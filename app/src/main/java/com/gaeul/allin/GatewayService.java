@@ -71,6 +71,35 @@ public class GatewayService extends Service {
     }
     public static boolean isForegroundStarted() { GatewayService s = current; return s != null && s.foreground; }
     public static boolean isRunning() { return RUNNING; }
+    /** 最近一次前台服务启动请求的失败原因；空串表示未失败。供磁贴判断是否需要兜底。 */
+    public static String lastStartError() {
+        GatewayService s = current;
+        String e = (s != null && !s.disposed) ? foregroundStartError : startError;
+        return e == null ? "" : e;
+    }
+
+    /**
+     * 无视当前实例状态，直接请求启动前台服务。
+     * 用于磁贴这类"刚关闭又要打开"的场景：requestHealthCheck 在实例尚未销毁时
+     * 会把请求投给正在退出的实例，导致启动被静默丢弃。
+     */
+    public static void forceStart(Context context) {
+        Context app = context.getApplicationContext();
+        try {
+            Intent intent = new Intent(app, GatewayService.class);
+            if (Build.VERSION.SDK_INT >= 26) {
+                Context.class.getMethod("startForegroundService", Intent.class).invoke(app, intent);
+            } else {
+                app.startService(intent);
+            }
+            startError = "";
+            KeepAliveScheduler.recordOutcome(app, "restartRequested", "forced");
+        } catch (Throwable t) {
+            Throwable cause = t.getCause() != null ? t.getCause() : t;
+            startError = cause.getClass().getSimpleName();
+            KeepAliveScheduler.recordOutcome(app, "startRestricted", startError);
+        }
+    }
     public static boolean isGatewayEnabled(Context context) {
         try { return context.getSharedPreferences("magpie_prefs", MODE_PRIVATE)
                 .getBoolean("gateway_enabled", true); }
