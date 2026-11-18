@@ -2472,8 +2472,28 @@ public class GatewayServer extends NanoHTTPD {
         synchronized(req.accountRoutingLeases){RecentUsageScheduler.Lease old=req.accountRoutingLeases.put(lease.target,lease);if(old!=null)old.cancel();}
         req.onClose(lease::cancel);
     }
+    /** XunE: 过滤掉「明确额度耗尽」的账号。未知额度照常保留。
+     *  若过滤后为空（全都耗尽或都读不到），回退到完整列表。 */
+    private List<JSONObject> quotaGatedAccounts(String id, List<JSONObject> accounts, String model) {
+        if (accounts == null || accounts.size() < 2) return accounts;
+        long now = System.currentTimeMillis();
+        List<JSONObject> alive = new ArrayList<JSONObject>();
+        for (int i = 0; i < accounts.size(); i++) {
+            JSONObject a = accounts.get(i);
+            if (a == null) continue;
+            if (!accountRouter().depleted(routingSeat(id, a), model, now)) alive.add(a);
+        }
+        return alive.isEmpty() ? accounts : alive;
+    }
+
     private int routingAccountIndex(String id,List<JSONObject> accounts,String model) {
         JSONObject provider=getProviderById(id);String mode=AccountRoutingPolicy.mode(provider);
+        // XunE: 额度门控。明确读到 remaining<=0 的账号不参与挑选（账号保留，充值后自动恢复）。
+        // 只使用已存在的额度读数做决策，不在这里发起新的额度请求——
+        // 新增额度读取由原有 usage 路径的 warmAccountRouting 按 60s 节流负责，
+        // 避免给每次请求都增加一次上游额度调用。
+        List<JSONObject> pool = quotaGatedAccounts(id, accounts, model);
+        accounts = pool;
         if("rotate".equals(mode)||accounts.size()<2)return nextAccountIndex(id,accounts.size());
         List<AccountRoutingPolicy.Seat> seats=new ArrayList<>();List<Integer> indices=new ArrayList<>();
         for(int i=0;i<accounts.size();i++) {

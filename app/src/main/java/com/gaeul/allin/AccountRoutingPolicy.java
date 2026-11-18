@@ -32,6 +32,25 @@ final class AccountRoutingPolicy {
         if(readings.size()>=512&&!readings.containsKey(seat.ref))readings.remove(readings.keySet().iterator().next());
         readings.put(seat.ref,new Reading(seat.fingerprint,new JSONObject(allowance.toString()),now));
     }
+    /** XunE: 该账号是否「明确」额度耗尽。
+     *
+     *  只有读到新鲜读数、且 remaining<=0（或百分比为0）才返回 true。
+     *  读不到、读数过期、没有读数，一律返回 false —— 未知绝不等于耗尽，
+     *  否则所有读不到余额的供应商会被永久跳过。
+     *  额度充值/领取后，下一次 observe 写入正数即自动恢复参与。 */
+    synchronized boolean depleted(Seat seat, String model, long now) {
+        JSONObject a = fresh(seat, now);
+        if (a == null) return false;                       // 未知或过期 → 不算耗尽
+        // 直接看原始数值：nonnegative() 会把负数吞成 null，这里必须能识别负数余额。
+        Object raw = a.opt("remaining");
+        if (raw instanceof Number) {
+            double n = ((Number) raw).doubleValue();
+            if (Double.isFinite(n)) return n <= 0;         // 明确 0 或负 → 耗尽
+        }
+        Double pct = remainingPercent(a, model, now);      // 只有百分比时按百分比
+        return pct != null && pct <= 0;
+    }
+
     private JSONObject fresh(Seat seat,long now){
         Reading r=readings.get(seat.ref);
         if(r==null||!r.fingerprint.equals(seat.fingerprint)||now<r.at||now-r.at>FRESH_MS)return null;
