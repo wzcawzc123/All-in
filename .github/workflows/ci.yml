@@ -77,3 +77,5 @@ jobs:
       #   run: |
       #     echo "${{ secrets.MAGPIE_KEYSTORE_BASE64 }}" | base64 -d > magpie.keystore
       #     ./gradlew assembleRelease --no-daemon
+
+# XunE fork: register workflow
