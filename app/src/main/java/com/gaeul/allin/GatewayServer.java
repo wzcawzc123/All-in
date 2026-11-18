@@ -13007,6 +13007,17 @@ public class GatewayServer extends NanoHTTPD {
      * 移植 magpie 的 retryable：厂商繁忙、额度用尽、模型下架、被防火墙拦、
      * 手里没余额——换一个还有戏；而是请求本身的问题（尤其上下文超长）就不要再换。
      */
+    /** XunE: raccoon 额度/余额耗尽判定。只认 400/402/422 且带额度措辞，
+     *  这类错误表示上游明确拒绝且未执行，可以安全换号重试。 */
+    private static boolean raccoonQuotaExhausted(int status, String body) {
+        if (status != 400 && status != 402 && status != 422) return false;
+        String b = body == null ? "" : body.toLowerCase(java.util.Locale.ROOT);
+        for (String term : new String[]{"quota", "balance", "credit", "insufficient",
+                "\u4f59\u989d", "\u4e0d\u8db3", "\u989d\u5ea6", "\u79ef\u5206"})
+            if (b.contains(term)) return true;
+        return false;
+    }
+
     private static boolean retryable(int status, String body) {
         String b = body == null ? "" : body.toLowerCase();
         // 0 表示连接/读取异常（DNS、超时、TLS 被切），换一家可能就通了
@@ -14269,7 +14280,11 @@ public class GatewayServer extends NanoHTTPD {
                     out.retryAfter=conn.getHeaderField("Retry-After");
                     errBody=raccoonError.json==null ? "{\"error\":{\"message\":\"Upstream error unavailable or truncated [REDACTED]\"}}" : safeUpstreamErrorJson(raccoonError.text,target);
                 } else errBody=readUpstreamError(conn, target, out, maskSession, statusCode);
-                if("raccoon".equals(target.providerId)) out.stopFallback=true;
+                // XunE patch: raccoon 账号额度耗尽时上游返回 400/402 + 余额措辞，
+                // 属于「明确拒绝、未执行」，重放到同供应商其它账号是安全的；
+                // 其余情况仍保留 stopFallback，维持「执行结果未知不重放」的保护。
+                if("raccoon".equals(target.providerId))
+                    out.stopFallback = !raccoonQuotaExhausted(statusCode, errBody);
                 if("zcode".equals(target.providerId)) {ZCodeRefusalPolicy.Kind kind=zcodeRefusals().observe(targetUrl,zcodeAccountScope(target),zcodeNetworkScope(),statusCode,errBody);out.safeZcodeRejection=kind==ZCodeRefusalPolicy.Kind.ACCOUNT||kind==ZCodeRefusalPolicy.Kind.EDGE;}
                 if ("cline".equals(target.providerId)) {
                     JSONObject classified=ClineFailurePolicy.classify(statusCode,errBody);
@@ -17085,7 +17100,9 @@ public class GatewayServer extends NanoHTTPD {
         List<RouteTarget> result=new ArrayList<>();result.add(selected);
         if(selected.account==null || selected.commercialCandidates!=null
                 || !java.util.Arrays.asList("openai","anthropic","responses","codex").contains(selected.protocol)
-                || java.util.Arrays.asList("raccoon","loomy","cline").contains(selected.providerId))return result;
+                // XunE patch: raccoon 移出排除名单——它的账号额度会各自耗尽，
+                // 必须在同一请求内能展开同供应商其它账号作为后续候选。
+                || java.util.Arrays.asList("loomy","cline").contains(selected.providerId))return result;
         JSONObject provider=getProviderById(selected.providerId);if(provider==null)return result;
         List<JSONObject> slots=AccountPoolPolicy.routingAccounts(provider);
         int start=-1;

@@ -87,6 +87,7 @@ def offlineTestMains = [
         'com.gaeul.allin.JsonNumericBoundaryOfflineTest',
         'com.gaeul.allin.AccountRoutingPolicyOfflineTest',
         'com.gaeul.allin.AccountRoutingGatewayTest',
+        'com.gaeul.allin.RaccoonQuotaFailoverOfflineTest',
         'com.gaeul.allin.AccountRoutingHttpTest',
         'com.gaeul.allin.WorkBuddyRoutingExpiryTest',
         'com.gaeul.allin.AntigravityRequestParityOfflineTest',
