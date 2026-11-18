@@ -11708,6 +11708,17 @@ public class GatewayServer extends NanoHTTPD {
                     terminalStatus = last.status > 0 ? last.status : 502;
                     terminalError = last.body == null ? "upstream failed" : last.body;
                     if (!enabled || (last.localRejection && !last.zcodePlanDenied) || last.protocolFailure) return last.response;
+                    // XunE: 通用额度耗尽换号。放在所有供应商专属的「已发送即终止」规则之前，
+                    // 让 raccoon / loomy / zcode / trae-cn / minimax / catpaw 等一视同仁：
+                    // 只要上游是明确拒绝（未执行）且理由是额度/余额，就冷却这个账号并换下一个。
+                    // UNKNOWN_EXECUTION 仍不重放——那种情况上游可能已经执行，重放会重复扣费。
+                    if (!remaining.isEmpty()
+                            && (last.failure == null || last.failure.kind != UpstreamFailure.Kind.UNKNOWN_EXECUTION)
+                            && quotaExhausted(last.status, last.body)) {
+                        rest(target, last.status);
+                        if (selectedLease != null) { selectedLease.cancel(); selectedLease = null; }
+                        continue;
+                    }
                     if(last.safeZcodeRejection) break;
                     if("raccoon".equals(target.providerId) && last.sent) {
                         if(last.status<=0 || last.failure!=null && last.failure.kind==UpstreamFailure.Kind.UNKNOWN_EXECUTION)
@@ -12617,13 +12628,29 @@ public class GatewayServer extends NanoHTTPD {
      * 移植 magpie 的 retryable：厂商繁忙、额度用尽、模型下架、被防火墙拦、
      * 手里没余额——换一个还有戏；而是请求本身的问题（尤其上下文超长）就不要再换。
      */
-    /** XunE: raccoon 额度/余额耗尽判定。只认 400/402/422 且带额度措辞，
-     *  这类错误表示上游明确拒绝且未执行，可以安全换号重试。 */
-    private static boolean raccoonQuotaExhausted(int status, String body) {
-        if (status != 400 && status != 402 && status != 422) return false;
+    /** XunE: 通用「额度/余额耗尽」判定（各供应商通用）。
+     *  这类错误表示上游明确拒绝且**没有执行**，因此在同一请求内换到同供应商的
+     *  其它账号重试是安全的，不会重复扣费。
+     *
+     *  覆盖的真实报文：
+     *   raccoon   400 积分余额不足 (code 1000007)
+     *   zcode     429 余额不足或无可用资源包 (code 1113)
+     *   catpaw    402 妙手余额不足
+     *   workbuddy 429 额度已用尽 (code 14018)
+     *   minimax   402 insufficient_balance_error
+     *   loomy/cline 及通用英文 insufficient balance / quota exceeded
+     *
+     *  刻意排除：401（凭据失效，换号无意义）、5xx（上游故障，交给 retryable）、
+     *  上下文超长（换谁都一样）。 */
+    private static boolean quotaExhausted(int status, String body) {
+        if (status != 400 && status != 402 && status != 403 && status != 422 && status != 429)
+            return false;
         String b = body == null ? "" : body.toLowerCase(java.util.Locale.ROOT);
-        for (String term : new String[]{"quota", "balance", "credit", "insufficient",
-                "\u4f59\u989d", "\u4e0d\u8db3", "\u989d\u5ea6", "\u79ef\u5206"})
+        for (String term : new String[]{
+                "quota", "balance", "credit", "insufficient", "exhausted",
+                "no available", "1113", "14018",
+                "\u4f59\u989d", "\u4e0d\u8db3", "\u989d\u5ea6", "\u79ef\u5206",
+                "\u7528\u5c3d", "\u8017\u5c3d", "\u5145\u503c"})
             if (b.contains(term)) return true;
         return false;
     }
@@ -13858,7 +13885,7 @@ public class GatewayServer extends NanoHTTPD {
                 // 属于「明确拒绝、未执行」，重放到同供应商其它账号是安全的；
                 // 其余情况仍保留 stopFallback，维持「执行结果未知不重放」的保护。
                 if("raccoon".equals(target.providerId))
-                    out.stopFallback = !raccoonQuotaExhausted(statusCode, errBody);
+                    out.stopFallback = !quotaExhausted(statusCode, errBody);
                 if("zcode".equals(target.providerId)) {ZCodeRefusalPolicy.Kind kind=zcodeRefusals().observe(targetUrl,zcodeAccountScope(target),zcodeNetworkScope(),statusCode,errBody);out.safeZcodeRejection=kind==ZCodeRefusalPolicy.Kind.ACCOUNT||kind==ZCodeRefusalPolicy.Kind.EDGE;}
                 if ("cline".equals(target.providerId)) {
                     JSONObject classified=ClineFailurePolicy.classify(statusCode,errBody);
@@ -16583,9 +16610,10 @@ public class GatewayServer extends NanoHTTPD {
         List<RouteTarget> result=new ArrayList<>();result.add(selected);
         if(selected.account==null || selected.commercialCandidates!=null
                 || !java.util.Arrays.asList("openai","anthropic","responses","codex").contains(selected.protocol)
-                // XunE patch: raccoon 移出排除名单——它的账号额度会各自耗尽，
-                // 必须在同一请求内能展开同供应商其它账号作为后续候选。
-                || java.util.Arrays.asList("loomy","cline").contains(selected.providerId))return result;
+                // XunE patch: raccoon/loomy/cline 全部移出排除名单——这些供应商的
+                // 账号额度会各自耗尽，必须在同一请求内能展开同供应商其它账号作为后续候选，
+                // 否则「额度耗尽自动换号」无从谈起。
+                )return result;
         JSONObject provider=getProviderById(selected.providerId);if(provider==null)return result;
         List<JSONObject> slots=AccountPoolPolicy.routingAccounts(provider);
         int start=-1;
