@@ -189,6 +189,7 @@ def offlineTestMains = [
         'com.gaeul.allin.ZCodeGiftBusyPolicyOfflineTest',
         'com.gaeul.allin.ZCodeGiftConcurrencyHttpTest',
         'com.gaeul.allin.ZCodeGiftBusyGatewayHttpTest',
+        'com.gaeul.allin.ZCodeGiftFailoverHttpTest',
         'com.gaeul.allin.ZCodeGiftControlGatewayHttpTest',
         'com.gaeul.allin.ClineAuthPolicyOfflineTest',
         'com.gaeul.allin.ClineFailurePolicyOfflineTest',
