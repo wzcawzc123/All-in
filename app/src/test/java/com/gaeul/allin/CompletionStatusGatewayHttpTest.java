@@ -20,7 +20,9 @@ public final class CompletionStatusGatewayHttpTest {
   return raw.replace("\"finish_reason\":\"tool_calls\"","\"finish_reason\":\""+reason+"\"");
  }
  static void run(boolean gift,String path,boolean stream,String reason)throws Exception {
-  boolean responses=path.endsWith("/responses");boolean directGift=gift&&!responses;
+  boolean responses=path.endsWith("/responses");boolean directGift=gift;
+  // 1.2.90 起 Responses 请求也走 gift 通道；gift 上游真实返回 Anthropic 格式，
+  // 所以 gift 用例（无论路径）mock 对齐 anthropic；plan 路径解析 chat 格式，保持原样。
   String payload=directGift?anthropic(stream,reason==null?null:(reason.equals("length")?"max_tokens":reason)):chat(stream,reason);
   try(VendorPolicyGatewayHttpTest.Upstream u=new VendorPolicyGatewayHttpTest.Upstream((req,n)->new VendorPolicyGatewayHttpTest.Reply(200,stream?"text/event-stream":"application/json",payload))) {
    ZCodeGift.resetBusyForTests();ZCodeGift.resetCooldownForTests();ZCodeGift.setFixtureBase("http://127.0.0.1:"+u.server.getLocalPort());

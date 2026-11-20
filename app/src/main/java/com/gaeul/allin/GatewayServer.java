@@ -8651,15 +8651,21 @@ public class GatewayServer extends NanoHTTPD {
 
                 // ===== OpenAI 形态的 zcode 请求优先走 gift：赠送额度只认 session，Key 花不到。
                 // 模型不在赠送额度支持范围内时返回 null，继续走原来的 Coding Plan 路径。
-                // XunE: 上游 1.2.90 把 Responses 客户端也放进了 gift 通道，但 gift 内部只认
-                // Anthropic 格式的响应；上游 1.2.90 未经 CI 验证（CompletionStatusGatewayHttpTest
-                // 在其原版上必红），responses+gift 会在响应解析处 502。恢复到 1.2.71 的
-                // 行为：Responses 客户端走 Coding Plan 路径，投影由 serveTrackedRequest 完成。
-                if (RESP_REQUEST.get() == null && "zcode".equals(providerIdOf(requestedModel))
+                if ("zcode".equals(providerIdOf(requestedModel))
                         && !NativeAnthropicPolicy.requiresNative(NATIVE_REQUEST.get())) {
+                    JSONObject original = RESP_REQUEST.get();
+                    if (original != null) {
+                        String unsupported = ResponsesBridge.nativeOnlyReason(original);
+                        if (unsupported != null) {
+                            return errorResponse(400, "Responses cannot be converted for selected route: " + unsupported);
+                        }
+                    }
                     Response gift = tryZCodeGiftOpenAI(payload, requestedModel, clientWantsStream,
                             maskSession, guardResult);
-                    if (gift != null) return gift;
+                    if (gift != null) {
+                        if (original != null) warnOnResponsesProjection(original);
+                        return gift;
+                    }
                 }
 
                 // ===== 候选与降级：对齐 magpie 的 order 语义 =====
