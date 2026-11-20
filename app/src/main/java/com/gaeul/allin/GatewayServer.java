@@ -14514,6 +14514,18 @@ public class GatewayServer extends NanoHTTPD {
         return null;
     }
 
+    /** 带有 session JWT 的 zcode 账号清单（保持配置顺序；gift 通道按序逐个试这些账号）。 */
+    private java.util.List<JSONObject> zcodeSessionAccounts(boolean requireEnabled) {
+        java.util.List<JSONObject> out = new java.util.ArrayList<JSONObject>();
+        JSONObject zc = getProviderById("zcode");
+        JSONArray accs = zc == null || (requireEnabled && !zc.optBoolean("enabled", true)) ? null : zc.optJSONArray("accounts");
+        for (int i = 0; accs != null && i < accs.length(); i++) {
+            JSONObject a = accs.optJSONObject(i);
+            if (a != null && (!requireEnabled || a.optBoolean("enabled", true)) && !a.optString("jwt", "").trim().isEmpty()) out.add(a);
+        }
+        return out;
+    }
+
     private ZCodeCatalogRefresh catalogRefresh;
     private synchronized ZCodeCatalogRefresh catalogRefresh() {
         if(stopping || backupRetired)return null;
@@ -14644,50 +14656,95 @@ public class GatewayServer extends NanoHTTPD {
         U_ROW.remove(); U_START.remove(); U_FIRST.remove(); U_LAST.remove(); U_DONE.remove();
     }
 
+    /** 单账号 gift 尝试的结局：SERVED=已拿到要交给客户端的终态响应；其余=该账号不可用，应换下一个。 */
+    private static final class ZCodeGiftAttempt {
+        static final int SERVED=0, UPSTREAM=1, SUMMARY=2, COOLDOWN=3, CANNOT_SERVE=4;
+        final Response response;
+        final int outcome;
+        ZCodeGiftAttempt(Response response, int outcome) { this.response=response; this.outcome=outcome; }
+    }
+
     /**
      * OpenAI 形态的请求走 ZCode gift。
-     * 返回 null 表示「这个模型不在赠送额度的支持范围内」，调用方继续走原来的 Coding Plan 路径。
+     * 返回 null 表示「没有任何账号的赠送额度能服务这个模型」，调用方继续走原来的 Coding Plan 路径。
+     *
+     * <p>XunE: gift 多账号轮换。原来只认第一个带 session JWT 的账号——它一花完或一进
+     * 本地冷却，客户端就直接吃 429，后面的账号再有钱也轮不上。现在按配置顺序逐个
+     * jwt 账号试：本地冷却、额度花完、模型不在赠送范围、上游拒绝都自动换下一个，
+     * 全部试完才出终态。「转付费 Coding Plan」仍是最后手段：只有所有账号都明确
+     * 花完/不支持才返回 null；冷却与额度查询失败保持原语义——宁可让客户端稍后
+     * 重试，也不误导付费。
      */
     private Response tryZCodeGiftOpenAI(JSONObject payload, String requestedModel, boolean clientWantsStream,
                                         PrivacyMasker.Session maskSession, ContextGuard.Result guardResult) {
-        JSONObject acc = zcodeSessionAccount(true);
-        if (acc == null) return null;
+        java.util.List<JSONObject> accounts = zcodeSessionAccounts(true);
+        if (accounts.isEmpty()) return null;
         try { payload=ZCodeRequestPolicy.chat(payload); }
         catch(IllegalArgumentException unsupportedRole) { return errorResponse(400,unsupportedRole.getMessage()); }
         catch(Exception invalid) { return errorResponse(400,"ZCode request messages invalid"); }
+        String upstreamBase = requestedModel.startsWith("zcode/")
+                ? requestedModel.substring(6) : requestedModel;
+
+        Response upstreamFailure=null, summaryFailure=null, cooldownResponse=null;
+        for (int ai=0; ai<accounts.size(); ai++) {
+            ZCodeGiftAttempt attempt=zcodeGiftAttempt(accounts.get(ai), ai+1, payload, requestedModel, upstreamBase,
+                    clientWantsStream, maskSession, guardResult);
+            if(attempt.outcome==ZCodeGiftAttempt.SERVED) return attempt.response;
+            if(attempt.outcome==ZCodeGiftAttempt.UPSTREAM) upstreamFailure=attempt.response;
+            else if(attempt.outcome==ZCodeGiftAttempt.SUMMARY) { if(summaryFailure==null) summaryFailure=attempt.response; }
+            else if(attempt.outcome==ZCodeGiftAttempt.COOLDOWN) { if(cooldownResponse==null) cooldownResponse=attempt.response; }
+            // CANNOT_SERVE：该账号明确花完/不含此模型，无响应可交；全部账号都如此则落到下方 return null 转付费。
+        }
+        // 终态优先级：真实上游失败 > 额度查询失败（防误导付费）> 本地冷却（暂时不可用，
+        // 不转付费）> 明确花完（转付费 Coding Plan）。
+        if (upstreamFailure!=null) return upstreamFailure;
+        if (summaryFailure!=null) return summaryFailure;
+        if (cooldownResponse!=null) {
+            LogicalRequest logical = new LogicalRequest(); logical.attempts=1; LOGICAL.set(logical);
+            beginUsage("zcode",requestedModel,upstreamBase); UsageLedger.Row row=U_ROW.get(); row.ep="gift";
+            RequestDiagnostics.coverTransport(row); RequestDiagnostics.outcome(row,false,true,"other",false);
+            finishGiftUsage(429,"ZCode gift local cooldown",true); LOGICAL.remove();
+            return cooldownResponse;
+        }
+        return null;
+    }
+
+    /**
+     * 用一个 zcode jwt 账号试 gift 通道的完整路径。busy hold、请求体转换失败与原生
+     * Anthropic 的 word-guard 限制是与账号无关的终态（SERVED 直出）；「换下一个账号」
+     * 的归拢在 {@link #tryZCodeGiftOpenAI} 的外壳里。
+     */
+    private ZCodeGiftAttempt zcodeGiftAttempt(JSONObject acc, int attempts, JSONObject payload, String requestedModel,
+                                              String upstreamBase, boolean clientWantsStream,
+                                              PrivacyMasker.Session maskSession, ContextGuard.Result guardResult) {
         String jwt = acc.optString("jwt", "");
         String device = acc.optString("device", "");
         String site = acc.optString("site", "zai");
 
-        String upstream = requestedModel.startsWith("zcode/")
-                ? requestedModel.substring(6) : requestedModel;
+        String upstream = upstreamBase;
 
         GiftTransport transport = giftTransport();
         ZCodeRefusalPolicy.Hold giftHold=giftTransportOverride==null?ZCodeGift.hold(jwt,device,REQUEST_CONTEXT.get()):null;
         if(giftHold!=null){
-            LogicalRequest logical = new LogicalRequest(); logical.attempts=1; LOGICAL.set(logical);
-            beginUsage("zcode",requestedModel,upstream); UsageLedger.Row row=U_ROW.get(); row.ep="gift";
-            RequestDiagnostics.coverTransport(row); RequestDiagnostics.outcome(row,false,true,"other",false);
-            finishGiftUsage(429,"ZCode gift local cooldown",true); LOGICAL.remove();
             ZCodeGift.Stream held=new ZCodeGift.Stream(); held.status=429; held.source="local_cooldown"; held.retryAfterMillis=giftHold.retryAfterMillis;
-            return giftErrorResponse(held);
+            return new ZCodeGiftAttempt(giftErrorResponse(held), ZCodeGiftAttempt.COOLDOWN);
         }
         JSONObject summary = transport.summary(jwt, device);
-        if(summary==null || !summary.optBoolean("ok",false) || (giftTransportOverride==null && !summary.optBoolean("complete",false)))return giftSummaryFailure(summary);
+        if(summary==null || !summary.optBoolean("ok",false) || (giftTransportOverride==null && !summary.optBoolean("complete",false)))return new ZCodeGiftAttempt(giftSummaryFailure(summary), ZCodeGiftAttempt.SUMMARY);
         java.util.List<String> allowed = ZCodeGift.allowedModels(summary);
-        if (allowed.isEmpty()) return null;
+        if (allowed.isEmpty()) return new ZCodeGiftAttempt(null, ZCodeGiftAttempt.CANNOT_SERVE);
         boolean supported = false;
         for (String m : allowed) if (m.equalsIgnoreCase(upstream)) { upstream = m; supported = true; break; }
-        if (!supported) return null;
+        if (!supported) return new ZCodeGiftAttempt(null, ZCodeGiftAttempt.CANNOT_SERVE);
         long busyHold=giftTransportOverride==null?ZCodeGift.busyHoldMillis():0;
         if(busyHold>0) {
-            LogicalRequest heldLogical=new LogicalRequest();heldLogical.attempts=1;LOGICAL.set(heldLogical);
+            LogicalRequest heldLogical=new LogicalRequest();heldLogical.attempts=attempts;LOGICAL.set(heldLogical);
             beginUsage("zcode",requestedModel,upstream);UsageLedger.Row heldRow=U_ROW.get();heldRow.ep="gift";
             RequestDiagnostics.coverTransport(heldRow);RequestDiagnostics.zcodeGift(heldRow,0,null,0,"local_busy_hold");
             RequestDiagnostics.outcome(heldRow,false,true,"rate",false);
             finishGiftUsage(429,"ZCode gift local busy hold",true);LOGICAL.remove();
             ZCodeGift.Stream held=new ZCodeGift.Stream();held.status=429;held.source="local_busy_hold";held.retryAfterMillis=busyHold;
-            return giftErrorResponse(held);
+            return new ZCodeGiftAttempt(giftErrorResponse(held), ZCodeGiftAttempt.SERVED);
         }
 
         JSONObject anthropic;
@@ -14713,18 +14770,18 @@ public class GatewayServer extends NanoHTTPD {
             }
             validateOutputCompatibility(anthropic);
         } catch (ImageContent.InvalidImage e) {
-            return errorResponse(400, "Invalid or unsupported image content");
+            return new ZCodeGiftAttempt(errorResponse(400, "Invalid or unsupported image content"), ZCodeGiftAttempt.SERVED);
         } catch (Exception e) {
             String message=e.getMessage();
-            return errorResponse(400, message==null||message.trim().isEmpty()
-                    ?"请求体转换成 Anthropic 格式失败":message);
+            return new ZCodeGiftAttempt(errorResponse(400, message==null||message.trim().isEmpty()
+                    ?"请求体转换成 Anthropic 格式失败":message), ZCodeGiftAttempt.SERVED);
         }
 
         JSONObject middleware = configJson.optJSONObject("middleware");
         if (wantsAnthropicOut() && (Middleware.wordGuardEnabled(middleware) || Middleware.thinkTagsEnabled(middleware)))
-            return errorResponse(400, "Native Anthropic responses cannot safely apply word-guard or think-tags; disable these transforms or use a Chat client");
+            return new ZCodeGiftAttempt(errorResponse(400, "Native Anthropic responses cannot safely apply word-guard or think-tags; disable these transforms or use a Chat client"), ZCodeGiftAttempt.SERVED);
         LogicalRequest logical = new LogicalRequest();
-        logical.attempts = 1;
+        logical.attempts = attempts;
         LOGICAL.set(logical);
         beginUsage("zcode", requestedModel, upstream);
         U_ROW.get().ep = "gift";
@@ -14754,7 +14811,7 @@ public class GatewayServer extends NanoHTTPD {
             int status=st.status >= 400 && st.status <= 599 ? st.status : st.refused && st.status>0 ? 405 : 502;
             RequestDiagnostics.outcome(giftRow,false,local,status==429?"rate":st.sent && st.status<=0?"unknown_execution":"other",!local && st.status>=400 && st.status<=599);
             finishGiftUsage(status, "ZCode gift " + (st.source==null?"transport":st.source) + " failure", true);
-            return giftErrorResponse(st);
+            return new ZCodeGiftAttempt(giftErrorResponse(st), ZCodeGiftAttempt.UPSTREAM);
         }
 
         if (clientWantsStream) {
@@ -14769,7 +14826,7 @@ public class GatewayServer extends NanoHTTPD {
             }
             resp.addHeader("X-Magpie-Served-By", "zcode-gift");
             handedOff = true;
-            return resp;
+            return new ZCodeGiftAttempt(resp, ZCodeGiftAttempt.SERVED);
         }
 
         try {
@@ -14791,7 +14848,7 @@ public class GatewayServer extends NanoHTTPD {
                 addCorsHeaders(resp);
                 applyGuardHeaders(resp, guardResult);
                 finishGiftUsage(200, "", true);
-                return resp;
+                return new ZCodeGiftAttempt(resp, ZCodeGiftAttempt.SERVED);
             }
             JSONObject out = ZCodeAnthropic.toOpenAI(msg, requestedModel);
             Response resp = newFixedLengthResponse(Status.OK, "application/json; charset=UTF-8", out.toString());
@@ -14799,22 +14856,22 @@ public class GatewayServer extends NanoHTTPD {
             addCorsHeaders(resp);
             applyGuardHeaders(resp, guardResult);
             finishGiftUsage(200, "", true);
-            return resp;
+            return new ZCodeGiftAttempt(resp, ZCodeGiftAttempt.SERVED);
         } catch (PrivacyMasker.PrivacyException e) {
             finishGiftUsage(503, "Privacy masking unavailable", true);
-            return errorResponse(503, "Privacy masking unavailable");
+            return new ZCodeGiftAttempt(errorResponse(503, "Privacy masking unavailable"), ZCodeGiftAttempt.SERVED);
         } catch (Exception e) {
             RequestDiagnostics.outcome(U_ROW.get(),false,false,"unknown_execution",false);
             finishGiftUsage(502, "ZCode gift response read failed", true);
-            return errorResponse(502, "读取 ZCode gift 响应失败");
+            return new ZCodeGiftAttempt(errorResponse(502, "读取 ZCode gift 响应失败"), ZCodeGiftAttempt.UPSTREAM);
         }
         } catch (PrivacyMasker.PrivacyException e) {
             finishGiftUsage(503, "Privacy masking unavailable", true);
-            return errorResponse(503, "Privacy masking unavailable");
+            return new ZCodeGiftAttempt(errorResponse(503, "Privacy masking unavailable"), ZCodeGiftAttempt.SERVED);
         } catch (Exception e) {
             RequestDiagnostics.outcome(U_ROW.get(),false,false,"unknown_execution",false);
             finishGiftUsage(502, "ZCode gift transport failed", true);
-            return errorResponse(502, "ZCode gift transport failed");
+            return new ZCodeGiftAttempt(errorResponse(502, "ZCode gift transport failed"), ZCodeGiftAttempt.UPSTREAM);
         } finally {
             if (handedOff) { U_ROW.remove(); U_START.remove(); U_FIRST.remove(); U_LAST.remove(); U_DONE.remove(); }
             else {
