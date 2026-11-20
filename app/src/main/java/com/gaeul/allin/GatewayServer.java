@@ -12066,6 +12066,9 @@ public class GatewayServer extends NanoHTTPD {
                         if (selectedLease != null) { selectedLease.cancel(); selectedLease = null; }
                         continue;
                     }
+                    // XunE: 1.2.90 的 loomy 401 是登录态失效（expired 业务码映射），不是
+                    // 可重试的临时故障——自动重试会每请求多打一次上游，直接返回让客户端重新登录。
+                    if ("loomy".equals(target.providerId) && last.status == 401) return last.response;
                     if(last.safeZcodeRejection) break;
                     if("raccoon".equals(target.providerId) && last.sent) {
                         if(last.status<=0 || last.failure!=null && last.failure.kind==UpstreamFailure.Kind.UNKNOWN_EXECUTION)
@@ -17201,7 +17204,7 @@ public class GatewayServer extends NanoHTTPD {
                 || !java.util.Arrays.asList("openai","anthropic","responses","codex").contains(selected.protocol)
                 // XunE patch: raccoon/loomy/cline 全部移出排除名单——这些供应商的
                 // 账号额度会各自耗尽，必须在同一请求内能展开同供应商其它账号作为后续候选，
-                // 否则「额度耗尽自动换号」无从谈起。
+                // 否则「额度耗尽自动换号」无从谈起（loomy 的 401 不重试在候选循环里特判）。
                 )return result;
         JSONObject provider=getProviderById(selected.providerId);if(provider==null)return result;
         List<JSONObject> slots=AccountPoolPolicy.routingAccounts(provider);
