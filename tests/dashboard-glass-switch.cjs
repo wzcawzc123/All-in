@@ -9,7 +9,11 @@ const css = [...source.slice(0, source.indexOf('</head>')).matchAll(/<style[^>]*
 const helper = source.slice(source.indexOf('    function stepGlassSpring('), source.indexOf('    let dockLens;'));
 const script = source.slice(source.indexOf('    function setupGlassSwitches('), source.indexOf('    const disclosureMotion'));
 const piece = (start, end) => source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start) + 1));
-const providerRendering = piece('    function providerCounts(', '    const providerRouteMotion') +
+// 1.2.90 起 providerCounts 依赖 providerModelCardCatalog/mediaModelsFor/providerHasCredential，
+// 这三个符号都在 providerHasCredential→renderAllModelsTags 区间内，一并提取。
+const symbolRange = piece('    function providerHasCredential(prov)', '    function renderAllModelsTags()');
+const providerRendering = symbolRange +
+  piece('    function providerCounts(', '    const providerRouteMotion') +
   piece('    function renderProviderList()', '    function renderProviderStatus()') +
   piece('    function visibleProviders(', '    function renderWbAccounts(');
 const providers = JSON.parse(fs.readFileSync(path.join(__dirname, '../app/src/main/assets/default_config.json'), 'utf8')).providers
