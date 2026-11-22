@@ -15,6 +15,7 @@ public final class RequestContext implements OutboundLimiter.Cancellation, AutoC
     final ProviderQuirks.Snapshot quirks;
     final String explicitSession, authScope;
     final long affinityEpoch;
+    boolean heldResponse;
     volatile AtomicBoolean affinitySemantic = new AtomicBoolean();
     private final AtomicBoolean cancelled = new AtomicBoolean();
     final Map<String,RecentUsageScheduler.Lease> accountRoutingLeases = new HashMap<>();

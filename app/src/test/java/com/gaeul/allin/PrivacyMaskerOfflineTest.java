@@ -37,6 +37,8 @@ public class PrivacyMaskerOfflineTest {
         PrivacyMasker.setProviderForTest(null);
         PrivacyMasker.Session unset = new PrivacyMasker.Session();
         check(PrivacyMasker.maskText("nothing", unset).equals("nothing"));
+        String plainReply = new String(new char[] {'回', '复'});
+        check(PrivacyMasker.unmaskText(plainReply, unset) == plainReply);
         fails(() -> PrivacyMasker.maskText("a@example.com", unset));
         PrivacyMasker.Config cfg = new PrivacyMasker.Config(); cfg.customPatterns.add("secret");
         fails(() -> PrivacyMasker.maskText("secret", unset, cfg));

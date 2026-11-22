@@ -3,6 +3,7 @@ package com.gaeul.allin;
 import com.gaeul.allin.json.JSONArray;
 import com.gaeul.allin.json.JSONObject;
 
+import java.io.IOException;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
@@ -20,6 +21,7 @@ public final class AntigravityClientOfflineTest {
         thinkingBudgetMatchesMagpie();
         magpieTurnPairingAndGenerationConfig();
         incompleteAndErrorStreamsFailClosed();
+        bareUpstreamError();
         finishReasonsMatchMagpie();
         System.out.println("AntigravityClientOfflineTest: PASS");
     }
@@ -402,6 +404,30 @@ public final class AntigravityClientOfflineTest {
         check(AntigravityClient.buildEnvelope(oss, "gpt-oss-120b", "project")
                 .getJSONObject("request").optJSONObject("generationConfig") == null,
                 "gpt-oss must not receive a thinkingConfig");
+    }
+
+    private static void bareUpstreamError() throws Exception {
+        String prefix = "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}}\n\n";
+        String done = "data: {\"response\":{\"candidates\":[{\"finishReason\":\"STOP\"}]}}\n\n";
+        String detail = "\"error\":{\"code\":400,\"status\":\"INVALID_ARGUMENT\",\"message\":\"late tool error Bearer fixture-token\"}";
+        String compact = "{" + detail + "}";
+        String pretty = "{\r\n \"response\": {\r\n " + detail + "\r\n }\r\n}";
+        for (String frame : new String[]{compact, pretty, "data: " + compact + "\n\n"}) {
+            String stream = readAll(AntigravityClient.toOpenAiStream(bytes(prefix + frame + "\n" + done), "gemini-3.1-pro"));
+            check(stream.contains("partial") && stream.contains("code=400 status=INVALID_ARGUMENT"), "upstream error facts and prefix preserved");
+            check(stream.indexOf("antigravity_stream_error") == stream.lastIndexOf("antigravity_stream_error"), "one error only");
+            check(!stream.contains("fixture-token") && !stream.contains("[DONE]") && !stream.contains("\"finish_reason\":\"stop\""), "no secret or false completion");
+            String anthropic = readAll(GatewayServer.openAiToAnthropicStream(
+                    AntigravityClient.toOpenAiStream(bytes(prefix + frame), "gemini-3.1-pro"), "gemini-3.1-pro", null, null));
+            check(anthropic.contains("event: error") && anthropic.contains("status=INVALID_ARGUMENT")
+                    && !anthropic.contains("event: message_stop"), "Messages gets a failure rather than message_stop");
+            boolean rejected = false;
+            try { AntigravityClient.decodeAll(bytes(prefix + frame)); }
+            catch (IOException e) { rejected = e.getMessage().contains("code=400 status=INVALID_ARGUMENT"); }
+            check(rejected, "aggregate keeps actual provider cause");
+        }
+        String ordinary = readAll(AntigravityClient.toOpenAiStream(bytes(prefix + "{\"unrelated\":true}\n" + done), "gemini-3.1-pro"));
+        check(ordinary.contains("[DONE]") && !ordinary.contains("antigravity_stream_error"), "non-error bare objects retain normal completion");
     }
 
     private static void incompleteAndErrorStreamsFailClosed() throws Exception {

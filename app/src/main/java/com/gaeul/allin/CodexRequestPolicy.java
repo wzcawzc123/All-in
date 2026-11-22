@@ -135,7 +135,9 @@ public final class CodexRequestPolicy {
 
         JSONObject body;
         try {
-            body = new JSONObject(request.toString());
+            body = CodexClientCompatibility.responses(request);
+        } catch (IllegalArgumentException invalidHint) {
+            throw invalidHint;
         } catch (Exception invalid) {
             throw new IllegalArgumentException("Codex request cannot be copied", invalid);
         }

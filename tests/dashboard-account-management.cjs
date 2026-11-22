@@ -7,7 +7,7 @@ process.env.ALLIN_TEST_TMP=process.env.ALLIN_TEST_TMP||path.resolve('build/accou
 const css=html.match(/<style>([\s\S]*?)<\/style>/)[1];
 const core=html.slice(html.indexOf('    let providerConfigRequest'),html.indexOf('    async function loadConfig()'));
 const accounts=html.slice(html.indexOf('    let currentModalProviderId'),html.indexOf('    // Account operations:'));
-const names=['loadConfig','closeAccountModal','removeProviderAccount','clearAllProviderAccounts','refreshProviderBadges'];
+const names=['loadConfig','closeAccountModal','removeProviderAccount','clearAllProviderAccounts','refreshProviderBadges','providerHasCredential','mediaModelsFor','providerModelCardCatalog'];
 if(!baseline)names.push('mutateProviderAccount');
 const funcs=names.map(n=>readFunction(html,n)).join('\n');
 const start=html.indexOf('  <!-- 供应商账号管理与移除弹窗 -->'),modal=html.slice(start,html.indexOf('  <!-- 首启向导',start));

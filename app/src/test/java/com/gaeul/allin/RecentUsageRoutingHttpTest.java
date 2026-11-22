@@ -366,6 +366,30 @@ public final class RecentUsageRoutingHttpTest {
         ((AllInTrackedResponse.WriteCompletion)body).onWriteComplete(true);
         awaitIdle(ref); near(ref,1);
     }
+    private static void concurrentRotation() throws Exception {
+        GatewayServer gateway = RoutingSetupOfflineTest.server(new JSONObject().put("providers", new JSONArray()));
+        Field turns = GatewayServer.class.getDeclaredField("groupTurns"); turns.setAccessible(true);
+        turns.set(gateway, new java.util.concurrent.ConcurrentHashMap<String, Integer>());
+        Method order = GatewayServer.class.getDeclaredMethod("orderByStrategy", JSONObject.class, List.class);
+        order.setAccessible(true);
+        JSONObject group = new JSONObject().put("id", "parallel").put("strategy", "rotate");
+        List<String> refs = Arrays.asList("a", "b", "c", "d");
+        java.util.concurrent.ConcurrentHashMap<String, Integer> first = new java.util.concurrent.ConcurrentHashMap<>();
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        try {
+            List<Future<?>> results = new ArrayList<>();
+            for (int worker = 0; worker < 8; worker++) results.add(pool.submit(() -> {
+                for (int call = 0; call < 200; call++) {
+                    List<?> sorted = (List<?>) order.invoke(gateway, group, refs);
+                    first.merge((String) sorted.get(0), 1, Integer::sum);
+                }
+                return null;
+            }));
+            for (Future<?> result : results) result.get(5, TimeUnit.SECONDS);
+            for (String ref : refs) check(Integer.valueOf(400).equals(first.get(ref)), "concurrent rotation must not lose turns");
+        } finally { pool.shutdownNow(); }
+    }
+
     private static void configuredTiesAndKeys() throws Exception {
         try(Fixture f=new Fixture((k,m,n)->new Reply(openai("{}")),
                 (k,m,n)->new Reply(openai("{}")),"openai",true)) {
@@ -426,7 +450,7 @@ public final class RecentUsageRoutingHttpTest {
         Field field=GatewayServer.class.getDeclaredField("RECENT_USAGE"); field.setAccessible(true); scheduler=(RecentUsageScheduler)field.get(null);
         try {
             UsageLedger.init(directory.toFile());
-            apiAndOrdering(); accounting(); concurrentStreams(); nativeAndTruncated(); convertedAnthropic(); convertedResponses(); cancellationAndNeverSent(); bufferedStreamDelivery(); repeatedCallback(); configuredTiesAndKeys(); capacityCompatibility();
+            apiAndOrdering(); accounting(); concurrentStreams(); nativeAndTruncated(); convertedAnthropic(); convertedResponses(); cancellationAndNeverSent(); bufferedStreamDelivery(); repeatedCallback(); concurrentRotation(); configuredTiesAndKeys(); capacityCompatibility();
             System.out.println("RecentUsageRoutingHttpTest passed");
         } finally {
             UsageLedger.setHooks(null); Method close=UsageLedger.class.getDeclaredMethod("closeWriter"); close.setAccessible(true); close.invoke(null);

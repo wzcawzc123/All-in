@@ -412,11 +412,41 @@ public final class ToolCallContractOfflineTest {
         }
     }
     static void deferredResponseToolsBounded() throws Exception {
-        char[] data=new char[1024*1024]; java.util.Arrays.fill(data,'x'); String args="{\"blob\":\""+new String(data)+"\"}";
-        String raw=sse(chunk(new JSONArray().put(delta(0,ID_A,"lookup_weather",args)),null),chunk(null,"tool_calls"));
-        String out=read(ResponsesBridge.chatStreamToResponses(input(raw),MODEL));
-        check(out.contains("response.failed") && out.contains("buffer limit") && !out.contains("response.completed"),"deferred Responses tools not bounded");
-        check(!out.contains("response.output_item.added"),"oversized deferred tool published before validation");
+        String name = "lookup_weather";
+        String prefix = "{\"blob\":\"";
+        String suffix = "\"}";
+        int maxArgument = 1024 * 1024 - ID_A.length() - name.length();
+        for (int extra : new int[]{0, 1}) {
+            String args = prefix + "x".repeat(maxArgument - prefix.length() - suffix.length() + extra) + suffix;
+            StringBuilder raw = new StringBuilder();
+            for (int offset = 0; offset < args.length(); offset += 128 * 1024) {
+                int end = Math.min(offset + 128 * 1024, args.length());
+                raw.append(sse(chunk(new JSONArray().put(delta(0, offset == 0 ? ID_A : null,
+                        offset == 0 ? name : null, args.substring(offset, end))), null)));
+            }
+            raw.append(sse(chunk(null, "tool_calls")));
+            String out = read(ResponsesBridge.chatStreamToResponses(input(raw.toString()), MODEL));
+            if (extra == 0) {
+                Call call = responsesCalls(responsesTerminal(out, true)).get(ID_A);
+                check(call != null && args.equals(call.args), "tools at the aggregate limit must complete without truncation");
+            } else {
+                int failed = 0;
+                for (JSONObject event : events(out)) {
+                    String type = event.getString("type");
+                    check(!"response.completed".equals(type) && !"response.incomplete".equals(type)
+                            && !"response.output_item.added".equals(type), "over-limit tool was published or finished");
+                    if ("response.failed".equals(type)) {
+                        failed++;
+                        JSONObject response = event.getJSONObject("response");
+                        check("failed".equals(response.getString("status")), "missing failed status");
+                        JSONObject error = response.getJSONObject("error");
+                        check("upstream_stream_error".equals(error.getString("code"))
+                                && "upstream stream failed".equals(error.getString("message")), "expected public failure envelope");
+                    }
+                }
+                check(failed == 1, "expected exactly one failure for aggregate tool overflow");
+            }
+        }
     }
     static void run(Map<String,Checked> tests) throws Exception {
         int failures=0;

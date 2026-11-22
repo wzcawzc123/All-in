@@ -19,6 +19,7 @@ final class CodexHttp1Connection extends HttpURLConnection {
     private volatile Socket socket;
     private volatile boolean closed;
     private IOException failure;
+    private final Object requestBodyLock = new Object();
     private ByteArrayOutputStream requestBody;
     private InputStream responseBody;
     private boolean responseRead;
@@ -90,23 +91,54 @@ final class CodexHttp1Connection extends HttpURLConnection {
         }catch(IOException e){failure=e;if(opened!=null)try{opened.close();}catch(IOException ignored){}throw e;}
         catch(Exception e){failure=new IOException("Codex HTTP1 connection failed",e);if(opened!=null)try{opened.close();}catch(IOException ignored){}throw failure;}
     }
-    @Override public synchronized OutputStream getOutputStream()throws IOException {
-        if(!getDoOutput())throw new ProtocolException("Output not enabled");connect();
-        if(requestBody==null)requestBody=new ByteArrayOutputStream();return requestBody;
+    @Override public synchronized OutputStream getOutputStream() throws IOException {
+        if (!getDoOutput()) throw new ProtocolException("Output not enabled");
+        if (responseRead) throw new ProtocolException("Codex request already sent");
+        connect();
+        synchronized (requestBodyLock) {
+            checkOpen();
+            if (requestBody == null) requestBody = new ByteArrayOutputStream();
+            return requestBody;
+        }
     }
-    private synchronized void execute()throws IOException {
-        if(responseRead)return;checkOpen();connect();
+
+    private void sendRequest() throws IOException {
+        ByteArrayOutputStream body;
+        synchronized (requestBodyLock) {
+            checkOpen();
+            body = requestBody;
+            requestBody = null;
+        }
+        if (body == null) {
+            writeRequest(null, 0);
+        } else {
+            synchronized (body) {
+                writeRequest(body, body.size());
+            }
+        }
+    }
+
+    private void writeRequest(ByteArrayOutputStream body, int length) throws IOException {
+        if (declaredLength >= 0 && declaredLength != length)
+            throw new ProtocolException("Declared Codex body length mismatch");
+        String path = url.getPath();
+        if (path.isEmpty()) path = "/";
+        if (url.getQuery() != null) path += "?" + url.getQuery();
+        if(path.indexOf('\r')>=0||path.indexOf('\n')>=0)throw new ProtocolException("Invalid HTTP path");
+        int port=url.getPort();String authority=url.getHost()+((port>0&&port!=443&&port!=80)?":"+port:"");
+        StringBuilder header=new StringBuilder(method+" "+path+" HTTP/1.1\r\nHost: "+authority+"\r\nConnection: close\r\n");
+        for(Map.Entry<String,String> e:requestHeaders.entrySet())if(!Arrays.asList("host","connection","content-length","transfer-encoding").contains(e.getKey().toLowerCase(Locale.ROOT)))header.append(e.getKey()).append(": ").append(e.getValue()).append("\r\n");
+        if(getRequestProperty("Accept-Encoding")==null)header.append("Accept-Encoding: identity\r\n");
+        if(getDoOutput())header.append("Content-Length: ").append(length).append("\r\n");
+        header.append("\r\n");OutputStream out=socket.getOutputStream();out.write(header.toString().getBytes(StandardCharsets.UTF_8));if(length>0)body.writeTo(out);out.flush();
+    }
+
+    private synchronized void execute() throws IOException {
+        if (responseRead) return;
         try {
-            byte[] body=requestBody==null?new byte[0]:requestBody.toByteArray();
-            if(declaredLength>=0&&declaredLength!=body.length)throw new ProtocolException("Declared Codex body length mismatch");
-            String path=url.getFile();if(path.isEmpty())path="/";
-            if(path.indexOf('\r')>=0||path.indexOf('\n')>=0)throw new ProtocolException("Invalid HTTP path");
-            int port=url.getPort();String authority=url.getHost()+((port>0&&port!=443&&port!=80)?":"+port:"");
-            StringBuilder header=new StringBuilder(method+" "+path+" HTTP/1.1\r\nHost: "+authority+"\r\nConnection: close\r\n");
-            for(Map.Entry<String,String> e:requestHeaders.entrySet())if(!Arrays.asList("host","connection","content-length","transfer-encoding").contains(e.getKey().toLowerCase(Locale.ROOT)))header.append(e.getKey()).append(": ").append(e.getValue()).append("\r\n");
-            if(getRequestProperty("Accept-Encoding")==null)header.append("Accept-Encoding: identity\r\n");
-            if(getDoOutput())header.append("Content-Length: ").append(body.length).append("\r\n");
-            header.append("\r\n");OutputStream out=socket.getOutputStream();out.write(header.toString().getBytes(StandardCharsets.UTF_8));if(body.length>0)out.write(body);out.flush();
+            checkOpen();
+            connect();
+            sendRequest();
             BufferedInputStream input=new BufferedInputStream(socket.getInputStream(),16384);
             for(int interim=0;;interim++){
                 statusLine=line(input,1024);if(!statusLine.matches("HTTP/1\\.[01] [1-5][0-9]{2}(?: [^\\r\\n]*)?"))throw new ProtocolException("Invalid Codex HTTP status");
@@ -130,7 +162,7 @@ final class CodexHttp1Connection extends HttpURLConnection {
             String encoding=single("content-encoding");if(encoding!=null&&!encoding.equalsIgnoreCase("identity")){
                 if(!encoding.equalsIgnoreCase("gzip"))throw new ProtocolException("Unsupported content encoding");bodyIn=new java.util.zip.GZIPInputStream(bodyIn);
             }
-            responseBody=new Closing(bodyIn);responseRead=true;if(requestBody!=null)requestBody.reset();
+            responseBody=new Closing(bodyIn);responseRead=true;
         }catch(IOException e){failure=e;disconnect();throw e;}
     }
     private String single(String name)throws IOException{List<String> list=responseHeaders.get(name);if(list==null)return null;if(list.size()!=1)throw new ProtocolException("Duplicate framing header");return list.get(0);}
@@ -147,7 +179,15 @@ final class CodexHttp1Connection extends HttpURLConnection {
     @Override public String getHeaderField(int index){try{execute();if(index==0)return statusLine;int i=1;for(List<String> values:responseHeaders.values())for(String v:values){if(i++==index)return v;}return null;}catch(IOException failed){return null;}}
     @Override public String getHeaderFieldKey(int index){try{execute();if(index==0)return null;int i=1;for(Map.Entry<String,List<String>> e:responseHeaders.entrySet())for(String ignored:e.getValue()){if(i++==index)return e.getKey();}return null;}catch(IOException failed){return null;}}
     @Override public Map<String,List<String>> getHeaderFields(){try{execute();Map<String,List<String>> copy=new LinkedHashMap<>();copy.put(null,Collections.singletonList(statusLine));for(Map.Entry<String,List<String>> e:responseHeaders.entrySet())copy.put(e.getKey(),Collections.unmodifiableList(new ArrayList<>(e.getValue())));return Collections.unmodifiableMap(copy);}catch(IOException failed){return Collections.emptyMap();}}
-    @Override public void disconnect(){closed=true;Socket s=socket;if(s!=null)try{s.close();}catch(IOException ignored){}}
+    @Override public void disconnect() {
+        // Cancellation must not wait for execute() to finish blocking socket I/O.
+        synchronized (requestBodyLock) {
+            closed = true;
+            requestBody = null;
+        }
+        Socket current = socket;
+        if (current != null) try { current.close(); } catch (IOException ignored) {}
+    }
     private final class Closing extends FilterInputStream {
         private boolean eof;
         Closing(InputStream in){super(in);}
@@ -165,7 +205,14 @@ final class CodexHttp1Connection extends HttpURLConnection {
         private boolean ready()throws IOException{
             if(ended)return false;if(left>0)return true;
             if(ending){if(in.read()!='\r'||in.read()!='\n')throw new ProtocolException("Invalid chunk terminator");ending=false;}
-            String size=line(in,1024).split(";",2)[0];if(!size.matches("[0-9A-Fa-f]{1,16}"))throw new ProtocolException("Invalid chunk size");try{left=Long.parseLong(size,16);}catch(NumberFormatException bad){throw new ProtocolException("Invalid chunk size");}
+            String chunkHeader = line(in, 1024);
+            int extension = chunkHeader.indexOf(';');
+            int sizeEnd = extension < 0 ? chunkHeader.length() : extension;
+            if (extension >= 0) {
+                while (sizeEnd > 0 && (chunkHeader.charAt(sizeEnd - 1) == ' ' || chunkHeader.charAt(sizeEnd - 1) == 9)) sizeEnd--;
+            }
+            String size = chunkHeader.substring(0, sizeEnd);
+            if(!size.matches("[0-9A-Fa-f]{1,16}"))throw new ProtocolException("Invalid chunk size");try{left=Long.parseLong(size,16);}catch(NumberFormatException bad){throw new ProtocolException("Invalid chunk size");}
             if(left==0){int total=0;while(true){String trailer=line(in,8192);total+=trailer.length()+2;if(total>65536)throw new ProtocolException("Trailers too large");if(trailer.isEmpty())break;}ended=true;return false;}ending=true;return true;
         }
         @Override public int read()throws IOException{if(!ready())return -1;int n=in.read();if(n<0)throw new EOFException("Truncated Codex chunk");left--;return n;}

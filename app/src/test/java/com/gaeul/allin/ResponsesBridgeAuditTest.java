@@ -204,5 +204,42 @@ public class ResponsesBridgeAuditTest {
         String growingOut=read(ResponsesBridge.chatStreamToResponses(new ByteArrayInputStream(growing.getBytes(StandardCharsets.UTF_8)),"m"));
         check(growingOut.contains("\"name\":\"list_list_items\"") && growingOut.contains("\"call_id\":\"call_tail\""),"growing fragment overwrote identity: "+growingOut);
     }
-    public static void main(String[] args) throws Exception { int failures=0; terminalSemantics(); try { invalidChat(); } catch(AssertionError e){System.err.println(e); failures++;} try {lateToolMetadata();} catch(AssertionError e){System.err.println(e);failures++;} try {fragmentedName();} catch(AssertionError e){System.err.println(e);failures++;} try {requestValidation();} catch(AssertionError e){System.err.println(e);failures++;} try {finalOnly();} catch(AssertionError e){System.err.println(e);failures++;} try {argumentsDone();} catch(AssertionError e){System.err.println(e);failures++;} try {lifecycleAndInterleave();} catch(AssertionError e){System.err.println(e);failures++;} try {gatewayFixtures();} catch(AssertionError e){System.err.println(e);failures++;} try {projectionBoundaries();} catch(AssertionError e){System.err.println(e);failures++;} try {invalidFinalCalls();} catch(AssertionError e){System.err.println(e);failures++;} try {prematureDone();} catch(AssertionError e){System.err.println(e);failures++;} try {doneWithoutSpace();} catch(AssertionError e){System.err.println(e);failures++;} try {nullErrorFields();} catch(AssertionError e){System.err.println(e);failures++;} try {repeatedToolIdentity();} catch(AssertionError e){System.err.println(e);failures++;} try {identityFragmentsAreNotGuessed();} catch(AssertionError e){System.err.println(e);failures++;} if(failures>0)throw new AssertionError(failures+" failures"); }
+    static void publicStreamErrors() throws Exception {
+        try (InputStream wire = ResponsesBridge.chatStreamToResponses(new InputStream() {
+            @Override public int read() throws IOException { throw new IOException("internal fixture detail"); }
+        }, "m")) {
+            JSONObject error = streamFailure(read(wire));
+            check("upstream_stream_error".equals(error.getString("code")), "stream error code changed");
+            check("upstream stream failed".equals(error.getString("message")), "internal exception message leaked");
+        }
+
+        JSONObject rate = new JSONObject().put("type", "rate_limit_error").put("code", "rate_limit_exceeded")
+                .put("message", "rate limited").put("retry_after", 7).put("retry_after_ms", 7000);
+        byte[] input = sse(new JSONObject().put("error", rate).toString()).getBytes(StandardCharsets.UTF_8);
+        try (InputStream wire = ResponsesBridge.chatStreamToResponses(new ByteArrayInputStream(input), "m")) {
+            JSONObject error = streamFailure(read(wire));
+            check("rate_limit_exceeded".equals(error.getString("code"))
+                && "rate_limit_error".equals(error.getString("type")) && "rate limited".equals(error.getString("message"))
+                && error.getInt("retry_after") == 7 && error.getInt("retry_after_ms") == 7000,
+                "structured rate-limit error changed");
+        }
+    }
+
+    static JSONObject streamFailure(String wire) throws Exception {
+        JSONObject failure = null;
+        for (String line : wire.split("\n")) {
+            if (!line.startsWith("data: ")) continue;
+            JSONObject event = new JSONObject(line.substring(6));
+            if ("response.failed".equals(event.optString("type"))) {
+                check(failure == null, "duplicate stream failure");
+                JSONObject response = event.getJSONObject("response");
+                check("failed".equals(response.getString("status")), "terminal response status");
+                failure = response.getJSONObject("error");
+            }
+        }
+        check(failure != null && !wire.contains("response.completed"), "missing or contradictory stream failure");
+        return failure;
+    }
+
+    public static void main(String[] args) throws Exception { int failures=0; terminalSemantics(); publicStreamErrors(); try { invalidChat(); } catch(AssertionError e){System.err.println(e); failures++;} try {lateToolMetadata();} catch(AssertionError e){System.err.println(e);failures++;} try {fragmentedName();} catch(AssertionError e){System.err.println(e);failures++;} try {requestValidation();} catch(AssertionError e){System.err.println(e);failures++;} try {finalOnly();} catch(AssertionError e){System.err.println(e);failures++;} try {argumentsDone();} catch(AssertionError e){System.err.println(e);failures++;} try {lifecycleAndInterleave();} catch(AssertionError e){System.err.println(e);failures++;} try {gatewayFixtures();} catch(AssertionError e){System.err.println(e);failures++;} try {projectionBoundaries();} catch(AssertionError e){System.err.println(e);failures++;} try {invalidFinalCalls();} catch(AssertionError e){System.err.println(e);failures++;} try {prematureDone();} catch(AssertionError e){System.err.println(e);failures++;} try {doneWithoutSpace();} catch(AssertionError e){System.err.println(e);failures++;} try {nullErrorFields();} catch(AssertionError e){System.err.println(e);failures++;} try {repeatedToolIdentity();} catch(AssertionError e){System.err.println(e);failures++;} try {identityFragmentsAreNotGuessed();} catch(AssertionError e){System.err.println(e);failures++;} if(failures>0)throw new AssertionError(failures+" failures"); }
 }

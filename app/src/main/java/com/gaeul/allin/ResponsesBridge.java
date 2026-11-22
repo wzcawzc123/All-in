@@ -65,7 +65,10 @@ final class ResponsesBridge {
 
     /** A conservative projection: native-only fields are never sent through Chat. */
     static JSONObject projection(JSONObject request) throws Exception {
-        JSONObject copy = normalize(request);
+        return projectNormalized(normalize(request));
+    }
+
+    private static JSONObject projectNormalized(JSONObject copy) throws Exception {
         for(String key:new String[]{"previous_response_id","conversation","prompt","background","max_tool_calls","top_logprobs","prompt_cache_retention","client_metadata","access_programs"}) copy.remove(key);
         JSONObject streamOptions=copy.optJSONObject("stream_options"); if(streamOptions!=null) { streamOptions.remove("include_obfuscation"); if(streamOptions.length()==0) copy.remove("stream_options"); }
         if(copy.has("include") && !copy.isNull("include") && copy.optJSONArray("include")==null) throw new IllegalArgumentException("include must be an array");
@@ -112,34 +115,40 @@ final class ResponsesBridge {
             }
             copy.put("input",projected);
         }
-        return toChatInternal(copy);
+        return convertProjected(copy);
+    }
+
+    private static String nativeOnlyField(JSONObject r) {
+        if(!r.optString("previous_response_id", "").isEmpty() && !r.isNull("previous_response_id")) return "previous_response_id requires full input for this route";
+        if(r.has("conversation") && !r.isNull("conversation")) return "conversation requires full input for this route";
+        if(r.has("prompt") && !r.isNull("prompt")) return "prompt requires full input for this route";
+        if(r.optBoolean("background",false)) return "background=true requires a synchronous call (background=false)";
+        if(r.has("max_tool_calls") && !r.isNull("max_tool_calls")) return "max_tool_calls requires a native Responses route";
+        JSONArray items=r.optJSONArray("input"); for(int i=0;items!=null && i<items.length();i++) { JSONObject item=items.optJSONObject(i); if(item!=null && "reasoning".equals(item.optString("type")) && !item.isNull("encrypted_content") && !item.optString("encrypted_content", "").isEmpty()) return "encrypted reasoning cannot be represented by Chat; use a native Responses route"; }
+        for(int i=0;items!=null && i<items.length();i++) { JSONObject item=items.optJSONObject(i); JSONArray parts=item==null?null:item.optJSONArray("content"); for(int j=0;parts!=null && j<parts.length();j++) { JSONObject part=parts.optJSONObject(j); if(part!=null && "refusal".equals(part.optString("type"))) return "refusal history requires a native Responses route"; } }
+        for(String key:new String[]{"top_logprobs","prompt_cache_retention","client_metadata","access_programs"}) if(r.has(key)) return key+" requires a native Responses route";
+        if(r.has("store") && r.optBoolean("store",false)) return "store=true requires a native Responses route";
+        JSONArray includes=r.optJSONArray("include"); for(int i=0;includes!=null && i<includes.length();i++) if(!Arrays.asList("reasoning.encrypted_content", "message.output_text.logprobs", "message.input_image.image_url", "file_search_call.results", "web_search_call.action.sources", "code_interpreter_call.outputs", "computer_call_output.output.image_url").contains(includes.optString(i))) return "Unsupported include value: "+includes.optString(i);
+        return null;
     }
 
     static String nativeOnlyReason(JSONObject request) {
         try {
-            JSONObject r=normalize(request);
-            if(!r.optString("previous_response_id", "").isEmpty() && !r.isNull("previous_response_id")) return "previous_response_id requires full input for this route";
-            if(r.has("conversation") && !r.isNull("conversation")) return "conversation requires full input for this route";
-            if(r.has("prompt") && !r.isNull("prompt")) return "prompt requires full input for this route";
-            if(r.optBoolean("background",false)) return "background=true requires a synchronous call (background=false)";
-            if(r.has("max_tool_calls") && !r.isNull("max_tool_calls")) return "max_tool_calls requires a native Responses route";
-            JSONArray items=r.optJSONArray("input"); for(int i=0;items!=null && i<items.length();i++) { JSONObject item=items.optJSONObject(i); if(item!=null && "reasoning".equals(item.optString("type")) && !item.isNull("encrypted_content") && !item.optString("encrypted_content", "").isEmpty()) return "encrypted reasoning cannot be represented by Chat; use a native Responses route"; }
-            for(int i=0;items!=null && i<items.length();i++) { JSONObject item=items.optJSONObject(i); JSONArray parts=item==null?null:item.optJSONArray("content"); for(int j=0;parts!=null && j<parts.length();j++) { JSONObject part=parts.optJSONObject(j); if(part!=null && "refusal".equals(part.optString("type"))) return "refusal history requires a native Responses route"; } }
-            for(String key:new String[]{"top_logprobs","prompt_cache_retention","client_metadata","access_programs"}) if(r.has(key)) return key+" requires a native Responses route";
-            if(r.has("store") && r.optBoolean("store",false)) return "store=true requires a native Responses route";
-            JSONArray includes=r.optJSONArray("include"); for(int i=0;includes!=null && i<includes.length();i++) if(!Arrays.asList("reasoning.encrypted_content", "message.output_text.logprobs", "message.input_image.image_url", "file_search_call.results", "web_search_call.action.sources", "code_interpreter_call.outputs", "computer_call_output.output.image_url").contains(includes.optString(i))) return "Unsupported include value: "+includes.optString(i);
-            projection(r); return null;
-        } catch (Exception e) { return e.getMessage(); }
+            toChat(request);
+            return null;
+        } catch (Exception invalid) {
+            return invalid.getMessage();
+        }
     }
 
     static JSONObject toChat(JSONObject request) throws Exception {
-        String unsupported=nativeOnlyReason(request);
-        if(unsupported!=null) throw new IllegalArgumentException(unsupported);
-        return projection(request);
+        JSONObject copy = normalize(request);
+        String unsupported = nativeOnlyField(copy);
+        if (unsupported != null) throw new IllegalArgumentException(unsupported);
+        return projectNormalized(copy);
     }
 
-    static JSONObject toChatInternal(JSONObject request) throws Exception {
-        request=normalize(request);
+    private static JSONObject convertProjected(JSONObject request) throws Exception {
         for (Iterator<String> keys = request.keys(); keys.hasNext();) {
             String key = keys.next();
             if (!FIELDS.contains(key)) throw new IllegalArgumentException("Unsupported Responses field: " + key);
@@ -639,7 +648,14 @@ final class ResponsesBridge {
                         }
                     } catch(Exception e) {
                         ended=true;
-                        try { start(); JSONObject error=terminalRateError==null?new JSONObject().put("code","upstream_stream_error").put("message",e.getMessage()==null?"upstream stream failed":e.getMessage()):terminalRateError; response.put("status","failed").put("error",error); event("response.failed",new JSONObject().put("response",response)); } catch(Exception ignored) {}
+                        try {
+                            start();
+                            JSONObject error = terminalRateError == null
+                                    ? new JSONObject().put("code", "upstream_stream_error").put("message", "upstream stream failed")
+                                    : terminalRateError;
+                            response.put("status", "failed").put("error", error);
+                            event("response.failed", new JSONObject().put("response", response));
+                        } catch (Exception ignored) {}
                     }
                     if(pending.length()>0) { bytes=pending.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8); pending.setLength(0); at=0; return true; }
                 } return true;
@@ -681,32 +697,67 @@ final class ResponsesBridge {
         JSONObject u=response.optJSONObject("usage"); if(u!=null)out.put("usage",chatUsage(u)); return out;
     }
     static JSONObject chatUsage(JSONObject u) throws Exception { JSONObject out=new JSONObject().put("prompt_tokens",u.optInt("input_tokens",0)).put("completion_tokens",u.optInt("output_tokens",0)).put("total_tokens",u.optInt("total_tokens",u.optInt("input_tokens",0)+u.optInt("output_tokens",0))); if(u.has("input_tokens_details"))out.put("prompt_tokens_details",u.get("input_tokens_details")); if(u.has("output_tokens_details"))out.put("completion_tokens_details",u.get("output_tokens_details")); if(u.optBoolean("magpie_cache_unknown",false))out.put("magpie_cache_unknown",true);if(u.optBoolean("estimated",false))out.put("estimated",true); return out; }
+    // Retained UTF-16 values and entry counts are independent of the SSE line limit.
+    static final int CHAT_STREAM_MAX_CHARS = 2 * 1024 * 1024;
+    static final int CHAT_STREAM_MAX_ENTRIES = 1024;
+    private static final class ChatStreamLimit extends java.io.IOException { }
+
     static java.io.InputStream responsesStreamToChat(final java.io.InputStream source, final String model) {
         return new java.io.InputStream() {
             final java.io.BufferedReader in=new BoundedSseReader(new java.io.InputStreamReader(source,java.nio.charset.StandardCharsets.UTF_8));
-            final java.util.Map<Integer,Integer> calls=new java.util.HashMap<Integer,Integer>();
-            final java.util.Map<Integer,String> callIds=new java.util.HashMap<Integer,String>();
-            final java.util.Map<Integer,String> callNames=new java.util.HashMap<Integer,String>();
-            final java.util.Map<Integer,String> callArgs=new java.util.HashMap<Integer,String>();
-            final java.util.Map<String,String> content=new java.util.HashMap<String,String>();
+            final java.util.Map<Integer,Integer> calls=new java.util.HashMap<>();
+            final java.util.Map<Integer,String> callIds=new java.util.HashMap<>();
+            final java.util.Map<Integer,String> callNames=new java.util.HashMap<>();
+            final java.util.Map<Integer,StringBuilder> callArgs=new java.util.HashMap<>();
+            final java.util.Map<String,StringBuilder> content=new java.util.HashMap<>();
+            int retainedChars;
+
+            void reserve(int count) throws ChatStreamLimit {
+                if (count > CHAT_STREAM_MAX_CHARS - retainedChars) throw new ChatStreamLimit();
+                retainedChars += count;
+            }
+
+            String snapshotSuffix(StringBuilder previous, String snapshot, String error) throws java.io.IOException {
+                int length = previous.length();
+                if (snapshot.length() < length) throw new java.io.IOException(error);
+                for (int i = 0; i < length; i++) {
+                    if (snapshot.charAt(i) != previous.charAt(i)) throw new java.io.IOException(error);
+                }
+                return snapshot.substring(length);
+            }
+
             String id="chatcmpl-"+java.util.UUID.randomUUID().toString().replace("-", ""); byte[] bytes=new byte[0]; int at=0; boolean ended=false, completed=false;
             String chunk(JSONObject delta,Object finish,JSONObject usage) throws Exception { JSONObject choice=new JSONObject().put("index",0).put("delta",delta).put("finish_reason",finish==null?JSONObject.NULL:finish); JSONObject o=new JSONObject().put("id",id).put("object","chat.completion.chunk").put("created",System.currentTimeMillis()/1000).put("model",model).put("choices",new JSONArray().put(choice)); if(usage!=null)o.put("usage",usage); return "data: "+o.toString()+"\n\n"; }
-            String key(String kind,int output,int part) { return kind+":"+output+":"+part; }
+            StringBuilder contentPart(String kind, int output, int part) throws ChatStreamLimit {
+                String key = kind + ":" + output + ":" + part;
+                StringBuilder buffer = content.get(key);
+                if (buffer == null) {
+                    if (content.size() >= CHAT_STREAM_MAX_ENTRIES) throw new ChatStreamLimit();
+                    buffer = new StringBuilder();
+                    content.put(key, buffer);
+                }
+                return buffer;
+            }
             String appendContent(String kind,int output,int part,String value) throws Exception {
-                String k=key(kind,output,part), old=content.containsKey(k)?content.get(k):"";
-                content.put(k,old+value);
+                StringBuilder buffer = contentPart(kind, output, part);
+                reserve(value.length());
+                buffer.append(value);
                 return value.isEmpty()?"":chunk(new JSONObject().put(kind,value),null,null);
             }
             String reconcileContent(String kind,int output,int part,String value) throws Exception {
-                String k=key(kind,output,part), old=content.containsKey(k)?content.get(k):"";
-                if(!value.startsWith(old)) throw new java.io.IOException("content changed in final response");
-                return appendContent(kind,output,part,value.substring(old.length()));
+                StringBuilder buffer = contentPart(kind, output, part);
+                String delta = snapshotSuffix(buffer, value, "content changed in final response");
+                reserve(delta.length());
+                buffer.append(delta);
+                return delta.isEmpty()?"":chunk(new JSONObject().put(kind,delta),null,null);
             }
             String addCall(int output,JSONObject item) throws Exception {
                 if(calls.containsKey(output)) return "";
+                if (calls.size() >= CHAT_STREAM_MAX_ENTRIES) throw new ChatStreamLimit();
                 int idx=calls.size(); calls.put(output,idx);
                 String name=toolFragment(item,"name"), args=toolFragment(item,"arguments"), callId=toolFragment(item,"call_id");
-                callIds.put(output,callId); callNames.put(output,name); callArgs.put(output,args);
+                reserve(callId.length() + name.length() + args.length());
+                callIds.put(output,callId); callNames.put(output,name); callArgs.put(output,new StringBuilder(args));
                 JSONObject fn=new JSONObject().put("arguments",args);
                 if(!name.isEmpty()) fn.put("name",name);
                 JSONObject call=new JSONObject().put("index",idx).put("type","function").put("function",fn);
@@ -717,15 +768,18 @@ final class ResponsesBridge {
                 String result=addCall(output,item); Integer idx=calls.get(output);
                 String oldId=callIds.get(output), callId=item.has("call_id")?toolFragment(item,"call_id"):oldId;
                 String oldName=callNames.get(output), name=item.has("name")?toolFragment(item,"name"):oldName;
-                String oldArgs=callArgs.get(output), args=item.has("arguments")?toolFragment(item,"arguments"):oldArgs;
+                StringBuilder arguments = callArgs.get(output);
+                String delta = item.has("arguments") ? snapshotSuffix(arguments, toolFragment(item,"arguments"),
+                        "function call changed in final response") : "";
                 // Responses done/final fields are cumulative snapshots. Only emit
                 // the missing suffix, including late IDs; conflicting IDs fail.
-                if(!callId.startsWith(oldId) || !name.startsWith(oldName) || !args.startsWith(oldArgs)) throw new java.io.IOException("function call changed in final response");
+                if(!callId.startsWith(oldId) || !name.startsWith(oldName)) throw new java.io.IOException("function call changed in final response");
                 JSONObject fn=new JSONObject(), call=new JSONObject().put("index",idx);
                 if(callId.length()>oldId.length()) call.put("id",callId.substring(oldId.length()));
                 if(name.length()>oldName.length()) fn.put("name",name.substring(oldName.length()));
-                if(args.length()>oldArgs.length()) fn.put("arguments",args.substring(oldArgs.length()));
-                callIds.put(output,callId); callNames.put(output,name); callArgs.put(output,args);
+                reserve(callId.length() - oldId.length() + name.length() - oldName.length() + delta.length());
+                if (!delta.isEmpty()) fn.put("arguments",delta);
+                callIds.put(output,callId); callNames.put(output,name); arguments.append(delta);
                 if(fn.length()>0) call.put("function",fn);
                 if(fn.length()>0 || call.has("id")) result+=chunk(new JSONObject().put("tool_calls",new JSONArray().put(call)),null,null);
                 return result;
@@ -739,7 +793,8 @@ final class ResponsesBridge {
                 }
             }
             String reconcileItem(int output,JSONObject item) throws Exception {
-                String type=item.optString("type"), result="";
+                String type = item.optString("type");
+                StringBuilder result = new StringBuilder();
                 if("function_call".equals(type)) {
                     toolString(item,"call_id"); toolString(item,"name"); toolArguments(item);
                     return reconcileCall(output,item);
@@ -748,15 +803,15 @@ final class ResponsesBridge {
                     JSONArray parts=item.optJSONArray("content");
                     for(int j=0;parts!=null && j<parts.length();j++) {
                         JSONObject part=parts.getJSONObject(j); String partType=part.optString("type");
-                        if("output_text".equals(partType)) result+=reconcileContent("content",output,j,part.optString("text"));
-                        else if("refusal".equals(partType)) result+=reconcileContent("refusal",output,j,part.optString("refusal"));
+                        if("output_text".equals(partType)) result.append(reconcileContent("content",output,j,part.optString("text")));
+                        else if("refusal".equals(partType)) result.append(reconcileContent("refusal",output,j,part.optString("refusal")));
                         else throw new java.io.IOException("Unsupported output content");
                     }
                 } else if("reasoning".equals(type)) {
                     JSONArray parts=item.optJSONArray("summary");
-                    for(int j=0;parts!=null && j<parts.length();j++) result+=reconcileContent("reasoning_content",output,j,parts.getJSONObject(j).optString("text"));
+                    for(int j=0;parts!=null && j<parts.length();j++) result.append(reconcileContent("reasoning_content",output,j,parts.getJSONObject(j).optString("text")));
                 } else throw new java.io.IOException("Unsupported output item");
-                return result;
+                return result.toString();
             }
             boolean fill() throws java.io.IOException {
                 while(at>=bytes.length) {
@@ -776,7 +831,9 @@ final class ResponsesBridge {
                             }
                             else if("response.function_call_arguments.delta".equals(type)) {
                                 int output=toolIndex(event,"output_index"); Integer idx=calls.get(output); if(idx==null) throw new java.io.IOException("function arguments before item");
-                                String args=toolFragment(event,"delta"); callArgs.put(output,callArgs.get(output)+args);
+                                String args=toolFragment(event,"delta");
+                                reserve(args.length());
+                                callArgs.get(output).append(args);
                                 JSONObject call=new JSONObject().put("index",idx).put("function",new JSONObject().put("arguments",args));
                                 result=chunk(new JSONObject().put("tool_calls",new JSONArray().put(call)),null,null);
                             }
@@ -784,7 +841,25 @@ final class ResponsesBridge {
                                 int output=toolIndex(event,"output_index"); if(!calls.containsKey(output)) throw new java.io.IOException("function arguments before item");
                                 result=reconcileCall(output,new JSONObject().put("arguments",toolArguments(event)));
                             }
-                            else if("response.completed".equals(type) || "response.incomplete".equals(type)) { JSONObject r=event.optJSONObject("response"); if(r==null || !type.substring(9).equals(r.optString("status"))) throw new java.io.IOException("invalid Responses terminal status"); if(r.has("error") && !r.isNull("error")) throw new java.io.IOException("terminal Responses contains error"); String incompleteReason="response.incomplete".equals(type)?incompleteFinish(r):null; JSONArray finalOutput=r.optJSONArray("output"); for(int i=0;finalOutput!=null && i<finalOutput.length();i++) result+=reconcileItem(i,finalOutput.getJSONObject(i)); validateCalls(); JSONObject u=r.optJSONObject("usage"); String reason=incompleteReason!=null?incompleteReason:calls.isEmpty()?"stop":"tool_calls"; result+=chunk(delta,reason,u==null?null:chatUsage(u))+"data: [DONE]\n\n"; completed=true; ended=true; }
+                            else if ("response.completed".equals(type) || "response.incomplete".equals(type)) {
+                                JSONObject r = event.optJSONObject("response");
+                                if (r == null || !type.substring(9).equals(r.optString("status")))
+                                    throw new java.io.IOException("invalid Responses terminal status");
+                                if (r.has("error") && !r.isNull("error")) throw new java.io.IOException("terminal Responses contains error");
+                                String incompleteReason = "response.incomplete".equals(type) ? incompleteFinish(r) : null;
+                                JSONArray finalOutput = r.optJSONArray("output");
+                                StringBuilder terminal = new StringBuilder();
+                                for (int i = 0; finalOutput != null && i < finalOutput.length(); i++)
+                                    terminal.append(reconcileItem(i, finalOutput.getJSONObject(i)));
+                                validateCalls();
+                                JSONObject usage = r.optJSONObject("usage");
+                                String reason = incompleteReason != null ? incompleteReason : calls.isEmpty() ? "stop" : "tool_calls";
+                                terminal.append(chunk(delta, reason, usage == null ? null : chatUsage(usage)));
+                                terminal.append("data: [DONE]\n\n");
+                                result = terminal.toString();
+                                completed = true;
+                                ended = true;
+                            }
                             else if("response.failed".equals(type)||"error".equals(type)) {
                                 // A null error field must still surface one real error
                                 // object; falling back to the event body or to a fixed
@@ -801,7 +876,14 @@ final class ResponsesBridge {
                                 result="data: "+new JSONObject().put("error",reported).toString()+"\n\n"; ended=true;
                             }
                         }
+                    } catch (ChatStreamLimit limit) {
+                        ended = true;
+                        result = GatewayServer.openAiStreamError("Responses stream exceeds the gateway aggregation limit");
+                    } catch (javax.net.ssl.SSLException tlsReadFailure) {
+                        ended = true;
+                        result = GatewayServer.openAiStreamError("Responses upstream TLS read failed before completion");
                     } catch(Exception ex) { ended=true; result="data: {\"error\":{\"message\":\"Invalid Responses stream\"}}\n\n"; }
+                    if (ended) { content.clear(); calls.clear(); callIds.clear(); callNames.clear(); callArgs.clear(); }
                     if(!result.isEmpty()) {bytes=result.getBytes(java.nio.charset.StandardCharsets.UTF_8);at=0;return true;}
                 }return true;
             }

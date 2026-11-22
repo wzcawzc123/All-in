@@ -268,7 +268,7 @@ final class MiniMaxMedia {
         int separator = url.indexOf(',');
         String mime = ref.optString("mime_type", url.substring(5, url.indexOf(';')));
         byte[] data;
-        try { data = java.util.Base64.getDecoder().decode(url.substring(separator + 1)); }
+        try { data = MediaBase64.decodeStandard(url.substring(separator + 1)); }
         catch (IllegalArgumentException e) { throw invalid("Invalid reference image base64"); }
         if (data.length == 0 || data.length > 64 * 1024 * 1024) throw invalid("Invalid reference image size");
         String filename = "reference." + mime.substring(6);

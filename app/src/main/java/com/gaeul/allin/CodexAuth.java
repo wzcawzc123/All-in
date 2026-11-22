@@ -758,7 +758,7 @@ public class CodexAuth {
      * 将 OpenAI Chat Completions payload 转换为 Codex Responses 格式 payload
      */
     public static JSONObject chatToResponses(JSONObject chatReq, String upstreamModel) throws Exception {
-        return ResponsesBridge.chatToResponses(chatReq, upstreamModel);
+        return CodexChatProjection.convert(chatReq, upstreamModel).body;
     }
 
     /**

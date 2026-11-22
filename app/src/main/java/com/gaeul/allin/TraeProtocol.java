@@ -64,7 +64,7 @@ public final class TraeProtocol {
             int start=p; while(p<s.length()&&",]} \t\r\n".indexOf(s.charAt(p))<0)p++;String v=s.substring(start,p);if(!v.matches("true|false|null|-?(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?"))throw bad("invalid JSON value"); }
         void str() throws IOException {if(p>=s.length()||s.charAt(p++)!='"')throw bad("invalid JSON string");while(p<s.length()){char c=s.charAt(p++);if(c=='"')return;if(c<32)throw bad("invalid JSON character");if(c=='\\'){if(p>=s.length())throw bad("truncated JSON escape");c=s.charAt(p++);if(c=='u'){for(int i=0;i<4;i++)if(p>=s.length()||Character.digit(s.charAt(p++),16)<0)throw bad("invalid JSON escape");}else if("\"\\/bfnrt".indexOf(c)<0)throw bad("invalid JSON escape");}}throw bad("truncated JSON string");}
     }
-    private static JSONObject strictObject(String s) throws Exception {if(s==null||s.length()>LIMIT)throw bad("invalid JSON size");JsonCheck j=new JsonCheck(s);j.value(0);j.ws();if(j.p!=s.length())throw bad("trailing JSON");Object x=new JSONTokener(s).nextValue();if(!(x instanceof JSONObject))throw bad("arguments must be a JSON object");return (JSONObject)x;}
+    static JSONObject strictObject(String s) throws IOException {if(s==null||s.length()>LIMIT)throw bad("invalid JSON size");JsonCheck j=new JsonCheck(s);j.value(0);j.ws();if(j.p!=s.length())throw bad("trailing JSON");Object x=new JSONTokener(s).nextValue();if(!(x instanceof JSONObject))throw bad("arguments must be a JSON object");return (JSONObject)x;}
     private static void fields(JSONObject o,String... allowed) throws IOException {try{ImageContent.keys(o,allowed);}catch(IllegalArgumentException ex){throw bad("unsupported object field");}}
     private static void functionType(JSONObject o,boolean required) throws IOException {Object t=o.opt("type");if((required&&t==null)||(t!=null&&(!(t instanceof String)||!"function".equals(t))))throw bad("invalid function type");}
     private static void validateTool(JSONObject tool) throws Exception {fields(tool,"type","function");functionType(tool,false);JSONObject f=tool.optJSONObject("function");if(f==null)throw bad("missing tool function");fields(f,"name","description","parameters","strict");if(f.has("strict")&&!Boolean.FALSE.equals(f.opt("strict")))throw bad("unsupported tool strict");required(f,"name");if(f.has("description")&&!(f.opt("description") instanceof String))throw bad("invalid tool description");Object schema=f.opt("parameters");if(schema!=null&&!(schema instanceof JSONObject)&&!(schema instanceof String))throw bad("invalid tool parameters");}
@@ -99,7 +99,7 @@ public final class TraeProtocol {
         if(openai==null)throw bad("missing request");
         // Constructed wire body never copies extension fields. Reject known controls
         // whose semantics cannot be represented; optional sampling hints use model defaults.
-        for(String key:new String[]{"response_format","stop","logprobs","top_logprobs","logit_bias","functions","function_call","modalities","audio","prediction","web_search_options"})
+        for(String key:new String[]{"stop","logprobs","top_logprobs","logit_bias","functions","function_call","modalities","audio","prediction","web_search_options"})
             if(openai.has(key) && !openai.isNull(key)) throw bad("unsupported request field: "+key);
         for(String key:new String[]{"top_p","seed","presence_penalty","frequency_penalty"}) {
             Object v=openai.opt(key); if(v==null||v==JSONObject.NULL)continue;
@@ -132,6 +132,7 @@ public final class TraeProtocol {
         JSONArray declaredTools=openai.optJSONArray("tools");
         boolean nativeTools=declaredTools!=null&&declaredTools.length()>0&&!"none".equals(openai.opt("tool_choice"));
         JSONArray out=new JSONArray(), pending=new JSONArray();
+        TraeResponseFormat format = TraeResponseFormat.from(openai);
         Set<String> calls=new HashSet<>(), results=new HashSet<>(), outstanding=new HashSet<>();
         Map<String,String> callNames=new HashMap<>();
         for(int i=0;i<msgs.length();i++){
@@ -208,6 +209,18 @@ public final class TraeProtocol {
         }
         if(!outstanding.isEmpty())throw bad("incomplete tool results");
         flush(out,pending);
+        if (format != null && out.length() > 0) {
+            JSONObject formatPart = new JSONObject().put("type", "text").put("text", format.instruction(nativeTools));
+            JSONObject first = out.getJSONObject(0);
+            if ("system".equals(first.optString("role"))) {
+                first.getJSONArray("content").put(formatPart);
+            } else {
+                JSONArray withFormat = new JSONArray().put(new JSONObject().put("role", "system")
+                        .put("content", new JSONArray().put(formatPart)));
+                for (int i = 0; i < out.length(); i++) withFormat.put(out.getJSONObject(i));
+                out = withFormat;
+            }
+        }
         String config=maxMode?requiredString(baseModel,"Max base model"):model;
         JSONObject body=new JSONObject().put("messages",out).put("function",function).put("config_name",config).put("model",config).put("stream",true).put("request_id",UUID.randomUUID().toString()).put("session_id",session==null||session.isEmpty()?UUID.randomUUID().toString():session);if(modelName!=null&&!modelName.isEmpty())body.put("model_name",modelName);
         // Trae 0.2.45 sends the catalog's output budget in normal mode too.
@@ -301,6 +314,8 @@ public final class TraeProtocol {
     public static final class Decoder {
         public boolean terminal; public JSONObject usage; public String finishReason;
         private final int outputLimit;
+        private final boolean structured;
+        private boolean structuredText;
         private boolean unmappedFinish;
         public String modelName(){return model;}
         public String chunkId(){return chunkId;}
@@ -309,6 +324,10 @@ public final class TraeProtocol {
         private static final class Call {String id="",name="",args="";Integer index;}
         public Decoder(JSONArray tools,String model){this(tools,model,0);}
         public Decoder(JSONArray tools,String model,int outputLimit){
+            this(tools, model, outputLimit, false);
+        }
+        Decoder(JSONArray tools, String model, int outputLimit, boolean structured) {
+            this.structured = structured;
             if(outputLimit<0)throw new IllegalArgumentException("negative Trae output limit");
             this.outputLimit=outputLimit;
             this.model=model==null?"":model;if(tools!=null)for(int i=0;i<tools.length();i++){JSONObject t=tools.optJSONObject(i);if(t!=null){JSONObject f=t.optJSONObject("function");if(f!=null){String name=f.optString("name");if(!name.isEmpty()){names.add(name);Object schema=f.opt("parameters");if(schema instanceof String){try{schema=new JSONObject((String)schema);}catch(Exception notJson){schema=null;}}declaredProperties.put(name,schema instanceof JSONObject?((JSONObject)schema).optJSONObject("properties"):null);}}}}}
@@ -368,6 +387,17 @@ public final class TraeProtocol {
         // Keep only a possible marker prefix or an unfinished call; ordinary text is emitted immediately.
         private static final String[] MARKERS={"<tool_call", "<toolcall", "</tool_call", "</toolcall", "<function_calls", "</function_calls", "<antml:function_calls", "</antml:function_calls", "<invoke", "<antml:invoke", "</antml:invoke", "<function=", "<｜DSML｜", "<|DSML|", "</｜DSML｜", "</|DSML|"};
         private void drainText(List<JSONObject> out,boolean last) throws Exception {
+            if (structured && !structuredText) {
+                String start = text.toString().trim();
+                structuredText = names.isEmpty() || start.startsWith("{") || start.startsWith("`");
+            }
+            if (structuredText) {
+                if (text.length() > 0) {
+                    out.add(chunk(new JSONObject().put("content", text.toString()), null));
+                    text.setLength(0);
+                }
+                return;
+            }
             // Right after a call, the blanks and closes that follow it are dropped as its leftovers.
             if(afterCall){skipLeftover();if(text.length()==0)return;}
             while(text.length()>0){String s=text.toString();int pos=-1;String marker=null;

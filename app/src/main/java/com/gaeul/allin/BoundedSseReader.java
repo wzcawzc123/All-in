@@ -53,7 +53,11 @@ final class BoundedSseReader extends BufferedReader {
     }
     Event readEvent()throws IOException {
         release();StringBuilder data=new StringBuilder(),meta=new StringBuilder();boolean has=false,any=false;int size=0;
-        try {for(;;){String l=line();if(l==null)return any?new Event(data.toString(),meta.toString(),has):null;
+        try {for(;;){String l=line();if (l == null) {
+                if (has) throw new EOFException("Truncated SSE event before blank line");
+                release();
+                return null;
+            }
             if(l.isEmpty()){if(any)return new Event(data.toString(),meta.toString(),has);continue;}
             any=true;size+=l.length()+1;if(size>MAX_EVENT_CHARS)throw new IOException("SSE event buffer limit exceeded");
             int colon=l.indexOf(':');String field=colon<0?l:l.substring(0,colon);String value=colon<0?"":l.substring(colon+1);if(value.startsWith(" "))value=value.substring(1);

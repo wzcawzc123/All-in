@@ -127,15 +127,27 @@ final class CatPawStream extends InputStream {
         reply.close();
     }
     private static String delta(String old,String current)throws IOException {if(old.startsWith(current))return "";if(!current.startsWith(old))throw new IOException("CatPaw cumulative text changed");int end=current.length();if(end>0&&Character.isHighSurrogate(current.charAt(end-1)))end--;return end<old.length()?"":current.substring(old.length(),end);}
+    /** A complete assistant message is business terminal evidence, not a promise of TCP EOF. */
+    private static boolean businessFinished(JSONObject frame, JSONObject message) {
+        if (message.has("type") && !"assistant".equals(message.optString("type"))) return false;
+        Object outer = frame.opt("finished"), inner = message.opt("finished");
+        // Do not close a message while either level explicitly says it is still in progress.
+        if (Boolean.FALSE.equals(outer) || Boolean.FALSE.equals(inner)) return false;
+        return Boolean.TRUE.equals(outer) || Boolean.TRUE.equals(inner);
+    }
     private void fill()throws Exception {
-        while(pending.available()==0&&!terminal){String line=line();if(line==null){if(!finished)throw new IOException("CatPaw stream ended without terminal evidence");done();return;}if(!line.startsWith("data:"))continue;String data=line.substring(5).trim();if(data.isEmpty())continue;if("[DONE]".equals(data)){done();return;}
+        while(pending.available()==0&&!terminal){if(finished){done();return;}String line=line();if(line==null){if(!finished)throw new IOException("CatPaw stream ended without terminal evidence");done();return;}if(!line.startsWith("data:"))continue;String data=line.substring(5).trim();if(data.isEmpty())continue;if("[DONE]".equals(data)){done();return;}
             new BoundedStrictJson(data).run();JSONObject frame=new JSONObject(data);if(!frame.isNull("error")){JSONObject error=frame.optJSONObject("error");Integer code=error==null?null:code(error.opt("code"));int status=error!=null&&error.optString("message").contains("余额不足")?402:business(code);throw new CatPawAuth.Failure(status,code,true);}
-            JSONObject message=frame.optJSONObject("message");if(message==null){if(!frame.isNull("message"))throw new IOException("CatPaw invalid message");continue;}JSONArray parts=message.optJSONArray("content");if(parts==null){if(message.has("content"))throw new IOException("CatPaw invalid content");continue;}
+            JSONObject message=frame.optJSONObject("message");if(message==null){if(!frame.isNull("message"))throw new IOException("CatPaw invalid message");continue;}JSONArray parts=message.optJSONArray("content");if(parts==null){if(message.has("content"))throw new IOException("CatPaw invalid content");if(businessFinished(frame,message))finished=true;continue;}
             StringBuilder t=new StringBuilder(),r=new StringBuilder();boolean hasText=false,hasReason=false;
             for(int i=0;i<parts.length();i++){JSONObject p=parts.optJSONObject(i);if(p==null)throw new IOException("CatPaw invalid part");if(!"text".equals(p.optString("type")))continue;if(p.has("text")&&!p.isNull("text")){if(!(p.opt("text")instanceof String))throw new IOException("CatPaw invalid text");t.append(p.getString("text"));hasText=true;}if(p.has("reasoningContent")&&!p.isNull("reasoningContent")){if(!(p.opt("reasoningContent")instanceof String))throw new IOException("CatPaw invalid reasoning");r.append(p.getString("reasoningContent"));hasReason=true;}}
             JSONObject d=new JSONObject();if(hasText){String current=t.toString(),head=current.replaceFirst("^\\s+","");boolean modelless=message.isNull("model")&&message.isNull("modelDisplayName");if(text.isEmpty()&&modelless&&head.startsWith("当前余额不足以完成本次操作"))throw new CatPawAuth.Failure(402,null,true);boolean held=text.isEmpty()&&modelless&&!head.isEmpty()&&"当前余额不足以完成本次操作".startsWith(head);if(!held){String next=delta(text,current);if(!next.isEmpty()){text+=next;String visible=visibleText(next);if(!visible.isEmpty())d.put("content",visible);}}}
             if(hasReason){String next=delta(reasoning,r.toString());if(!next.isEmpty()){d.put("reasoning_content",next);reasoning+=next;}}
-            finished=Boolean.TRUE.equals(message.opt("finished"));if(d.length()>0)emit(d);
+            finished=businessFinished(frame,message);
+            if(finished && ((hasText && t.length()>0 && Character.isHighSurrogate(t.charAt(t.length()-1)))
+                    || (hasReason && r.length()>0 && Character.isHighSurrogate(r.charAt(r.length()-1)))))
+                throw new IOException("CatPaw incomplete terminal Unicode");
+            if(d.length()>0)emit(d);
         }
     }
     private void fail(Exception error){int status=CatPawAuth.failureStatus(error);String message=status==402?"妙手余额不足，流式响应已停止":status==401?"妙手登录已失效，流式响应已停止":status==429?"妙手限流，请等待约45秒后重试":"妙手流式响应不完整，未重复发送请求";JSONObject detail=new JSONObject().put("type",status==402?"insufficient_quota":status==429?"rate_limit_error":"upstream_error").put("status",status).put("message",message);if(error instanceof CatPawAuth.Failure&&((CatPawAuth.Failure)error).businessCode!=null)detail.put("business_code",((CatPawAuth.Failure)error).businessCode);if(status==429)detail.put("retry_after_seconds",45);terminal=true;pending=new ByteArrayInputStream(("data: "+new JSONObject().put("error",detail)+"\n\ndata: [DONE]\n\n").getBytes(StandardCharsets.UTF_8));reply.close();}

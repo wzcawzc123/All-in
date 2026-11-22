@@ -199,14 +199,14 @@ public final class AllInHeldResponse extends NanoHTTPD.Response {
         private void updateBoundary(byte[] b, int off, int len) {
             for (int i = off; i < off + len; i++) {
                 int c = b[i] & 255;
-                if (c == '\n') {
-                    boundary = lineEmpty;
-                    lineEmpty = true; previousCR = false;
-                } else if (c == '\r') {
-                    if (previousCR) lineEmpty = false;
-                    previousCR = true; boundary = false;
+                if (c == '\n' || c == '\r') {
+                    if (c == '\r' || !previousCR) boundary = lineEmpty;
+                    lineEmpty = true;
+                    previousCR = c == '\r';
                 } else {
-                    lineEmpty = false; previousCR = false; boundary = false;
+                    lineEmpty = false;
+                    previousCR = false;
+                    boundary = false;
                 }
             }
         }
@@ -280,8 +280,18 @@ public final class AllInHeldResponse extends NanoHTTPD.Response {
                         int c = b[i] & 255;
                         match = (match == 0 && c == 13) ? 1 : (match == 1 && c == 10) ? 2 :
                                 (match == 2 && c == 13) ? 3 : (match == 3 && c == 10) ? 4 : 0;
-                        if (match == 4) { headersDone = true; String text = new String(headers.toByteArray(), StandardCharsets.ISO_8859_1).toLowerCase(java.util.Locale.US); chunked = text.contains("transfer-encoding: chunked");
-                            for (String line : text.split("\r\n")) if (line.startsWith("content-length:")) try { expectedLength = Long.parseLong(line.substring(15).trim()); } catch (NumberFormatException ignored) {}
+                        if (match == 4) { headersDone = true; String text = new String(headers.toByteArray(), StandardCharsets.ISO_8859_1).toLowerCase(java.util.Locale.US); chunked = false;
+                            for (String line : text.split("\r\n")) {
+                                int colon = line.indexOf(':');
+                                if (colon < 0) continue;
+                                String name = line.substring(0, colon);
+                                String value = line.substring(colon + 1).trim();
+                                if ("transfer-encoding".equals(name)) {
+                                    for (String coding : value.split(",")) if ("chunked".equals(coding.trim())) chunked = true;
+                                } else if ("content-length".equals(name)) {
+                                    try { expectedLength = Long.parseLong(value); } catch (NumberFormatException ignored) {}
+                                }
+                            }
                             break; }
                     }
                 } else if (chunked) {

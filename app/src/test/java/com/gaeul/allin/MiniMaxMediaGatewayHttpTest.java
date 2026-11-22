@@ -64,7 +64,26 @@ public final class MiniMaxMediaGatewayHttpTest {
         return send(gateway, path, "POST", body.toString().getBytes(StandardCharsets.UTF_8), "application/json", AUTH);
     }
 
+    private static void base64Parity() {
+        java.util.Random random = new java.util.Random(106);
+        for (int size = 0; size < 260; size++) {
+            byte[] data = new byte[size];
+            random.nextBytes(data);
+            String standard = java.util.Base64.getEncoder().encodeToString(data);
+            check(standard.equals(MediaBase64.standard(data)), "standard Base64 wire parity");
+            check(java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(data).equals(MediaBase64.urlNoPadding(data)), "URL-safe job ID parity");
+            check(java.util.Arrays.equals(data, MediaBase64.decodeStandard(standard))
+                    && java.util.Arrays.equals(data, MediaBase64.decodeStandard(standard.replace("=", ""))), "padded and unpadded Base64 parity");
+        }
+        for (String text : new String[]{"=", "Z", "Zg=", "Zg===", "Zm9v=", "=Zm9v", "Zm 9v", "Zm-v"}) {
+            boolean rejected = false;
+            try { MediaBase64.decodeStandard(text); } catch (IllegalArgumentException invalid) { rejected = true; }
+            check(rejected, "invalid Base64 stays rejected");
+        }
+    }
+
     public static void main(String[] args) throws Exception {
+        base64Parity();
         TestPrivacyScope.initialize();
         AtomicInteger submits = new AtomicInteger(), renders = new AtomicInteger(), uploads = new AtomicInteger();
         AtomicInteger queries = new AtomicInteger(), downloads = new AtomicInteger();

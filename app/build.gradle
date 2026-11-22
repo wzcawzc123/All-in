@@ -15,8 +15,8 @@ android {
         applicationId 'com.gaeul.allin'
         minSdk 24
         targetSdk 34
-        versionCode 96
-        versionName '1.2.90-test'
+        versionCode 111
+        versionName '1.2.104'
         testInstrumentationRunner 'com.gaeul.allin.RepairInstrumentation'
     }
 
@@ -64,6 +64,7 @@ android {
 
 dependencies {
     implementation 'org.nanohttpd:nanohttpd:2.3.1'
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
 }
 
 // ===== 原有 main() 风格离线测试：不改测试代码，用 JavaExec 驱动 =====
@@ -71,12 +72,15 @@ dependencies {
 configurations { offlineTest }
 dependencies {
     offlineTest 'org.nanohttpd:nanohttpd:2.3.1'
+    offlineTest 'com.squareup.okhttp3:okhttp:4.12.0'
     // Windows-only durable rename for offline tests; not an Android implementation dependency.
     offlineTest 'net.java.dev.jna:jna:5.17.0'
 }
 
 // 保留原有 9 个套件，并运行网关、Responses 和首次设置回归测试。
 def offlineTestMains = [
+        'com.gaeul.allin.PanelThemePageOfflineTest',
+        'com.gaeul.allin.JsonNumericBoundaryOfflineTest',
         'com.gaeul.allin.AccountRoutingPolicyOfflineTest',
         'com.gaeul.allin.AccountRoutingGatewayTest',
         'com.gaeul.allin.AccountRoutingHttpTest',
@@ -153,6 +157,7 @@ def offlineTestMains = [
         'com.gaeul.allin.WorkBuddyCompletionGatewayHttpTest',
         'com.gaeul.allin.WorkBuddyToolRoundTripGatewayHttpTest',
         'com.gaeul.allin.CompletionStatusGatewayHttpTest',
+        'com.gaeul.allin.InferenceBodyLimitHttpTest',
         'com.gaeul.allin.CompletionBudgetOfflineTest',
         'com.gaeul.allin.ZCodeBoundaryGatewayHttpTest',
         'com.gaeul.allin.RequestTimingOfflineTest',
@@ -185,6 +190,10 @@ def offlineTestMains = [
         'com.gaeul.allin.ProviderRetryPolicyOfflineTest',
         'com.gaeul.allin.CodexRefreshOfflineTest',
         'com.gaeul.allin.CodexRequestPolicyOfflineTest',
+        'com.gaeul.allin.CodexClientCompatibilityOfflineTest',
+        'com.gaeul.allin.CodexClientCompatibilityHttpTest',
+        'com.gaeul.allin.CodexChatProjectionOfflineTest',
+        'com.gaeul.allin.CodexChatProjectionHttpTest',
         'com.gaeul.allin.CodexFailureDiagnosticsOfflineTest',
         'com.gaeul.allin.CodexHttp1OfflineTest',
         'com.gaeul.allin.CodexPersistenceOfflineTest',
@@ -316,6 +325,8 @@ def offlineTestMains = [
         'com.gaeul.allin.GatewayMissingProviderOfflineTest',
         'com.gaeul.allin.ResponsesBridgeOfflineTest',
         'com.gaeul.allin.ResponsesBridgeAuditTest',
+        'com.gaeul.allin.ResponsesCancellationHttpTest',
+        'com.gaeul.allin.ResponsesStreamAggregationHttpTest',
         'com.gaeul.allin.ResponsesGatewayOfflineTest',
         'com.gaeul.allin.ResponsesAgentRequestOfflineTest',
         'com.gaeul.allin.ResponsesEmptyContentOfflineTest',
@@ -501,6 +512,15 @@ tasks.named('streamingHttpTests') { dependsOn 'patienceRoutingHttpTests' }
         mainClass = 'com.gaeul.allin.' + name
     }
     tasks.named('streamingHttpTests') { dependsOn taskName }
+}
+
+// Explicit opt-in only; never a dependency of offlineTests or any CI verification entry.
+tasks.register('codexLiveLanTests', JavaExec) {
+    group = 'verification'
+    dependsOn 'compileOfflineTests'
+    classpath = files({ [mainClassesDir.get(), testClassesDir.get(), configurations.offlineTest, tasks.named('compileReleaseJavaWithJavac', JavaCompile).get().options.bootstrapClasspath] })
+    mainClass = 'com.gaeul.allin.CodexChatProjectionHttpTest'
+    args '--real-lan'
 }
 
 // Source and fixture text must have the same UTF-8 meaning on Windows and Unix.

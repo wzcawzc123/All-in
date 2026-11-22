@@ -38,6 +38,38 @@ public final class ProviderBillingGatewayHttpTest {
         boolean failed=false; try { MiniMaxAuth.fetchAllowance("x","",url->new MiniConnection(url,200,"{\"base_resp\":{\"status_code\":1004}}")); } catch(IOException expected) { failed=true; }
         check(failed,"invalid schema not zero");
     }
+    static void boundedBillingStop() throws Exception {
+        GatewayServer gateway = RoutingSetupOfflineTest.server(new JSONObject().put("providers", new JSONArray()));
+        java.lang.reflect.Method dispatch = GatewayServer.class.getDeclaredMethod("dispatchBilling", String.class, Object.class, FutureTask.class);
+        dispatch.setAccessible(true);
+        CountDownLatch entered = new CountDownLatch(4), interrupted = new CountDownLatch(4);
+        List<FutureTask<JSONObject>> tasks = new ArrayList<>();
+        try {
+            for (int i = 0; i < 4; i++) {
+                FutureTask<JSONObject> task = new FutureTask<>(() -> {
+                    entered.countDown();
+                    try { Thread.sleep(30_000); }
+                    catch (InterruptedException expected) { interrupted.countDown(); }
+                    return new JSONObject();
+                });
+                tasks.add(task);
+                dispatch.invoke(gateway, "fixture-" + i, new Object(), task);
+            }
+            check(entered.await(2, TimeUnit.SECONDS), "four billing tasks reached the executor");
+            FutureTask<JSONObject> extra = new FutureTask<>(JSONObject::new);
+            try {
+                dispatch.invoke(gateway, "overflow", new Object(), extra);
+                throw new AssertionError("billing executor exceeded four concurrent tasks");
+            } catch (java.lang.reflect.InvocationTargetException e) {
+                check(e.getCause() instanceof RejectedExecutionException, "fifth request rejected");
+            }
+            gateway.stop();
+            check(interrupted.await(2, TimeUnit.SECONDS), "gateway stop interrupted all billing workers");
+            for (FutureTask<?> task : tasks) check(task.isCancelled(), "in-flight billing wait released");
+            check(!extra.isDone(), "rejected work was not scheduled");
+        } finally { gateway.stop(); }
+    }
+
     public static void main(String[] args) throws Exception {
         JSONObject provider=new JSONObject().put("id","qoder_cn").put("enabled",true)
             .put("models",new JSONArray().put("m").put("unknown"))
@@ -107,6 +139,7 @@ public final class ProviderBillingGatewayHttpTest {
                 check(w.getString("scope").equals("model") && w.getInt("remaining")==i+1,"gift account scope"); }
         } finally { ZCodeGiftControl.setTestHooks(null,null); }
         miniProtocol();
+        boundedBillingStop();
         System.out.println("ProviderBillingGatewayHttpTest passed");
     }
 }

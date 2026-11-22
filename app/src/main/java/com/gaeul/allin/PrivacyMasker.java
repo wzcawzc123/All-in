@@ -198,6 +198,10 @@ public class PrivacyMasker {
         return maskText(input, session, new Config());
     }
 
+    static void validatePatterns(Config cfg) {
+        patterns(cfg);
+    }
+
     private static List<Pattern> patterns(Config cfg) {
         List<Pattern> result = new ArrayList<Pattern>();
         if (cfg.maskApiKeys) result.add(API_KEY_PATTERN);
@@ -284,6 +288,7 @@ public class PrivacyMasker {
     public static String unmaskText(String input, Session session) {
         if (input == null || session == null) return input;
         synchronized (session) {
+            if (session.placeholderToReal.isEmpty()) return input;
             StringBuilder out = new StringBuilder();
             int pos = 0;
             List<String> keys = new ArrayList<String>(session.placeholderToReal.keySet());

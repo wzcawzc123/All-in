@@ -133,6 +133,13 @@ public final class Audit53RegressionTest {
         }finally{for(BoundedSseReader br:readers){br.close();br.close();}}
         check(BoundedSseReader.activeBytes()==0,"L1 repeated close releases exactly once");
         try(BoundedSseReader br=new BoundedSseReader(new StringReader("data: a\r\ndata: b\r\n\r\nlast\n"))){check(br.readEvent().data.equals("a\nb"),"L1 multiline CRLF event unchanged");check(br.readLine().equals("last"),"L1 event/line mixed read");check(br.readEvent()==null&&BoundedSseReader.activeBytes()==0,"L1 mixed EOF releases reservations");}
+        String data = "data: [DONE]";
+        for (String ending : new String[]{"", String.valueOf((char)10), String.valueOf((char)13)}) {
+            try (BoundedSseReader br = new BoundedSseReader(new StringReader(data + ending))) {
+                try { br.readEvent(); throw new AssertionError("truncated event was dispatched"); }
+                catch (EOFException expected) { check(BoundedSseReader.activeBytes() == 0, "truncation releases reservations"); }
+            }
+        }
         try(BoundedSseReader br=new BoundedSseReader(new Reader(){int n;public int read(char[] b,int o,int l)throws IOException{if(n++>0)throw new IOException("synthetic read failure");b[o]='x';return 1;}public void close(){}})){
             boolean failed=false;try{br.readLine();}catch(IOException e){failed=true;}check(failed&&BoundedSseReader.activeBytes()==0,"L1 source failure releases reservation");
         }

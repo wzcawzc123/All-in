@@ -2,6 +2,7 @@
 const fs=require('fs'),path=require('path'),cp=require('child_process');
 const root=path.resolve(__dirname,'..');
 const scripts=[
+  "tests/dashboard-startup-theme.cjs",
   "tests/dashboard-cache-usage.cjs",
   "tests/dashboard-usage-hours.cjs",
   "tests/dashboard-usage-range.cjs",
@@ -28,6 +29,7 @@ const scripts=[
   "tests/dashboard-catpaw-auth-feedback.cjs",
   "tests/provider-upstream-defaults.cjs",
   "tests/dashboard-checkin-center.cjs",
+  "tests/dashboard-home-quota.cjs",
   "tests/dashboard-setup-key.cjs",
   "tests/dashboard-setup-motion.cjs",
   "tests/dashboard-back-navigation.cjs",

@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const {dom} = require('./browser-fixture.cjs');
+const {readFunction} = require('./model-selection-fixture.cjs');
 process.env.ALLIN_TEST_TMP ||= path.resolve('build');
 const source = fs.readFileSync(path.join(__dirname, '../app/src/main/assets/dashboard.html'), 'utf8');
 const css = [...source.slice(0, source.indexOf('</head>')).matchAll(/<style[^>]*>[\s\S]*?<\/style>/g)].map(match => match[0]).join('\n');
@@ -11,7 +12,8 @@ const script = source.slice(source.indexOf('    function setupGlassSwitches('), 
 const piece = (start, end) => source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start) + 1));
 const providerRendering = piece('    function providerCounts(', '    const providerRouteMotion') +
   piece('    function renderProviderList()', '    function renderProviderStatus()') +
-  piece('    function visibleProviders(', '    function renderWbAccounts(');
+  piece('    function visibleProviders(', '    function renderWbAccounts(') +
+  ['providerHasCredential', 'mediaModelsFor', 'providerModelCardCatalog'].map(name => readFunction(source, name)).join(String.fromCharCode(10));
 const providers = JSON.parse(fs.readFileSync(path.join(__dirname, '../app/src/main/assets/default_config.json'), 'utf8')).providers
   .map(({id, name}, index) => ({id, name, enabled: index % 2 === 0, accounts: [{token: 'fixture'}]}));
 const controls = source.match(/<input[^>]*class="glass-switch"[^>]*>/g);

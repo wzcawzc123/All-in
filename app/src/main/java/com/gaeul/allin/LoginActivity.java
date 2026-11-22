@@ -36,11 +36,49 @@ public class LoginActivity extends Activity {
     // Native login work keeps the policy captured when this Activity starts.
     // Browser and WebView networking are controlled by the system, not this scope.
     private NetworkPolicy.Snapshot loginNetworkSnapshot;
-    private Runnable scopedLoginTask(final Runnable task) {
-        return () -> {
-            try (NetworkPolicy.Scope scope = NetworkPolicy.use(loginNetworkSnapshot)) { task.run(); }
-        };
+    private final Object loginWork = new Object();
+    private final java.util.Set<Thread> loginThreads = new java.util.HashSet<>();
+    private final java.util.Set<LocalBridge.Call> loginCalls = new java.util.HashSet<>();
+    private volatile boolean loginDestroyed;
+
+    private void startLoginTask(Runnable task) {
+        synchronized (loginWork) {
+            if (loginDestroyed) return;
+            Thread worker = new Thread(() -> {
+                try (NetworkPolicy.Scope scope = NetworkPolicy.use(loginNetworkSnapshot)) {
+                    if (!loginDestroyed) task.run();
+                } finally {
+                    synchronized (loginWork) { loginThreads.remove(Thread.currentThread()); }
+                }
+            }, "account-login");
+            loginThreads.add(worker);
+            try { worker.start(); }
+            catch (RuntimeException | Error failure) { loginThreads.remove(worker); throw failure; }
+        }
     }
+
+    private void postLoginUi(Runnable update) {
+        synchronized (loginWork) {
+            if (loginDestroyed) return;
+            mainHandler.post(() -> { if (!loginDestroyed && !isFinishing()) update.run(); });
+        }
+    }
+
+    private LocalBridge.Result loginRequest(String method, String path, String body, int timeout) {
+        LocalBridge.Call call = new LocalBridge.Call(timeout);
+        synchronized (loginWork) {
+            if (loginDestroyed) return LocalBridge.Result.failure("cancelled");
+            loginCalls.add(call);
+        }
+        try { return LocalBridge.requestResult(method, path, body, call); }
+        finally { synchronized (loginWork) { loginCalls.remove(call); } }
+    }
+
+    private String loginPost(String path, String body) {
+        LocalBridge.Result result = loginRequest("POST", path, body, 20000);
+        return result.transportError.isEmpty() ? result.body : null;
+    }
+
     private WebView webView;
     private TextView subtitleView;
     private volatile boolean isPolling = false;
@@ -249,7 +287,7 @@ public class LoginActivity extends Activity {
                 if ("deepseek_web".equals(currentProvider) && isDeepSeekOrigin(url)
                         && isDeepSeekOrigin(view.getUrl()) && deepSeekActive && !deepSeekComplete) {
                     mainHandler.removeCallbacks(deepSeekPoll);
-                    if (deepSeekAttempts < DEEPSEEK_MAX_ATTEMPTS) mainHandler.post(deepSeekPoll);
+                    if (deepSeekAttempts < DEEPSEEK_MAX_ATTEMPTS) postLoginUi(deepSeekPoll);
                 }
                 // 页面加载完成时不主动关闭页面，确保用户可以自如在网页内输入与登录
                 if ("codex".equals(currentProvider)) {
@@ -396,7 +434,7 @@ public class LoginActivity extends Activity {
     /** 妙手 CatPaw 登录：走官方 login-config 入口，sid 由网关侧轮询（不需要回跳端口） */
     private void initCatPawAuth() {
         subtitleView.setText("正在向妙手申请官方登录通道…");
-        new Thread(scopedLoginTask(new Runnable() {
+        startLoginTask(new Runnable() {
             @Override
             public void run() {
                 try {
@@ -407,7 +445,7 @@ public class LoginActivity extends Activity {
                     final JSONObject res = new JSONObject(gwBody);
                     if (!res.optBoolean("ok", false)) {
                         final String err = res.optString("error", "初始化失败");
-                        mainHandler.post(new Runnable() {
+                        postLoginUi(new Runnable() {
                             @Override
                             public void run() {
                                 subtitleView.setText("初始化失败：" + err);
@@ -418,7 +456,7 @@ public class LoginActivity extends Activity {
                     }
                     catpawSid = res.optString("sid", "");
                     final String authUrl = res.optString("url", "");
-                    mainHandler.post(new Runnable() {
+                    postLoginUi(new Runnable() {
                         @Override
                         public void run() {
                             subtitleView.setText("登录妙手账号，完成后会自动入池");
@@ -427,7 +465,7 @@ public class LoginActivity extends Activity {
                         }
                     });
                 } catch (final Exception e) {
-                    mainHandler.post(new Runnable() {
+                    postLoginUi(new Runnable() {
                         @Override
                         public void run() {
                             String m = e.getMessage() == null ? "未知错误" : e.getMessage();
@@ -437,12 +475,12 @@ public class LoginActivity extends Activity {
                     });
                 }
             }
-        })).start();
+        });
     }
 
     private void startCatPawPolling() {
         isPolling = true;
-        new Thread(scopedLoginTask(new Runnable() {
+        startLoginTask(new Runnable() {
             @Override
             public void run() {
                 long deadline = System.currentTimeMillis() + 3 * 60 * 1000L;
@@ -460,7 +498,7 @@ public class LoginActivity extends Activity {
                         if (res.optBoolean("ok", false) && "ready".equals(status)) {
                             isPolling = false;
                             final String who = res.optString("account", "");
-                            mainHandler.post(new Runnable() {
+                            postLoginUi(new Runnable() {
                                 @Override
                                 public void run() {
                                     Toast.makeText(LoginActivity.this,
@@ -474,7 +512,7 @@ public class LoginActivity extends Activity {
                         if ("duplicate".equals(status) || "failed".equals(status)) {
                             isPolling = false;
                             final String err = res.optString("error", "登录未完成");
-                            mainHandler.post(new Runnable() {
+                            postLoginUi(new Runnable() {
                                 @Override
                                 public void run() {
                                     subtitleView.setText(err);
@@ -489,15 +527,15 @@ public class LoginActivity extends Activity {
                 }
                 isPolling = false;
             }
-        })).start();
+        });
     }
 
     private void initWorkBuddyAuth() {
         final int generation=++workBuddyGeneration;
         subtitleView.setText("正在申请官方授权；本次登录不会移除已入池账号…");
-        new Thread(scopedLoginTask(() -> {
+        startLoginTask(() -> {
             try {
-                LocalBridge.Result response=LocalBridge.requestResult("GET","/api/auth/workbuddy/init-login",null,20000);
+                LocalBridge.Result response=loginRequest("GET","/api/auth/workbuddy/init-login",null,20000);
                 JSONObject data=new JSONObject(response.body);
                 if(response.status<200 || response.status>=300 || !data.optBoolean("ok",false))throw new java.io.IOException();
                 final String state=data.optString("state","");
@@ -505,7 +543,7 @@ public class LoginActivity extends Activity {
                 java.net.URI url=java.net.URI.create(authUrl);
                 if(state.isEmpty() || !"https".equalsIgnoreCase(url.getScheme()) || url.getHost()==null || url.getRawUserInfo()!=null)
                     throw new java.io.IOException();
-                mainHandler.post(() -> {
+                postLoginUi(() -> {
                     if(isFinishing() || isDestroyed() || generation!=workBuddyGeneration)return;
                     currentState=state;
                     subtitleView.setText("请在官方页面选择个人或团队账号；确认保存成功后才会完成入池");
@@ -513,10 +551,10 @@ public class LoginActivity extends Activity {
                     startWorkBuddyPolling(state,generation);
                 });
             } catch(Exception failed) {
-                mainHandler.post(() -> {if(!isFinishing() && !isDestroyed() && generation==workBuddyGeneration)
+                postLoginUi(() -> {if(!isFinishing() && !isDestroyed() && generation==workBuddyGeneration)
                     subtitleView.setText("无法取得官方授权链接，请检查网关后点完成入池重试");});
             }
-        })).start();
+        });
     }
 
     /**
@@ -531,7 +569,7 @@ public class LoginActivity extends Activity {
         } catch (Exception ignored) {
         }
         final boolean hasCode = code != null && !code.isEmpty();
-        mainHandler.post(new Runnable() {
+        postLoginUi(new Runnable() {
             @Override
             public void run() {
                 subtitleView.setText(hasCode ? "授权成功，正在换取 API Key…" : "授权回调已收到，正在确认登录状态…");
@@ -547,7 +585,7 @@ public class LoginActivity extends Activity {
     private void initZCodeAuth() {
         final String siteName = "bigmodel".equals(currentZCodeSite) ? "BigModel（智谱）" : "Z.ai";
         subtitleView.setText("正在向 ZCode 申请 " + siteName + " 登录通道…");
-        new Thread(scopedLoginTask(new Runnable() {
+        startLoginTask(new Runnable() {
             @Override
             public void run() {
                 try {
@@ -559,7 +597,7 @@ public class LoginActivity extends Activity {
                     final JSONObject res = new JSONObject(gwBody);
                     if (!res.optBoolean("ok", false)) {
                         final String err = res.optString("error", "初始化失败");
-                        mainHandler.post(new Runnable() {
+                        postLoginUi(new Runnable() {
                             @Override
                             public void run() {
                                 subtitleView.setText("初始化失败：" + err);
@@ -572,7 +610,7 @@ public class LoginActivity extends Activity {
                     final String authUrl = res.optString("url", "");
                     final long interval = Math.max(res.optLong("intervalMs", 2000), 1500);
 
-                    mainHandler.post(new Runnable() {
+                    postLoginUi(new Runnable() {
                         @Override
                         public void run() {
                             subtitleView.setText("请在下方登录 " + siteName + "，成功后自动入池");
@@ -581,7 +619,7 @@ public class LoginActivity extends Activity {
                         }
                     });
                 } catch (final Exception e) {
-                    mainHandler.post(new Runnable() {
+                    postLoginUi(new Runnable() {
                         @Override
                         public void run() {
                             subtitleView.setText("连接网关失败：" + e.getMessage());
@@ -589,7 +627,7 @@ public class LoginActivity extends Activity {
                     });
                 }
             }
-        })).start();
+        });
     }
 
     // The generation belongs to this Activity; stale workers may never change a new flow.
@@ -610,14 +648,14 @@ public class LoginActivity extends Activity {
         final String restoringId = traeFlowId;
         final boolean restoring = !restoringId.isEmpty();
         subtitleView.setText("正在申请 Trae 授权…");
-        new Thread(scopedLoginTask(() -> {
+        startLoginTask(() -> {
             try {
                 String body = gatewayGet("http://127.0.0.1:3425/api/auth/trae-cn/init" + (fresh ? "?fresh=1" : restoring ? "?flowId=" + URLEncoder.encode(restoringId, "UTF-8") : ""));
                 if (body == null) throw new java.io.IOException("无法连接本机网关");
                 JSONObject result = new JSONObject(body);
                 if (!Boolean.TRUE.equals(result.opt("ok"))) {
                     final String detail = result.optString("error", "Trae 授权初始化失败，请重新发起授权");
-                    mainHandler.post(() -> { if (traeCurrent(generation)) rememberTraeFailure(traeLastError.isEmpty() ? detail : traeLastError); });
+                    postLoginUi(() -> { if (traeCurrent(generation)) rememberTraeFailure(traeLastError.isEmpty() ? detail : traeLastError); });
                     return;
                 }
                 final String id = result.optString("flowId", "");
@@ -629,7 +667,7 @@ public class LoginActivity extends Activity {
                 long localDeadline = restoring && !fresh ? prefs.getLong("trae_flow_at", now) + 5 * 60 * 1000L : now + 5 * 60 * 1000L;
                 final long deadline = returnedDeadline > 0 ? Math.min(returnedDeadline, localDeadline) : localDeadline;
                 final boolean resumed = result.optBoolean("resumed", false);
-                mainHandler.post(() -> {
+                postLoginUi(() -> {
                     if (!traeCurrent(generation)) return;
                     traeFlowId = id;
                     traeUrl = url;
@@ -643,9 +681,9 @@ public class LoginActivity extends Activity {
                     startTraePolling(generation, id, deadline);
                 });
             } catch (Exception e) {
-                mainHandler.post(() -> { if (traeCurrent(generation)) rememberTraeFailure(traeLastError.isEmpty() ? "Trae 登录初始化失败，请检查本机网关后重新发起授权" : traeLastError); });
+                postLoginUi(() -> { if (traeCurrent(generation)) rememberTraeFailure(traeLastError.isEmpty() ? "Trae 登录初始化失败，请检查本机网关后重新发起授权" : traeLastError); });
             }
-        })).start();
+        });
     }
 
     private boolean validTraeUrl(String url) {
@@ -696,7 +734,7 @@ public class LoginActivity extends Activity {
     }
 
     private void startTraePolling(final int generation, final String id, final long deadline) {
-        new Thread(scopedLoginTask(() -> {
+        startLoginTask(() -> {
             int failures = 0;
             boolean firstCheck = true;
             // A terminal result can still exist after the authorization deadline.
@@ -711,32 +749,32 @@ public class LoginActivity extends Activity {
                             || "expired".equals(status) || "closed".equals(status) || "missing".equals(status)
                             || "error".equals(status) || status.isEmpty()) {
                         final String detail = r.optString("error", r.optString("hint", "授权已失效"));
-                        mainHandler.post(() -> { if (traeCurrent(generation)) rememberTraeFailure("授权未完成：" + detail); });
+                        postLoginUi(() -> { if (traeCurrent(generation)) rememberTraeFailure("授权未完成：" + detail); });
                         return;
                     }
                     failures = 0;
                     if ("ready".equals(status)) {
                         if (!Boolean.TRUE.equals(r.opt("ok")) || !(r.opt("keyId") instanceof String) || r.optString("keyId", "").trim().isEmpty()) {
-                            mainHandler.post(() -> { if (traeCurrent(generation)) rememberTraeFailure("未收到有效的账号保存确认，请检查账号池后重新授权"); });
+                            postLoginUi(() -> { if (traeCurrent(generation)) rememberTraeFailure("未收到有效的账号保存确认，请检查账号池后重新授权"); });
                             return;
                         }
                         final String hint = r.optString("hint", "");
-                        mainHandler.post(() -> { if (traeCurrent(generation)) { clearTraeFlow(); Toast.makeText(this, "Trae 账号已入池" + (hint.isEmpty() ? "" : "：" + hint), Toast.LENGTH_LONG).show(); finish(); } });
+                        postLoginUi(() -> { if (traeCurrent(generation)) { clearTraeFlow(); Toast.makeText(this, "Trae 账号已入池" + (hint.isEmpty() ? "" : "：" + hint), Toast.LENGTH_LONG).show(); finish(); } });
                         return;
                     }
-                    if ("binding".equals(status)) mainHandler.post(() -> { if (traeCurrent(generation)) subtitleView.setText("登录成功，正在绑定设备…"); });
-                    else if ("validating".equals(status)) mainHandler.post(() -> { if (traeCurrent(generation)) subtitleView.setText("设备绑定未启用，正在核验官方网页登录状态…"); });
-                    else mainHandler.post(() -> { if (traeCurrent(generation)) subtitleView.setText("等待 Trae 授权，点此重新打开授权页"); });
+                    if ("binding".equals(status)) postLoginUi(() -> { if (traeCurrent(generation)) subtitleView.setText("登录成功，正在绑定设备…"); });
+                    else if ("validating".equals(status)) postLoginUi(() -> { if (traeCurrent(generation)) subtitleView.setText("设备绑定未启用，正在核验官方网页登录状态…"); });
+                    else postLoginUi(() -> { if (traeCurrent(generation)) subtitleView.setText("等待 Trae 授权，点此重新打开授权页"); });
                 } catch (Exception e) {
                     if (++failures >= 3) {
-                        mainHandler.post(() -> { if (traeCurrent(generation)) subtitleView.setText("连续连接网关失败，请检查网络后点检查状态或重新发起授权"); });
+                        postLoginUi(() -> { if (traeCurrent(generation)) subtitleView.setText("连续连接网关失败，请检查网络后点检查状态或重新发起授权"); });
                         return;
                     }
                 }
                 try { Thread.sleep(2500); } catch (InterruptedException e) { return; }
             }
-            mainHandler.post(() -> { if (traeCurrent(generation)) rememberTraeFailure("授权等待超时，请重新发起授权"); });
-        })).start();
+            postLoginUi(() -> { if (traeCurrent(generation)) rememberTraeFailure("授权等待超时，请重新发起授权"); });
+        });
     }
 
     /**
@@ -746,7 +784,7 @@ public class LoginActivity extends Activity {
      */
     private void initAntigravityAuth() {
         subtitleView.setText("正在向网关申请 Google 授权链接…");
-        new Thread(scopedLoginTask(new Runnable() {
+        startLoginTask(new Runnable() {
             @Override
             public void run() {
                 try {
@@ -756,7 +794,7 @@ public class LoginActivity extends Activity {
                     final JSONObject res = new JSONObject(gwBody);
                     if (!res.optBoolean("ok", false)) {
                         final String err = res.optString("error", "初始化失败");
-                        mainHandler.post(new Runnable() {
+                        postLoginUi(new Runnable() {
                             @Override
                             public void run() {
                                 subtitleView.setText("初始化失败：" + err);
@@ -773,7 +811,7 @@ public class LoginActivity extends Activity {
                     }
                     final String authUrl = res.optString("authUrl", "");
                     final boolean resumed = res.optBoolean("resumed", false);
-                    mainHandler.post(new Runnable() {
+                    postLoginUi(new Runnable() {
                         @Override
                         public void run() {
                             if (resumed) {
@@ -808,7 +846,7 @@ public class LoginActivity extends Activity {
                         }
                     });
                 } catch (final Exception e) {
-                    mainHandler.post(new Runnable() {
+                    postLoginUi(new Runnable() {
                         @Override
                         public void run() {
                             String m = e.getMessage() == null ? "未知错误" : e.getMessage();
@@ -818,13 +856,13 @@ public class LoginActivity extends Activity {
                     });
                 }
             }
-        })).start();
+        });
     }
 
     private void startAntigravityPolling() {
         if (isPolling) return;   // Activity 重建会重复调，避免两个线程抢同一个 flow
         isPolling = true;
-        new Thread(scopedLoginTask(new Runnable() {
+        startLoginTask(new Runnable() {
             @Override
             public void run() {
                 long deadline = System.currentTimeMillis() + 15 * 60 * 1000L;
@@ -851,7 +889,7 @@ public class LoginActivity extends Activity {
                             }
                             final String who = res.optString("account", "");
                             final String proj = res.optString("project", "");
-                            mainHandler.post(new Runnable() {
+                            postLoginUi(new Runnable() {
                                 @Override
                                 public void run() {
                                     Toast.makeText(LoginActivity.this,
@@ -865,7 +903,7 @@ public class LoginActivity extends Activity {
                         } else if (!res.optBoolean("ok", false) && "failed".equals(status)) {
                             isPolling = false;
                             final String err = res.optString("error", "授权失败");
-                            mainHandler.post(new Runnable() {
+                            postLoginUi(new Runnable() {
                                 @Override
                                 public void run() {
                                     subtitleView.setText("授权失败：" + err);
@@ -878,7 +916,7 @@ public class LoginActivity extends Activity {
                     }
                 }
             }
-        })).start();
+        });
     }
 
     /**
@@ -887,9 +925,9 @@ public class LoginActivity extends Activity {
      * 这页是 React 渲染的，直接改 value 不生效，必须用原型上的 setter + input 事件。
      */
     private void autofillGitHubDeviceCode() {
+        if (!deviceFlowCode.matches("[A-Za-z0-9]{4}-?[A-Za-z0-9]{4}")) return;
         final String code = deviceFlowCode.replace("-", "");
-        if (code.isEmpty()) return;
-        String js = "(function(){var c='" + code + "';var idx=[0,1,2,3,5,6,7,8];"
+        String js = "(function(){var c=" + JSONObject.quote(code) + ";var idx=[0,1,2,3,5,6,7,8];"
                 + "for(var i=0;i<idx.length&&i<c.length;i++){"
                 + "var el=document.getElementById('user-code-'+idx[i]);if(!el)continue;"
                 + "var s=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;"
@@ -916,7 +954,7 @@ public class LoginActivity extends Activity {
      */
     private void initDeviceFlowAuth(final String providerId, final String display, final long hardDeadlineMs) {
         subtitleView.setText("正在向 " + display + " 申请设备授权…");
-        new Thread(scopedLoginTask(new Runnable() {
+        startLoginTask(new Runnable() {
             @Override
             public void run() {
                 try {
@@ -926,7 +964,7 @@ public class LoginActivity extends Activity {
                     final JSONObject res = new JSONObject(gwBody);
                     if (!res.optBoolean("ok", false)) {
                         final String err = res.optString("error", "初始化失败");
-                        mainHandler.post(new Runnable() {
+                        postLoginUi(new Runnable() {
                             @Override
                             public void run() {
                                 subtitleView.setText("初始化失败：" + err);
@@ -941,7 +979,7 @@ public class LoginActivity extends Activity {
                     final String userCode = deviceFlowCode;
                     final long interval = Math.max(res.optLong("intervalMs", 5000), 2000);
 
-                    mainHandler.post(new Runnable() {
+                    postLoginUi(new Runnable() {
                         @Override
                         public void run() {
                             String hint = providerId.startsWith("github")
@@ -965,7 +1003,7 @@ public class LoginActivity extends Activity {
                         }
                     });
                 } catch (final Exception e) {
-                    mainHandler.post(new Runnable() {
+                    postLoginUi(new Runnable() {
                         @Override
                         public void run() {
                             String m = e.getMessage() == null ? "未知错误" : e.getMessage();
@@ -975,13 +1013,13 @@ public class LoginActivity extends Activity {
                     });
                 }
             }
-        })).start();
+        });
     }
 
     private void startDeviceFlowPolling(final String providerId, final String display,
                                         final long intervalMs, final long hardDeadlineMs) {
         isPolling = true;
-        new Thread(scopedLoginTask(new Runnable() {
+        startLoginTask(new Runnable() {
             @Override
             public void run() {
                 long deadline = System.currentTimeMillis() + hardDeadlineMs;
@@ -999,7 +1037,7 @@ public class LoginActivity extends Activity {
                         if (res.optBoolean("ok", false) && "ready".equals(status)) {
                             isPolling = false;
                             final String who = res.optString("account", "");
-                            mainHandler.post(new Runnable() {
+                            postLoginUi(new Runnable() {
                                 @Override
                                 public void run() {
                                     Toast.makeText(LoginActivity.this,
@@ -1013,7 +1051,7 @@ public class LoginActivity extends Activity {
                         if ("duplicate".equals(status)) {
                             isPolling = false;
                             final String dupErr = res.optString("error", "池内已存在同名账号");
-                            mainHandler.post(new Runnable() {
+                            postLoginUi(new Runnable() {
                                 @Override
                                 public void run() {
                                     Toast.makeText(LoginActivity.this, dupErr, Toast.LENGTH_LONG).show();
@@ -1025,7 +1063,7 @@ public class LoginActivity extends Activity {
                         if (!res.optBoolean("ok", false) && "failed".equals(status)) {
                             isPolling = false;
                             final String err = res.optString("error", "授权失败");
-                            mainHandler.post(new Runnable() {
+                            postLoginUi(new Runnable() {
                                 @Override
                                 public void run() {
                                     subtitleView.setText("授权失败：" + err);
@@ -1040,7 +1078,7 @@ public class LoginActivity extends Activity {
                 }
                 isPolling = false;
             }
-        })).start();
+        });
     }
 
     /**
@@ -1050,7 +1088,7 @@ public class LoginActivity extends Activity {
      */
     private void initClineAuth() {
         subtitleView.setText("正在向 Cline 申请设备授权…");
-        new Thread(scopedLoginTask(new Runnable() {
+        startLoginTask(new Runnable() {
             @Override
             public void run() {
                 try {
@@ -1061,7 +1099,7 @@ public class LoginActivity extends Activity {
                     final JSONObject res = new JSONObject(gwBody);
                     if (!res.optBoolean("ok", false)) {
                         final String err = res.optString("error", "初始化失败");
-                        mainHandler.post(new Runnable() {
+                        postLoginUi(new Runnable() {
                             @Override
                             public void run() {
                                 subtitleView.setText("初始化失败：" + err);
@@ -1075,7 +1113,7 @@ public class LoginActivity extends Activity {
                     final String userCode = res.optString("userCode", "");
                     final long interval = Math.max(res.optLong("intervalMs", 5000), 2000);
 
-                    mainHandler.post(new Runnable() {
+                    postLoginUi(new Runnable() {
                         @Override
                         public void run() {
                             subtitleView.setText("请在浏览器中确认授权（用户码: " + userCode + "）[点击在此打开外部浏览器]");
@@ -1095,7 +1133,7 @@ public class LoginActivity extends Activity {
                         }
                     });
                 } catch (final Exception e) {
-                    mainHandler.post(new Runnable() {
+                    postLoginUi(new Runnable() {
                         @Override
                         public void run() {
                             String m = e.getMessage() == null ? "未知错误" : e.getMessage();
@@ -1105,12 +1143,12 @@ public class LoginActivity extends Activity {
                     });
                 }
             }
-        })).start();
+        });
     }
 
     private void startClinePolling(final long intervalMs) {
         isPolling = true;
-        new Thread(scopedLoginTask(new Runnable() {
+        startLoginTask(new Runnable() {
             @Override
             public void run() {
                 long deadline = System.currentTimeMillis() + 15 * 60 * 1000L;
@@ -1130,7 +1168,7 @@ public class LoginActivity extends Activity {
                         if (res.optBoolean("ok", false) && "ready".equals(status)) {
                             isPolling = false;
                             final String who = res.optString("account", "");
-                            mainHandler.post(new Runnable() {
+                            postLoginUi(new Runnable() {
                                 @Override
                                 public void run() {
                                     Toast.makeText(LoginActivity.this,
@@ -1143,7 +1181,7 @@ public class LoginActivity extends Activity {
                         } else if ("duplicate".equals(status)) {
                             isPolling = false;
                             final String dupErr = res.optString("error", "池内已存在同名账号");
-                            mainHandler.post(new Runnable() {
+                            postLoginUi(new Runnable() {
                                 @Override
                                 public void run() {
                                     Toast.makeText(LoginActivity.this, dupErr, Toast.LENGTH_LONG).show();
@@ -1154,7 +1192,7 @@ public class LoginActivity extends Activity {
                         } else if (!res.optBoolean("ok", false) && "failed".equals(status)) {
                             isPolling = false;
                             final String err = res.optString("error", "授权失败");
-                            mainHandler.post(new Runnable() {
+                            postLoginUi(new Runnable() {
                                 @Override
                                 public void run() {
                                     subtitleView.setText("授权失败：" + err);
@@ -1167,7 +1205,7 @@ public class LoginActivity extends Activity {
                     }
                 }
             }
-        })).start();
+        });
     }
 
     /**
@@ -1176,7 +1214,7 @@ public class LoginActivity extends Activity {
      */
     private void initQoderCnAuth() {
         subtitleView.setText("正在向 Qoder CN 申请登录通道…");
-        new Thread(scopedLoginTask(new Runnable() {
+        startLoginTask(new Runnable() {
             @Override
             public void run() {
                 try {
@@ -1187,7 +1225,7 @@ public class LoginActivity extends Activity {
                     final JSONObject res = new JSONObject(gwBody);
                     if (!res.optBoolean("ok", false)) {
                         final String err = res.optString("error", "初始化失败");
-                        mainHandler.post(new Runnable() {
+                        postLoginUi(new Runnable() {
                             @Override
                             public void run() {
                                 subtitleView.setText("初始化失败：" + err);
@@ -1200,7 +1238,7 @@ public class LoginActivity extends Activity {
                     final String authUrl = res.optString("url", "");
                     final long interval = Math.max(res.optLong("intervalMs", 2000), 1500);
 
-                    mainHandler.post(new Runnable() {
+                    postLoginUi(new Runnable() {
                         @Override
                         public void run() {
                             subtitleView.setText("请登录 Qoder CN 并授权本设备，成功后自动入池");
@@ -1209,7 +1247,7 @@ public class LoginActivity extends Activity {
                         }
                     });
                 } catch (final Exception e) {
-                    mainHandler.post(new Runnable() {
+                    postLoginUi(new Runnable() {
                         @Override
                         public void run() {
                             String m = e.getMessage() == null ? "未知错误" : e.getMessage();
@@ -1219,12 +1257,12 @@ public class LoginActivity extends Activity {
                     });
                 }
             }
-        })).start();
+        });
     }
 
     private void startQoderCnPolling(final long intervalMs) {
         isPolling = true;
-        new Thread(scopedLoginTask(new Runnable() {
+        startLoginTask(new Runnable() {
             @Override
             public void run() {
                 long deadline = System.currentTimeMillis() + 15 * 60 * 1000L;
@@ -1245,7 +1283,7 @@ public class LoginActivity extends Activity {
                             isPolling = false;
                             final String who = res.optString("account", "");
                             final boolean deviceChat = res.optBoolean("deviceChat", false);
-                            mainHandler.post(new Runnable() {
+                            postLoginUi(new Runnable() {
                                 @Override
                                 public void run() {
                                     Toast.makeText(LoginActivity.this,
@@ -1261,7 +1299,7 @@ public class LoginActivity extends Activity {
                         if ("duplicate".equals(status)) {
                             isPolling = false;
                             final String err = res.optString("error", "该账号已在池内");
-                            mainHandler.post(new Runnable() {
+                            postLoginUi(new Runnable() {
                                 @Override
                                 public void run() {
                                     subtitleView.setText(err);
@@ -1274,7 +1312,7 @@ public class LoginActivity extends Activity {
                         if ("failed".equals(status)) {
                             isPolling = false;
                             final String err = res.optString("error", "登录失败");
-                            mainHandler.post(new Runnable() {
+                            postLoginUi(new Runnable() {
                                 @Override
                                 public void run() {
                                     subtitleView.setText(err);
@@ -1288,7 +1326,7 @@ public class LoginActivity extends Activity {
                 }
                 if (isPolling) {
                     isPolling = false;
-                    mainHandler.post(new Runnable() {
+                    postLoginUi(new Runnable() {
                         @Override
                         public void run() {
                             subtitleView.setText("登录超时，请返回后重新发起");
@@ -1296,12 +1334,12 @@ public class LoginActivity extends Activity {
                     });
                 }
             }
-        })).start();
+        });
     }
 
     private void startZCodePolling(final long intervalMs) {
         isPolling = true;
-        new Thread(scopedLoginTask(new Runnable() {
+        startLoginTask(new Runnable() {
             @Override
             public void run() {
                 long deadline = System.currentTimeMillis() + 6 * 60 * 1000L;
@@ -1322,7 +1360,7 @@ public class LoginActivity extends Activity {
                             isPolling = false;
                             final String plan = res.optString("plan", "");
                             final String who = res.optString("account", "");
-                            mainHandler.post(new Runnable() {
+                            postLoginUi(new Runnable() {
                                 @Override
                                 public void run() {
                                     String tail = plan.isEmpty() ? "" : "（" + plan + "）";
@@ -1339,7 +1377,7 @@ public class LoginActivity extends Activity {
                         if ("failed".equals(status) || "no-plan".equals(status) || "duplicate".equals(status)) {
                             isPolling = false;
                             final String err = res.optString("error", "登录失败");
-                            mainHandler.post(new Runnable() {
+                            postLoginUi(new Runnable() {
                                 @Override
                                 public void run() {
                                     subtitleView.setText(err);
@@ -1353,7 +1391,7 @@ public class LoginActivity extends Activity {
                 }
                 if (isPolling) {
                     isPolling = false;
-                    mainHandler.post(new Runnable() {
+                    postLoginUi(new Runnable() {
                         @Override
                         public void run() {
                             subtitleView.setText("登录超时，请返回后重新发起");
@@ -1361,23 +1399,23 @@ public class LoginActivity extends Activity {
                     });
                 }
             }
-        })).start();
+        });
     }
 
     private void startWorkBuddyPolling(final String state, final int generation) {
         isPolling=true;
-        new Thread(scopedLoginTask(() -> {
+        startLoginTask(() -> {
             final long deadline=System.currentTimeMillis()+5*60*1000L;
             while(isPolling && generation==workBuddyGeneration && System.currentTimeMillis()<deadline) {
                 try {
                     Thread.sleep(1500);
                     if(!isPolling || generation!=workBuddyGeneration)break;
-                    LocalBridge.Result response=LocalBridge.requestResult("GET","/api/auth/workbuddy/poll-login?state="
+                    LocalBridge.Result response=loginRequest("GET","/api/auth/workbuddy/poll-login?state="
                             +URLEncoder.encode(state,"UTF-8"),null,20000);
                     JSONObject result=new JSONObject(response.body);
                     if(response.accountSaved() && "success".equals(result.optString("status"))) {
                         isPolling=false;
-                        mainHandler.post(() -> {
+                        postLoginUi(() -> {
                             if(isFinishing() || isDestroyed() || generation!=workBuddyGeneration)return;
                             Toast.makeText(LoginActivity.this,"WorkBuddy 账号已确认保存并入池",Toast.LENGTH_LONG).show();
                             finish();
@@ -1386,7 +1424,7 @@ public class LoginActivity extends Activity {
                     }
                     if(response.status==410 || response.status==409 || response.status>=500 || !result.optBoolean("ok",false)) {
                         isPolling=false;
-                        mainHandler.post(() -> {
+                        postLoginUi(() -> {
                             if(isFinishing() || isDestroyed() || generation!=workBuddyGeneration)return;
                             if(response.status==410 || response.status==409)currentState="";
                             subtitleView.setText("尚未确认入池：请检查官方账号选择，点完成入池重试；已有账号保持不变");
@@ -1398,10 +1436,10 @@ public class LoginActivity extends Activity {
             }
             if(generation==workBuddyGeneration) {
                 isPolling=false;
-                mainHandler.post(() -> {if(!isFinishing() && !isDestroyed() && generation==workBuddyGeneration){
+                postLoginUi(() -> {if(!isFinishing() && !isDestroyed() && generation==workBuddyGeneration){
                     currentState="";subtitleView.setText("授权等待超时，请点完成入池重新发起");}});
             }
-        })).start();
+        });
     }
 
     private void startRaccoonAuthorizationFlow() {
@@ -1415,7 +1453,7 @@ public class LoginActivity extends Activity {
         final int generation = ++raccoonOAuthGeneration;
         try {
             final RaccoonAuthorizationFlow flow = RaccoonAuthorizationFlow.start(callback ->
-                    mainHandler.post(() -> finishRaccoonAuthorization(generation, callback)));
+                    postLoginUi(() -> finishRaccoonAuthorization(generation, callback)));
             raccoonAuthorizationFlow = flow;
             subtitleView.setText("请在小浣熊授权页完成登录；回调校验、凭据交换与安全入池将自动完成。");
             webView.loadUrl(flow.authorizeUrl());
@@ -1448,7 +1486,7 @@ public class LoginActivity extends Activity {
         raccoonExchangeRunning = true;
         subtitleView.setText("授权回调已验证，正在安全交换登录凭据…");
         final String code = callback.code;
-        new Thread(scopedLoginTask(() -> {
+        startLoginTask(() -> {
             String resultText;
             boolean saved=false;
             try {
@@ -1462,7 +1500,7 @@ public class LoginActivity extends Activity {
                         .put("source",credentials.source).put("access",credentials.access).put("refresh",credentials.refresh)
                         .put("expires",credentials.expires).put("accountId",credentials.accountId)
                         .put("uid",credentials.uid).put("name",credentials.name);
-                String response=LocalBridge.post("/api/auth/raccoon/oauth-add",account.toString());
+                String response=loginPost("/api/auth/raccoon/oauth-add",account.toString());
                 if(response==null) throw new java.io.IOException("Gateway save result unavailable");
                 JSONObject persisted=new JSONObject(response);
                 if(!persisted.optBoolean("ok") || persisted.optString("provider").isEmpty()
@@ -1477,13 +1515,13 @@ public class LoginActivity extends Activity {
             }
             final String message = resultText;
             final boolean accountSaved=saved;
-            mainHandler.post(() -> {
+            postLoginUi(() -> {
                 if (generation != raccoonOAuthGeneration || isFinishing()) return;
                 subtitleView.setText(message);
                 Toast.makeText(LoginActivity.this, message, Toast.LENGTH_LONG).show();
                 if(accountSaved) finish(); // MainActivity.onResume reloads the saved provider pool.
             });
-        })).start();
+        });
     }
 
     private void extractTokenFromPage(final boolean isManualClick) {
@@ -1687,19 +1725,19 @@ public class LoginActivity extends Activity {
         if (!deepSeekActive || deepSeekSaving || deepSeekComplete || isFinishing()
                 || webView == null || !isDeepSeekOrigin(webView.getUrl())) return;
         deepSeekSaving = true;
-        new Thread(scopedLoginTask(new Runnable() { @Override public void run() {
+        startLoginTask(new Runnable() { @Override public void run() {
             boolean success = false;
             try {
                 JSONObject body = new JSONObject();
                 body.put("provider", "deepseek_web");
                 body.put("name", "DeepSeek用户");
                 body.put("token", credential);
-                String response = LocalBridge.post("/api/auth/deepseek_web/add", body.toString());
+                String response = loginPost("/api/auth/deepseek_web/add", body.toString());
                 JSONObject result = response == null ? null : new JSONObject(response);
                 success = result != null && result.optBoolean("ok", false) && result.optBoolean("validated", false);
             } catch (Exception ignored) { }
             final boolean ok = success;
-            mainHandler.post(new Runnable() { @Override public void run() {
+            postLoginUi(new Runnable() { @Override public void run() {
                 deepSeekSaving = false;
                 if (!deepSeekActive || isFinishing()) return;
                 if (ok) {
@@ -1714,7 +1752,7 @@ public class LoginActivity extends Activity {
                     if (manual) showError("入池验证失败，请检查网关并完成网页登录验证后重试。");
                 }
             }});
-        }})).start();
+        }});
     }
 
     // ===== 网关口令 =====
@@ -1763,14 +1801,15 @@ public class LoginActivity extends Activity {
 
     /** 读网关 GET 接口，返回正文；失败返回 null（与原 try/catch 语义一致） */
     private String gatewayGet(String urlString) {
-        return LocalBridge.get(gatewayPath(urlString));
+        LocalBridge.Result result = loginRequest("GET", gatewayPath(urlString), null, 15000);
+        return result.transportError.isEmpty() ? result.body : null;
     }
 
     private void saveAccountToGateway(final String providerId, final String name, final String token) {
         if (isFinishing() || isDestroyed() || accountSaveInFlight) return;
         accountSaveInFlight = true;
         final int generation = ++accountSaveGeneration;
-        new Thread(scopedLoginTask(new Runnable() {
+        startLoginTask(new Runnable() {
             @Override
             public void run() {
                 try {
@@ -1780,8 +1819,8 @@ public class LoginActivity extends Activity {
                     body.put("provider", providerId);
 
                     // raw socket：明文 HTTP 在本机被系统禁止
-                    final LocalBridge.Result response = LocalBridge.postResult("/api/auth/" + providerId + "/add", body.toString());
-                    mainHandler.post(new Runnable() {
+                    final LocalBridge.Result response = loginRequest("POST", "/api/auth/" + providerId + "/add", body.toString(), 20000);
+                    postLoginUi(new Runnable() {
                         @Override
                         public void run() {
                             if (isFinishing() || isDestroyed() || generation != accountSaveGeneration) return;
@@ -1796,7 +1835,7 @@ public class LoginActivity extends Activity {
                         }
                     });
                 } catch (final Exception e) {
-                    mainHandler.post(new Runnable() {
+                    postLoginUi(new Runnable() {
                         @Override
                         public void run() {
                             if (isFinishing() || isDestroyed() || generation != accountSaveGeneration) return;
@@ -1806,11 +1845,11 @@ public class LoginActivity extends Activity {
                     });
                 }
             }
-        })).start();
+        });
     }
 
     private void showError(final String msg) {
-        mainHandler.post(new Runnable() {
+        postLoginUi(new Runnable() {
             @Override
             public void run() {
                 subtitleView.setText("❌ " + msg);
@@ -1841,9 +1880,23 @@ public class LoginActivity extends Activity {
         traeGeneration++;
         isPolling = false;
         deepSeekActive = false;
-        mainHandler.removeCallbacks(deepSeekPoll);
-        if (webView != null) {
-            webView.destroy();
+        java.util.List<Thread> workers;
+        java.util.List<LocalBridge.Call> calls;
+        synchronized (loginWork) {
+            loginDestroyed = true;
+            workers = new java.util.ArrayList<>(loginThreads);
+            calls = new java.util.ArrayList<>(loginCalls);
+        }
+        mainHandler.removeCallbacksAndMessages(null);
+        for (Thread worker : workers) worker.interrupt();
+        for (LocalBridge.Call call : calls) call.cancel();
+        WebView view = webView;
+        webView = null;
+        if (view != null) {
+            if (view.getParent() instanceof android.view.ViewGroup)
+                ((android.view.ViewGroup) view.getParent()).removeView(view);
+            view.stopLoading();
+            view.destroy();
         }
         super.onDestroy();
     }
@@ -1927,7 +1980,7 @@ public class LoginActivity extends Activity {
 
     /** 把地区限制换成用户看得懂的中文说明，并给两条可行路径 */
     private void showCodexRegionBlockPage() {
-        runOnUiThread(new Runnable() {
+        postLoginUi(new Runnable() {
             @Override
             public void run() {
                 try {
@@ -1970,7 +2023,7 @@ public class LoginActivity extends Activity {
 
     private void initCodexAuth() {
         subtitleView.setText("正在向 OpenAI 发起 Codex 授权申请…");
-        new Thread(scopedLoginTask(new Runnable() {
+        startLoginTask(new Runnable() {
             @Override
             public void run() {
                 try {
@@ -1981,7 +2034,7 @@ public class LoginActivity extends Activity {
                     final JSONObject res = new JSONObject(gwBody);
                     if (!res.optBoolean("ok", false)) {
                         final String err = res.optString("error", "初始化失败");
-                        mainHandler.post(new Runnable() {
+                        postLoginUi(new Runnable() {
                             @Override
                             public void run() {
                                 subtitleView.setText("Codex 授权初始化失败：" + err);
@@ -2001,7 +2054,7 @@ public class LoginActivity extends Activity {
                         return;
                     }
 
-                    mainHandler.post(new Runnable() {
+                    postLoginUi(new Runnable() {
                         @Override
                         public void run() {
                             // 关键：Codex 授权页有 Cloudflare 人机验证，App 内 WebView 的
@@ -2022,7 +2075,7 @@ public class LoginActivity extends Activity {
                         }
                     });
                 } catch (final Exception e) {
-                    mainHandler.post(new Runnable() {
+                    postLoginUi(new Runnable() {
                         @Override
                         public void run() {
                             subtitleView.setText("连接网关失败：" + e.getMessage());
@@ -2030,15 +2083,15 @@ public class LoginActivity extends Activity {
                     });
                 }
             }
-        })).start();
+        });
     }
 
     private void startPollingCodexFlow() {
-        new Thread(scopedLoginTask(new Runnable() {
+        startLoginTask(new Runnable() {
             @Override
             public void run() {
                 long deadline = System.currentTimeMillis() + 600000L;
-                while (System.currentTimeMillis() < deadline && !isFinishing()) {
+                while (!loginDestroyed && System.currentTimeMillis() < deadline && !isFinishing()) {
                     try {
                         Thread.sleep(3000);
                         String api = "http://127.0.0.1:3425/api/auth/codex/poll?flowId="
@@ -2050,7 +2103,7 @@ public class LoginActivity extends Activity {
                             if ("done".equals(status)) {
                                 final String acc = res.optString("account", "Codex 账号");
                                 final String plan = res.optString("plan", "chatgpt");
-                                mainHandler.post(new Runnable() {
+                                postLoginUi(new Runnable() {
                                     @Override
                                     public void run() {
                                         Toast.makeText(LoginActivity.this, "Codex 授权成功：" + acc + " (" + plan + ")", Toast.LENGTH_LONG).show();
@@ -2061,7 +2114,7 @@ public class LoginActivity extends Activity {
                                 return;
                             } else if ("failed".equals(status)) {
                                 final String err = res.optString("error", "授权失败");
-                                mainHandler.post(new Runnable() {
+                                postLoginUi(new Runnable() {
                                     @Override
                                     public void run() {
                                         subtitleView.setText("授权失败：" + err);
@@ -2074,7 +2127,7 @@ public class LoginActivity extends Activity {
                     } catch (Throwable ignored) {}
                 }
             }
-        })).start();
+        });
     }
 
 }

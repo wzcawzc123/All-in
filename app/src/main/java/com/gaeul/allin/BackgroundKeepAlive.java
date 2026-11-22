@@ -23,6 +23,9 @@ final class BackgroundKeepAlive {
     private View overlay;
     private volatile boolean overlayAttached, audioPlaying;
     private boolean closed;
+    private boolean retryAudio = true;
+    private final Handler main = new Handler(Looper.getMainLooper());
+    private final Runnable retry = this::requestAudioRefresh;
     private volatile String overlayError = "", audioError = "";
     private volatile AudioWorker audio;
     BackgroundKeepAlive(Context context) { this.context = context; current = this; }
@@ -59,6 +62,8 @@ final class BackgroundKeepAlive {
         if (audioEnabled(context) && audioAllowed) {
             if (audio == null) { audioError = ""; audio = new AudioWorker(); audio.start(); }
         } else {
+            retryAudio = true;
+            main.removeCallbacks(retry);
             stopAudio(); audioError = audioEnabled(context) ? "媒体前台服务未启动" : "";
         }
     }
@@ -85,7 +90,8 @@ final class BackgroundKeepAlive {
         }
     }
     private void stopAudio() { if (audio != null) audio.shutdown(); audioPlaying = false; }
-    void close() { closed = true; detach(); stopAudio(); if (current == this) current = null; }
+    private void requestAudioRefresh() { if (!closed) GatewayService.refreshKeepAlive(context); }
+    void close() { closed = true; main.removeCallbacks(retry); detach(); stopAudio(); if (current == this) current = null; }
     private final class AudioWorker extends Thread {
         private volatile boolean stopped;
         AudioWorker() { super("allin-silent-audio"); setDaemon(true); }
@@ -104,6 +110,7 @@ final class BackgroundKeepAlive {
                 track.play();
                 byte[] silence = new byte[1600]; // 100 ms, mono PCM16 at 8 kHz.
                 long next = android.os.SystemClock.elapsedRealtime();
+                boolean announced = false;
                 while (!stopped) {
                     int offset = 0;
                     while (!stopped && offset < silence.length) {
@@ -113,9 +120,10 @@ final class BackgroundKeepAlive {
                         if (n == 0) Thread.sleep(10);
                     }
                     if (stopped) break;
-                    new Handler(Looper.getMainLooper()).post(new Runnable() { public void run() {
-                        if (!stopped && !closed && audio == AudioWorker.this) audioPlaying = true;
-                    }});
+                    if (!announced) {
+                        announced = true;
+                        main.post(() -> { if (!stopped && !closed && audio == this) audioPlaying = true; });
+                    }
                     next += 100;
                     long delay = next - android.os.SystemClock.elapsedRealtime();
                     if (delay > 0) Thread.sleep(delay); else next = android.os.SystemClock.elapsedRealtime();
@@ -125,12 +133,17 @@ final class BackgroundKeepAlive {
             finally {
                 if (track != null) { try { track.stop(); } catch (RuntimeException ignored) { } track.release(); }
                 // An old worker must not overwrite a replacement worker's state.
-                new Handler(Looper.getMainLooper()).post(new Runnable() { public void run() {
-                    if (audio == AudioWorker.this) {
-                        audioPlaying = false; audio = null;
-                        if (stopped && !closed) GatewayService.refreshKeepAlive(context);
+                main.post(() -> {
+                    if (audio != this) return;
+                    audioPlaying = false;
+                    audio = null;
+                    if (closed) return;
+                    if (stopped) requestAudioRefresh();
+                    else if (retryAudio && audioEnabled(context)) {
+                        retryAudio = false;
+                        main.postDelayed(retry, 2000);
                     }
-                }});
+                });
             }
         }
     }

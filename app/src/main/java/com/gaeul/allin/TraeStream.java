@@ -14,6 +14,7 @@ public final class TraeStream extends InputStream {
     private final TraeProtocol.Decoder decoder;
     private final RequestContext request;
     private final UsageSink sink;
+    private final TraeResponseFormat.Output structured;
     private byte[] pending = new byte[0];
     private int offset, skipped, frameSize;
     private boolean done, closed;
@@ -25,10 +26,16 @@ public final class TraeStream extends InputStream {
     }
     /** outputLimit is the final wire max_tokens, after client/model budget clipping. */
     public TraeStream(InputStream upstream, JSONArray tools, String model, RequestContext request, UsageSink sink, int outputLimit) {
+        this(upstream, tools, model, request, sink, outputLimit, null);
+    }
+
+    TraeStream(InputStream upstream, JSONArray tools, String model, RequestContext request, UsageSink sink,
+               int outputLimit, TraeResponseFormat.Output structured) {
+        this.structured = structured;
         if (upstream == null) throw new IllegalArgumentException("upstream");
         reader = new InputStreamReader(upstream, StandardCharsets.UTF_8.newDecoder()
                 .onMalformedInput(CodingErrorAction.REPORT).onUnmappableCharacter(CodingErrorAction.REPORT));
-        decoder = new TraeProtocol.Decoder(tools, model, outputLimit);
+        decoder = new TraeProtocol.Decoder(tools, model, outputLimit, structured != null);
         this.request = request; this.sink = sink;
     }
     private void check() throws IOException { if (request != null) request.check(); }
@@ -71,11 +78,12 @@ public final class TraeStream extends InputStream {
                 List<JSONObject> chunks=decoder.accept(event,body);
                 if(decoder.usage!=null && decoder.usage!=lastUsage) { lastUsage=decoder.usage; if(sink!=null)sink.accept(lastUsage); }
                 ByteArrayOutputStream out=new ByteArrayOutputStream();
+                if (structured != null) chunks = structured.accept(chunks);
                 for(JSONObject chunk:chunks) { byte[] b=("data: "+chunk.toString()+"\n\n").getBytes(StandardCharsets.UTF_8); if(out.size()+b.length>TOTAL_LIMIT)throw new IOException("Trae 输出超过大小限制"); out.write(b); }
                 if(decoder.terminal) { if(decoder.usage!=null) { JSONObject usageChunk=new JSONObject().put("id",decoder.chunkId()).put("object","chat.completion.chunk").put("created",decoder.createdAt()).put("model",decoder.modelName()).put("choices",new JSONArray()).put("usage",decoder.usage); out.write(("data: "+usageChunk.toString()+"\n\n").getBytes(StandardCharsets.UTF_8)); } out.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8)); done=true; }
                 pending=out.toByteArray(); offset=0;
                 if(pending.length==0) { skipped+=frameSize; if(skipped>TOTAL_LIMIT)throw new IOException("Trae 流缺少有效数据"); } else skipped=0;
-            } catch (TraeProtocol.UpstreamError ex) { throw ex; } catch (Exception ex) { throw new IOException("Trae 流数据无效或上游报错"); }
+            } catch (TraeProtocol.UpstreamError | TraeResponseFormat.InvalidOutput ex) { throw ex; } catch (Exception ex) { throw new IOException("Trae 流数据无效或上游报错"); }
         }
     }
     public void prime() throws IOException { if(closed)throw new IOException("流已关闭"); fill(); }

@@ -50,6 +50,16 @@ public class UsageLedgerHeatmapOfflineTest {
             long dst=at(ny,2030,3,12,12,0); JSONObject ds=UsageLedger.summary(7,"model",dst,ny);
             JSONArray dd=ds.getJSONArray("daily"); check("2030-03-06".equals(dd.getJSONObject(0).getString("day")),"DST start");
             check("2030-03-12".equals(dd.getJSONObject(6).getString("day")),"DST end");
+            File late = new File(new File(dir, "usage"), "ledger-200001.jsonl");
+            String first = new JSONObject().put("t", at(utc, 2020, 1, 1, 0, 0)).put("in", 9).put("st", 200).toString();
+            String delayed = new JSONObject().put("t", now - 1000).put("in", 17).put("st", 200).toString();
+            Files.write(late.toPath(), (first + (char)10).getBytes(StandardCharsets.UTF_8));
+            equal(UsageLedger.summary(7,"model",now,utc).getJSONObject("totals").getLong("tokens"), 4294967327L, "out-of-window file on cold scan");
+            equal(UsageLedger.summary(7,"model",now,utc).getJSONObject("totals").getLong("tokens"), 4294967327L, "out-of-window file on indexed scan");
+            check("2020-01-01".equals(UsageLedger.heatmap(now,utc).getString("firstRecordedDate")), "skipped file preserves earliest actual timestamp");
+            Files.write(late.toPath(), (delayed + (char)10).getBytes(StandardCharsets.UTF_8), java.nio.file.StandardOpenOption.APPEND);
+            equal(UsageLedger.summary(7,"model",now,utc).getJSONObject("totals").getLong("tokens"), 4294967344L, "changed file includes cross-month delayed row");
+            Files.delete(late.toPath());
             // Old on-disk row is outside the 90-day row cache but in heatmap range.
             File usage=new File(dir,"usage"); File fixture=new File(usage,"ledger-fixture.jsonl");
             long actual=System.currentTimeMillis(), historical=actual-150L*86400000L;

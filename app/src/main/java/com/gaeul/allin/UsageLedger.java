@@ -5,6 +5,7 @@ import com.gaeul.allin.json.JSONObject;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.EOFException;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
@@ -341,7 +342,7 @@ public class UsageLedger {
     public static void init(File filesDir) {
         synchronized(REBUILD_LOCK) {
             synchronized(LOCK) {
-                closeWriter();baseDir=new File(filesDir,DIR);DAYS.clear();unpersisted.clear();
+                closeWriter();baseDir=new File(filesDir,DIR);DAYS.clear();unpersisted.clear();fileRanges.clear();
                 heatDays.clear();lostHours.clear();retainedBytes=pendingBytes=0;
                 droppedPendingRows=cacheEvictions=aggregateOverflowRows=0;gapsDirty=gapStateUncertain=false;
                 firstTimestamp=Long.MAX_VALUE;invalidLines=readErrors=persistenceErrors=uncertainWrites=0;
@@ -389,6 +390,7 @@ public class UsageLedger {
             }
             if(chosen.exists()&&chosen.length()>=maxFileBytes)chosen=new File(baseDir,String.format(Locale.US,"ledger-%s-%04d.jsonl",m,++sequence));
             currentFile=chosen;
+            fileRanges.remove(chosen);
             if(currentFile.exists()&&currentFile.length()>0)try(RandomAccessFile f=new RandomAccessFile(currentFile,"rw")){
                 f.seek(f.length()-1);if(f.read()!='\n'){f.seek(f.length());f.write('\n');}
             }
@@ -397,23 +399,85 @@ public class UsageLedger {
     }
 
     private interface RowVisitor { void accept(Row r); }
-    private static void visitRows(long from,long through,RowVisitor visitor) {
-        final File[] files;final long[] lengths;final List<Row> pending;
-        synchronized(LOCK){File[] found=baseDir==null?null:baseDir.listFiles();files=found==null?new File[0]:found;
-            lengths=new long[files.length];for(int i=0;i<files.length;i++)lengths[i]=files[i].length();pending=new ArrayList<>(unpersisted);}
-        long bad=0,errors=0,first=Long.MAX_VALUE;
-        for(int i=0;i<files.length;i++){
+
+    // These bounds come from the rows, since files are named by the write month.
+    // Only cache clean, completed scans of immutable (rotated) files.
+    private static final Map<File, LedgerRange> fileRanges = new LinkedHashMap<>();
+    private static final int MAX_FILE_RANGES = 256;
+    private static final class LedgerRange {
+        final long length, modified, first, last;
+        LedgerRange(long length, long modified, long first, long last) {
+            this.length = length; this.modified = modified; this.first = first; this.last = last;
+        }
+        boolean matches(long length, long modified) { return this.length == length && this.modified == modified; }
+    }
+
+    private static long visitRows(long from,long through,RowVisitor visitor) {
+        final File[] files;
+        final long[] lengths, modified;
+        final LedgerRange[] ranges;
+        final List<Row> pending;
+        final long scanGeneration;
+        synchronized (LOCK) {
+            File[] found = baseDir == null ? null : baseDir.listFiles();
+            files = found == null ? new File[0] : found;
+            lengths = new long[files.length];
+            modified = new long[files.length];
+            ranges = new LedgerRange[files.length];
+            for (int i = 0; i < files.length; i++) {
+                File file = files[i];
+                lengths[i] = file.length();
+                modified[i] = file.lastModified();
+                if (!file.equals(currentFile)) ranges[i] = fileRanges.get(file);
+            }
+            pending = new ArrayList<>(unpersisted);
+            scanGeneration = generation;
+        }
+        long bad=0,errors=0,first=Long.MAX_VALUE,firstInTime=Long.MAX_VALUE;
+        for (int i = 0; i < files.length; i++) {
             File f=files[i];if(!f.getName().startsWith("ledger-")||!f.getName().endsWith(".jsonl"))continue;
             final long prefix=lengths[i];
+            LedgerRange known = ranges[i];
+            if (known != null && known.matches(prefix, modified[i]) && (known.last < from || known.first > through)) {
+                first = Math.min(first, known.first);
+                if (known.first <= through) firstInTime = Math.min(firstInTime, known.first);
+                continue;
+            }
+            long fileFirst = Long.MAX_VALUE, fileLast = Long.MIN_VALUE, badBefore = bad;
             try(InputStream raw=new FileInputStream(f);InputStream bounded=new java.io.FilterInputStream(raw){long left=prefix;
-                public int read()throws java.io.IOException{if(left<=0)return -1;int n=in.read();if(n>=0)left--;return n;}
-                public int read(byte[] b,int off,int len)throws java.io.IOException{if(left<=0)return -1;int n=in.read(b,off,(int)Math.min(left,len));if(n>0)left-=n;return n;}};
+                public int read()throws java.io.IOException{if(left<=0)return -1;int n=in.read();if(n<0)throw new EOFException("Ledger file shortened");left--;return n;}
+                public int read(byte[] b,int off,int len)throws java.io.IOException{if(len==0)return 0;if(left<=0)return -1;int n=in.read(b,off,(int)Math.min(left,len));if(n<0)throw new EOFException("Ledger file shortened");left-=n;return n;}};
                 BoundedSseReader reader=new BoundedSseReader(new InputStreamReader(bounded,"UTF-8"),512*1024)){
-                String line;while((line=reader.readLine())!=null){Row r=parse(line.trim());if(r==null||r.t<=0){bad++;continue;}first=Math.min(first,r.t);if(r.t>=from&&r.t<=through)visitor.accept(r);}
-            }catch(Exception e){errors++;}
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    Row r = parse(line.trim());
+                    if (r == null || r.t <= 0) { bad++; continue; }
+                    fileFirst = Math.min(fileFirst, r.t);
+                    if (r.t <= through) firstInTime = Math.min(firstInTime, r.t);
+                    fileLast = Math.max(fileLast, r.t);
+                    if (r.t >= from && r.t <= through) visitor.accept(r);
+                }
+                if (bad == badBefore) synchronized (LOCK) {
+                    if (generation == scanGeneration && !f.equals(currentFile) && f.length() == prefix && f.lastModified() == modified[i]) {
+                        if (fileRanges.size() >= MAX_FILE_RANGES && !fileRanges.containsKey(f))
+                            fileRanges.remove(fileRanges.keySet().iterator().next());
+                        fileRanges.put(f, new LedgerRange(prefix, modified[i], fileFirst, fileLast));
+                    }
+                }
+            } catch (Exception e) { errors++; }
+            first = Math.min(first, fileFirst);
         }
-        for(Row r:pending){first=Math.min(first,r.t);if(r.t>=from&&r.t<=through)visitor.accept(r);}
-        synchronized(LOCK){invalidLines=bad;readErrors=errors;firstTimestamp=Math.min(firstTimestamp,first);}
+        for (Row r : pending) {
+            first = Math.min(first, r.t);
+            if (r.t <= through) firstInTime = Math.min(firstInTime, r.t);
+            if (r.t >= from && r.t <= through) visitor.accept(r);
+        }
+        synchronized (LOCK) {
+            if (generation == scanGeneration) {
+                invalidLines=bad;readErrors=errors;firstTimestamp=Math.min(firstTimestamp,first);
+            }
+        }
+        return firstInTime;
     }
     private static long estimate(Row r){if(r.ledgerEstimate>0)return r.ledgerEstimate;long n=768;for(String v:new String[]{r.prov,r.model,r.req,r.err,r.ep,r.session,r.requestId,r.credentialId,r.accountId,r.failureKind,r.upstreamErrorCode,r.upstreamRetryAfter})if(v!=null)n+=2L*v.length();if(r.diagnostics!=null)n+=2L*r.diagnostics.json().toString().length();if(r.callEvidence!=null)n+=2L*r.callEvidence.json().toString().length();r.ledgerEstimate=n;return n;}
     private static void retain(Row r){
@@ -865,8 +929,8 @@ public class UsageLedger {
         long now=fixedNow==null?System.currentTimeMillis():fixedNow;
         Calendar start=Calendar.getInstance(zone,Locale.US);start.setTimeInMillis(now);start.set(Calendar.HOUR_OF_DAY,0);start.set(Calendar.MINUTE,0);start.set(Calendar.SECOND,0);start.set(Calendar.MILLISECOND,0);
         start.add(Calendar.DAY_OF_MONTH,-((start.get(Calendar.DAY_OF_WEEK)+5)%7)-52*7);
-        final Map<String,HeatCounts> counts=new LinkedHashMap<>();final long[] first={Long.MAX_VALUE};
-        visitRows(Long.MIN_VALUE,now,r->{first[0]=Math.min(first[0],r.t);if(r.t>=start.getTimeInMillis())addHeat(counts,r,zone);});
+        final Map<String,HeatCounts> counts=new LinkedHashMap<>();
+        final long[] first={visitRows(start.getTimeInMillis(),now,r -> addHeat(counts,r,zone))};
         synchronized(LOCK){for(LostBucket bucket:lostHours.values())if(bucket.min>=start.getTimeInMillis()&&bucket.max<=now){String k=dayKey(bucket.min,zone);HeatCounts c=counts.get(k);if(c==null){c=new HeatCounts();counts.put(k,c);}c.add(bucket.heat);first[0]=Math.min(first[0],bucket.min);}}
         JSONArray days=new JSONArray();HeatCounts total=new HeatCounts();String end=dayKey(now,zone);
         for(Calendar c=(Calendar)start.clone();;c.add(Calendar.DAY_OF_MONTH,1)){String date=dayKey(c.getTimeInMillis(),zone);if(date.compareTo(end)>0)break;HeatCounts count=counts.get(date);if(count==null)count=new HeatCounts();total.add(count);days.put(count.json().put("date",date));}

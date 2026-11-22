@@ -6,7 +6,7 @@ All In 在 Android 设备上运行 HTTP 服务。你在手机上配置供应商�
 
 [下载 APK](https://github.com/xunianooo/All-in/releases/latest) · [查看更新记录](https://github.com/xunianooo/All-in/releases) · [反馈问题](https://github.com/xunianooo/All-in/issues)
 
-当前正式版为 **All In 1.2.90（构建 96）**，APK 和标签保留 `1.2.90-test` 命名。[1.2.90 更新说明](docs/RELEASE_1.2.90-test.md)
+当前正式版为 **All In 1.2.104（构建 111）**。[1.2.104 更新说明](docs/RELEASE_1.2.104.md)
 
 ## 长什么样
 

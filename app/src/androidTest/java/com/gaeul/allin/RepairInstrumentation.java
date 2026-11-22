@@ -17,8 +17,11 @@ import java.util.UUID;
 /** Runs on Android's actual class loader and socket stack, without accounts or vendor traffic. */
 public final class RepairInstrumentation extends Instrumentation {
     private int checks;
-    private boolean audit52, qoderNamesOnly, qoderCheckinOnly, codexTlsOnly;
-    @Override public void onCreate(Bundle arguments){super.onCreate(arguments);codexTlsOnly=arguments!=null&&"true".equals(arguments.getString("codexTlsOnly"));qoderCheckinOnly=arguments!=null&&"true".equals(arguments.getString("qoderCheckin"));audit52=arguments!=null&&arguments.getString("audit52","").equals("true");qoderNamesOnly=arguments!=null&&arguments.getString("qoderNames","").equals("true");start();}
+    private String etaInputText;
+    private boolean catPawTerminalOnly;
+    private boolean heldCancellationOnly;
+    private boolean audit52, qoderNamesOnly, qoderCheckinOnly, codexTlsOnly, panelRefreshOnly, gatewayLifecycleOnly, loginLifecycleOnly, themeStartupOnly;
+    @Override public void onCreate(Bundle arguments){super.onCreate(arguments);themeStartupOnly=arguments!=null&&"true".equals(arguments.getString("themeStartupOnly"));etaInputText=arguments==null?null:arguments.getString("etaInputText");catPawTerminalOnly=arguments!=null&&"true".equals(arguments.getString("catPawTerminalOnly"));heldCancellationOnly=arguments!=null&&"true".equals(arguments.getString("heldCancellationOnly"));loginLifecycleOnly=arguments!=null&&"true".equals(arguments.getString("loginLifecycleOnly"));gatewayLifecycleOnly=arguments!=null&&"true".equals(arguments.getString("gatewayLifecycleOnly"));panelRefreshOnly=arguments!=null&&"true".equals(arguments.getString("panelRefreshOnly"));codexTlsOnly=arguments!=null&&"true".equals(arguments.getString("codexTlsOnly"));qoderCheckinOnly=arguments!=null&&"true".equals(arguments.getString("qoderCheckin"));audit52=arguments!=null&&arguments.getString("audit52","").equals("true");qoderNamesOnly=arguments!=null&&arguments.getString("qoderNames","").equals("true");start();}
     private void check(boolean value,String label){checks++;if(!value)throw new AssertionError(label);}
     private Object call(String type,String method,Class<?>[] types,Object... args)throws Exception {
         Method m=Class.forName("com.gaeul.allin."+type).getDeclaredMethod(method,types);m.setAccessible(true);return m.invoke(null,args);
@@ -274,11 +277,41 @@ public final class RepairInstrumentation extends Instrumentation {
     }
     private static String read(File file)throws Exception{try(InputStream in=new FileInputStream(file);ByteArrayOutputStream out=new ByteArrayOutputStream()){byte[] b=new byte[4096];int n;while((n=in.read(b))!=-1)out.write(b,0,n);return out.toString("UTF-8");}}
     private static void delete(File file){File[] children=file.listFiles();if(children!=null)for(File child:children)delete(child);file.delete();}
+    /** Test-only draft injection, constrained to the visible LongCat ETA composer, never credential forms. */
+    private void setEtaInputText() throws Exception {
+        String text=new String(android.util.Base64.decode(etaInputText,android.util.Base64.DEFAULT),StandardCharsets.UTF_8);
+        if(!text.matches("[A-Za-z0-9_ .]{1,120}")||!text.contains("ETA_LONGCAT_103_"))throw new SecurityException("Unexpected test draft");
+        android.view.accessibility.AccessibilityNodeInfo root=getUiAutomation().getRootInActiveWindow();
+        if(root==null||!"io.github.mangi.eta".contentEquals(root.getPackageName()))throw new SecurityException("ETA is not the active application");
+        boolean composer=false;java.util.ArrayDeque<android.view.accessibility.AccessibilityNodeInfo> nodes=new java.util.ArrayDeque<>();nodes.add(root);
+        while(!nodes.isEmpty()) {
+            android.view.accessibility.AccessibilityNodeInfo node=nodes.remove();
+            if("切换模型，当前为 catpaw/longcat-2.5".contentEquals(node.getContentDescription()==null?"":node.getContentDescription()))composer=true;
+            for(int i=0;i<node.getChildCount();i++){android.view.accessibility.AccessibilityNodeInfo child=node.getChild(i);if(child!=null)nodes.add(child);}
+        }
+        android.view.accessibility.AccessibilityNodeInfo input=root.findFocus(android.view.accessibility.AccessibilityNodeInfo.FOCUS_INPUT);
+        if(!composer||input==null||input.isPassword()||!"android.widget.EditText".contentEquals(input.getClassName()))throw new SecurityException("Expected ETA composer is not focused");
+        Bundle argument=new Bundle();argument.putCharSequence(android.view.accessibility.AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,text);
+        if(!input.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_SET_TEXT,argument))throw new AssertionError("ETA set-text action rejected");
+        getUiAutomation().waitForIdle(200,3000);input.refresh();
+        if(!text.contentEquals(input.getText()==null?"":input.getText()))throw new AssertionError("ETA draft differs after set-text");
+    }
     @Override public void onStart() {
         Bundle result=new Bundle();
         try {
             Context target=getTargetContext();
             if(!target.getPackageName().endsWith(".repairtest"))throw new SecurityException("Runtime tests require the isolatedTestInstall package");
+            if(themeStartupOnly){result.putString("stream",PanelThemeStartupRuntime.run(this)+System.lineSeparator());finish(Activity.RESULT_OK,result);return;}
+            if (etaInputText!=null) { setEtaInputText();result.putString("stream","ETA_TEST_INPUT_PASS verified exact draft\n");finish(Activity.RESULT_OK,result);return; }
+            if (catPawTerminalOnly) { result.putString("stream",CatPawTerminalRuntime.run(target)+System.lineSeparator());finish(Activity.RESULT_OK,result);return; }
+            if (heldCancellationOnly) {
+                result.putString("stream", HeldCancellationRuntime.run(target) + System.lineSeparator());
+                finish(Activity.RESULT_OK, result);
+                return;
+            }
+            if(loginLifecycleOnly){result.putString("stream",LoginLifecycleRuntime.run(this)+System.lineSeparator());finish(Activity.RESULT_OK,result);return;}
+            if(gatewayLifecycleOnly){result.putString("stream",GatewayLifecycleRuntime.run(this)+System.lineSeparator());finish(Activity.RESULT_OK,result);return;}
+            if(panelRefreshOnly){result.putString("stream",PanelRefreshRuntime.run(this)+System.lineSeparator());finish(Activity.RESULT_OK,result);return;}
             if(codexTlsOnly){result.putString("stream",CodexTlsRuntime.run()+System.lineSeparator());finish(Activity.RESULT_OK,result);return;}
             if(qoderCheckinOnly){result.putString("stream",QoderCheckinRuntime.run(target)+System.lineSeparator());finish(Activity.RESULT_OK,result);return;}
             if(audit52){result.putString("stream","AUDIT_ANDROID 05_webview "+Audit52WebView.run(this)+"\n");finish(Activity.RESULT_OK,result);return;}

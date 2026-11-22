@@ -55,9 +55,39 @@ public final class AntigravityCompatibilityGatewayTest {
         check(r.getStatus().getRequestStatus()==200,"management probe HTTP envelope");
         return new JSONObject(Audit53RegressionTest.body(r));
     }
+    static void toolResultFailure(Path dir) throws Exception {
+        String partial = "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}}\n\n";
+        String detail = new JSONObject().put("response", new JSONObject().put("error", new JSONObject()
+                .put("code", 400).put("status", "INVALID_ARGUMENT").put("message", "late tool error " + ACCESS + " " + REFRESH))).toString(2);
+        JSONObject tool = new JSONObject().put("name", "lookup").put("input_schema", new JSONObject().put("type", "object"));
+        JSONArray messages = new JSONArray().put(new JSONObject().put("role", "user").put("content", "look up an order"))
+                .put(new JSONObject().put("role", "assistant").put("content", new JSONArray().put(new JSONObject()
+                        .put("type", "tool_use").put("id", "toolu_fixture").put("name", "lookup").put("input", new JSONObject()))))
+                .put(new JSONObject().put("role", "user").put("content", new JSONArray().put(new JSONObject()
+                        .put("type", "tool_result").put("tool_use_id", "toolu_fixture").put("content", "19:42"))));
+        for (boolean stream : new boolean[]{false, true}) {
+            Wire wire = new Wire(partial + detail);
+            wire.status = 200;
+            GatewayServer g = server(dir, wire);
+            try {
+                JSONObject request = new JSONObject().put("model", "antigravity/" + MODEL).put("max_tokens", 128)
+                        .put("messages", messages).put("tools", new JSONArray().put(tool)).put("stream", stream);
+                NanoHTTPD.Response reply = Audit53RegressionTest.request(g, "/v1/messages", "POST", request.toString());
+                int status = reply.getStatus().getRequestStatus();
+                String text = Audit53RegressionTest.body(reply);
+                check(status == (stream ? 200 : 502), "late upstream failure preserves protocol status");
+                check(text.contains("code=400 status=INVALID_ARGUMENT") && !text.contains(ACCESS) && !text.contains(REFRESH), "late error facts preserved and account secret echoes redacted");
+                check(wire.opens == 1 && wire.request.contains("functionResponse"), "tool result transmitted once");
+                if (stream) check(text.contains("partial") && text.indexOf("event: error") >= 0
+                        && text.indexOf("event: error") == text.lastIndexOf("event: error") && !text.contains("event: message_stop"),
+                        "Anthropic result stream emits one error and no success terminal");
+            } finally { g.stop(); }
+        }
+    }
     public static void main(String[] args)throws Exception {
         Path dir=Files.createTempDirectory("antigravity56-gateway-");
         try {
+            toolResultFailure(dir);
             for(String mode:new String[]{"scope","region","permission"}) {
                 String msg=mode.equals("region")?"Your current account is not eligible for Gemini Code Assist for individuals because it is not currently available in your location.":mode.equals("scope")?"Request had insufficient authentication scopes.":"Permission denied for this operation.";
                 String reason=mode.equals("scope")?"ACCESS_TOKEN_SCOPE_INSUFFICIENT":"SYNTHETIC_PERMISSION";

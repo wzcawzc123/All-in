@@ -3,11 +3,9 @@ package com.gaeul.allin;
 import com.gaeul.allin.json.JSONArray;
 import com.gaeul.allin.json.JSONObject;
 
-import java.io.BufferedReader;
 import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.io.PipedInputStream;
 import java.io.PipedOutputStream;
 import java.nio.charset.StandardCharsets;
@@ -629,56 +627,35 @@ public class AntigravityClient {
      * 交给 GatewayServer 现有的 streamForwardResponse / Anthropic 桥处理。
      */
     public static InputStream toOpenAiStream(final InputStream upstream, final String model) throws Exception {
+        return toOpenAiStream(upstream, model, text -> AntigravityProtocol.safeError(text, null));
+    }
+
+    static InputStream toOpenAiStream(final InputStream upstream, final String model,
+                                      final java.util.function.UnaryOperator<String> safeError) throws IOException {
         final PipedOutputStream pos = new PipedOutputStream();
         final PipedInputStream pis = new PipedInputStream(pos, 16384);
         final String chunkId = "chatcmpl-ag-" + System.currentTimeMillis();
         final Thread worker = new Thread(new Runnable() {
             @Override
             public void run() {
-                BufferedReader br = null;
-                try {
-                    br = new BoundedSseReader(new InputStreamReader(upstream, StandardCharsets.UTF_8));
-                    String line;
+                try (AntigravityEvents events = new AntigravityEvents(upstream)) {
                     boolean started = false;
                     boolean stopped = false;
                     boolean sawFinishReason = false;
-                    boolean sawProviderError = false;
                     boolean saidSomething = false;
                     int toolIndex = -1;
                     JSONObject reportedUsage=new JSONObject();
                     String usageSent="";
-                    while ((line = br.readLine()) != null) {
-                        if (!line.startsWith("data:")) continue;
-                        String data = line.substring(5).trim();
-                        if (data.isEmpty() || "[DONE]".equals(data)) continue;
-                        JSONObject ev;
-                        try {
-                            ev = new JSONObject(data);
-                        } catch (Exception ignored) {
-                            continue;
-                        }
-                        if (ev.has("error") || "error".equals(ev.optString("type", ""))
-                                || "response.failed".equals(ev.optString("type", ""))) {
-                            sawProviderError = true;
-                            JSONObject err = ev.optJSONObject("error");
-                            Object rawError = ev.opt("error");
-                            String msg = err != null ? err.optString("message", err.optString("type", data))
-                                    : rawError instanceof String ? (String) rawError : data;
-                            pos.write(wrapError(msg).getBytes(StandardCharsets.UTF_8));
+                    JSONObject event;
+                    while ((event = events.next()) != null) {
+                        String error = AntigravityEvents.error(event);
+                        if (error != null) {
+                            pos.write(wrapError(safeError.apply(error)).getBytes(StandardCharsets.UTF_8));
                             pos.flush();
-                            continue;
+                            return;
                         }
-                        JSONObject resp = ev.optJSONObject("response");
-                        if (resp != null && resp.has("error")) {
-                            sawProviderError = true;
-                            JSONObject err = resp.optJSONObject("error");
-                            String msg = err == null ? resp.optString("error", data)
-                                    : err.optString("message", err.optString("type", data));
-                            pos.write(wrapError(msg).getBytes(StandardCharsets.UTF_8));
-                            pos.flush();
-                            continue;
-                        }
-                        if (resp == null) resp = ev;
+                        JSONObject resp = event.optJSONObject("response");
+                        if (resp == null) resp = event;
                         JSONObject usage = resp.optJSONObject("usageMetadata");
                         if (usage != null) {
                             mergeGeminiUsage(reportedUsage,usage);
@@ -744,13 +721,12 @@ public class AntigravityClient {
                             }
                         }
                     }
-                    if (!sawFinishReason && !sawProviderError) {
+                    if (!sawFinishReason) {
                         pos.write(wrapError("Antigravity stream ended before a finishReason was received")
                                 .getBytes(StandardCharsets.UTF_8));
                         pos.flush();
                         return;
                     }
-                    if (sawProviderError) return;
                     if (!saidSomething) {
                         pos.write(wrapDelta("content", "", "", model, chunkId).getBytes(StandardCharsets.UTF_8));
                         pos.flush();
@@ -761,11 +737,11 @@ public class AntigravityClient {
                     }
                     pos.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
                     pos.flush();
-                } catch (Throwable ignored) {
+                } catch (Exception failure) {
+                    try { pos.write(wrapError("Antigravity upstream stream read failed").getBytes(StandardCharsets.UTF_8)); }
+                    catch (IOException closed) { /* Client has stopped reading. */ }
                 } finally {
-                    try { pos.close(); } catch (Throwable ignored) {}
-                    try { if (br != null) br.close(); } catch (Throwable ignored) {}
-                    try { upstream.close(); } catch (Throwable ignored) {}
+                    try { pos.close(); } catch (IOException ignored) {}
                 }
             }
         }, "Antigravity-SSE");
@@ -809,95 +785,71 @@ public class AntigravityClient {
 
     public static Decoded decodeAll(InputStream upstream) throws Exception {
         Decoded d = new Decoded();
-        BufferedReader br = new BoundedSseReader(new InputStreamReader(upstream, StandardCharsets.UTF_8));
         StringBuilder text = new StringBuilder();
         StringBuilder think = new StringBuilder();
-        String line;
-        while ((line = br.readLine()) != null) {
-            if (!line.startsWith("data:")) continue;
-            String data = line.substring(5).trim();
-            if (data.isEmpty() || "[DONE]".equals(data)) continue;
-            JSONObject ev;
-            try {
-                ev = new JSONObject(data);
-            } catch (Exception ignored) {
-                continue;
-            }
-            if (ev.has("error") || "error".equals(ev.optString("type", ""))
-                    || "response.failed".equals(ev.optString("type", ""))) {
-                Object rawError = ev.opt("error");
-                JSONObject err = ev.optJSONObject("error");
-                if (err != null) d.providerError = err.optString("message", err.optString("type", data));
-                else if (rawError instanceof String) d.providerError = (String) rawError;
-                else d.providerError = data;
-                continue;
-            }
-            JSONObject resp = ev.optJSONObject("response");
-            if (resp != null && resp.has("error")) {
-                JSONObject err = resp.optJSONObject("error");
-                d.providerError = err == null ? resp.optString("error", data)
-                        : err.optString("message", err.optString("type", data));
-                continue;
-            }
-            if (resp == null) resp = ev;
-            String mv = resp.optString("modelVersion", "");
-            if (!mv.isEmpty()) d.modelVersion = mv;
-            JSONObject usage = resp.optJSONObject("usageMetadata");
-            if (usage != null) {
-                mergeGeminiUsage(d.reportedUsage,usage);
-                d.promptTokens = usage.optInt("promptTokenCount", d.promptTokens);
-                d.cachedTokens = usage.optInt("cachedContentTokenCount", d.cachedTokens);
-                d.outputTokens = usage.optInt("candidatesTokenCount", d.outputTokens);
-                d.thoughtTokens = usage.optInt("thoughtsTokenCount", d.thoughtTokens);
-            }
-            JSONArray cands = resp.optJSONArray("candidates");
-            if (cands == null) continue;
-            for (int ci = 0; ci < cands.length(); ci++) {
-                JSONObject cand = cands.optJSONObject(ci);
-                if (cand == null) continue;
-                JSONObject content = cand.optJSONObject("content");
-                JSONArray parts = content == null ? null : content.optJSONArray("parts");
-                if (parts != null) {
-                    for (int pi = 0; pi < parts.length(); pi++) {
-                        JSONObject p = parts.optJSONObject(pi);
-                        if (p == null) continue;
-                        JSONObject fc = p.optJSONObject("functionCall");
-                        if (fc != null) {
-                            JSONObject call = new JSONObject();
-                            String id = fc.optString("id", "");
-                            if (id.isEmpty()) id = "call_" + randomHex(6);
-                            call.put("id", id);
-                            call.put("type", "function");
-                            JSONObject fn = new JSONObject();
-                            fn.put("name", fc.optString("name", "tool"));
-                            JSONObject args = fc.optJSONObject("args");
-                            fn.put("arguments", args == null ? "{}" : args.toString());
-                            call.put("function", fn);
-                            String signature = p.optString("thoughtSignature", "");
-                            if (!signature.isEmpty()) call.put("extra_content", googleExtraContent(signature));
-                            d.toolCalls.put(call);
-                            continue;
-                        }
-                        if (hasOutputImage(p)) {
-                            d.sawImage = true;
-                            if (d.imageMime.isEmpty()) d.imageMime = inlineMime(p);
-                            continue;
-                        }
-                        String signature = p.optString("thoughtSignature", "");
-                        if (!signature.isEmpty()) d.thoughtSignature = signature;
-                        String t = p.optString("text", "");
-                        if (t.isEmpty()) continue;
-                        if (p.optBoolean("thought", false)) think.append(t);
-                        else text.append(t);
-                    }
+        try (AntigravityEvents events = new AntigravityEvents(upstream)) {
+            JSONObject event;
+            while ((event = events.next()) != null) {
+                String error = AntigravityEvents.error(event);
+                if (error != null) throw new IOException(error);
+                JSONObject resp = event.optJSONObject("response");
+                if (resp == null) resp = event;
+                String mv = resp.optString("modelVersion", "");
+                if (!mv.isEmpty()) d.modelVersion = mv;
+                JSONObject usage = resp.optJSONObject("usageMetadata");
+                if (usage != null) {
+                    mergeGeminiUsage(d.reportedUsage,usage);
+                    d.promptTokens = usage.optInt("promptTokenCount", d.promptTokens);
+                    d.cachedTokens = usage.optInt("cachedContentTokenCount", d.cachedTokens);
+                    d.outputTokens = usage.optInt("candidatesTokenCount", d.outputTokens);
+                    d.thoughtTokens = usage.optInt("thoughtsTokenCount", d.thoughtTokens);
                 }
-                String fr = cand.optString("finishReason", "");
-                if (!fr.isEmpty()) d.finishReason = openAiFinishReason(fr);
+                JSONArray cands = resp.optJSONArray("candidates");
+                if (cands == null) continue;
+                for (int ci = 0; ci < cands.length(); ci++) {
+                    JSONObject cand = cands.optJSONObject(ci);
+                    if (cand == null) continue;
+                    JSONObject content = cand.optJSONObject("content");
+                    JSONArray parts = content == null ? null : content.optJSONArray("parts");
+                    if (parts != null) {
+                        for (int pi = 0; pi < parts.length(); pi++) {
+                            JSONObject p = parts.optJSONObject(pi);
+                            if (p == null) continue;
+                            JSONObject fc = p.optJSONObject("functionCall");
+                            if (fc != null) {
+                                JSONObject call = new JSONObject();
+                                String id = fc.optString("id", "");
+                                if (id.isEmpty()) id = "call_" + randomHex(6);
+                                call.put("id", id);
+                                call.put("type", "function");
+                                JSONObject fn = new JSONObject();
+                                fn.put("name", fc.optString("name", "tool"));
+                                JSONObject args = fc.optJSONObject("args");
+                                fn.put("arguments", args == null ? "{}" : args.toString());
+                                call.put("function", fn);
+                                String signature = p.optString("thoughtSignature", "");
+                                if (!signature.isEmpty()) call.put("extra_content", googleExtraContent(signature));
+                                d.toolCalls.put(call);
+                                continue;
+                            }
+                            if (hasOutputImage(p)) {
+                                d.sawImage = true;
+                                if (d.imageMime.isEmpty()) d.imageMime = inlineMime(p);
+                                continue;
+                            }
+                            String signature = p.optString("thoughtSignature", "");
+                            if (!signature.isEmpty()) d.thoughtSignature = signature;
+                            String t = p.optString("text", "");
+                            if (t.isEmpty()) continue;
+                            if (p.optBoolean("thought", false)) think.append(t);
+                            else text.append(t);
+                        }
+                    }
+                    String fr = cand.optString("finishReason", "");
+                    if (!fr.isEmpty()) d.finishReason = openAiFinishReason(fr);
+                }
             }
         }
-        br.close();
-        upstream.close();
-        if (!d.providerError.isEmpty()) throw new java.io.IOException(d.providerError);
         // A reply holding a picture is not one OpenAI's message carries: told as the failure it is,
         // rather than handed over with the picture gone and finish_reason "stop".
         if (d.sawImage) throw new java.io.IOException(imageOutputError(d.imageMime));

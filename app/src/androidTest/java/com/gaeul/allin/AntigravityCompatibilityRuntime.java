@@ -51,6 +51,33 @@ final class AntigravityCompatibilityRuntime {
         check(!result.toString().contains("ANDROID_ACCESS_SENTINEL")&&!result.toString().contains("ANDROID_REFRESH_SENTINEL"),"Android errors redact credential echoes");
         check(result.getJSONObject("upstreamError").getJSONArray("reasons").length()==1,"Android structured ErrorInfo");
         check("free-tier".equals(AntigravityProtocol.onboardBody(null).optString("tierId")),"Android new onboard fields");
+        String late = "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}}\n\n"
+                + "{\r\n\"error\":{\"code\":400,\"status\":\"INVALID_ARGUMENT\",\"message\":\"late fixture error\"}\r\n}";
+        try (InputStream stream = GatewayServer.openAiToAnthropicStream(AntigravityClient.toOpenAiStream(
+                new ByteArrayInputStream(late.getBytes(StandardCharsets.UTF_8)), "gemini-3.1-flash-lite"), "gemini-3.1-flash-lite", null, null)) {
+            ByteArrayOutputStream client = new ByteArrayOutputStream();
+            byte[] buffer = new byte[1024];
+            for (int n; (n = stream.read(buffer)) >= 0;) client.write(buffer, 0, n);
+            String messages = client.toString("UTF-8");
+            check(messages.contains("partial") && messages.contains("code=400 status=INVALID_ARGUMENT"), "Android keeps prefix and Google error facts");
+            check(messages.indexOf("event: error") >= 0 && messages.indexOf("event: error") == messages.lastIndexOf("event: error")
+                    && !messages.contains("event: message_stop"), "Android Messages emits one failure, without completion");
+        }
+        JSONObject shape = new JSONObject("{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"required\":[\"id\"],\"additionalProperties\":false}");
+        JSONObject format = new JSONObject().put("type", "json_schema").put("json_schema", new JSONObject().put("name", "job").put("schema",shape).put("strict",true));
+        TraeResponseFormat validator = TraeResponseFormat.from(new JSONObject().put("response_format", format));
+        String good = "event: output\ndata: {\"content\":\"{\\\"id\\\":9007199254740993}\"}\n\nevent: done\ndata: {}\n\n";
+        try (TraeStream stream = new TraeStream(new ByteArrayInputStream(good.getBytes(StandardCharsets.UTF_8)), null,
+                "fixture", null, null, 0, validator.output(null, null))) {
+            JSONObject message = stream.aggregate().getJSONArray("choices").getJSONObject(0).getJSONObject("message");
+            check(new JSONObject(message.getString("content")).getLong("id") == 9007199254740993L, "Android preserves exact JSON integers");
+        }
+        String invalid = good.replace("9007199254740993", "3.5");
+        boolean rejected = false;
+        try (TraeStream stream = new TraeStream(new ByteArrayInputStream(invalid.getBytes(StandardCharsets.UTF_8)), null,
+                "fixture", null, null, 0, validator.output(null, null))) { stream.aggregate(); }
+        catch (TraeResponseFormat.InvalidOutput expected) { rejected = true; }
+        check(rejected, "Android rejects noninteger structured output");
         return checks;
     }
 }

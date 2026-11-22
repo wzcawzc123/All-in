@@ -153,6 +153,12 @@ public final class HeldResponseOfflineTest {
                     if (stage == 2) { partialRelease.await(2,TimeUnit.SECONDS); byte[] v = "\n\n".getBytes("UTF-8"); System.arraycopy(v,0,b,o,v.length); return v.length; } return -1;
                 } catch (InterruptedException e) { throw new IOException(e); } }
             };
+            String rawCr = "data: native-cr" + (char)13 + (char)13;
+            Body crBody = new Body(rawCr);
+            AllInHeldResponse crStream = held(() -> NanoHTTPD.newChunkedResponse(NanoHTTPD.Response.Status.OK, "text/event-stream", crBody),
+                    executor, 1000, new AtomicInteger(), new AtomicInteger(), "chat");
+            ByteArrayOutputStream crSink = new ByteArrayOutputStream(); crStream.send(crSink);
+            check(crBody.success && crSink.toString("UTF-8").contains(rawCr), "bare CR event completes and is forwarded intact");
             AllInHeldResponse partialStream = held(() -> NanoHTTPD.newChunkedResponse(NanoHTTPD.Response.Status.OK,"text/event-stream",partialEvent), executor, 1000, new AtomicInteger(), new AtomicInteger(), "chat");
             ByteArrayOutputStream partialSink = new ByteArrayOutputStream(); Thread partialSender = new Thread(() -> partialStream.send(partialSink)); partialSender.start();
             check(partialStarted.await(1,TimeUnit.SECONDS), "partial started"); Thread.sleep(100); check(!partialSink.toString("UTF-8").contains("heartbeat"), "no heartbeat in partial event"); partialRelease.countDown(); partialSender.join(2000); check(!partialSender.isAlive(), "partial sender finished");

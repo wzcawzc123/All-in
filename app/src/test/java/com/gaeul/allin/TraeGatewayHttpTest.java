@@ -64,6 +64,16 @@ public final class TraeGatewayHttpTest {
                         :m.equals("error")?"event: output\ndata: {\"content\":\"partial\"}\n\nevent: error\ndata: {\"code\":1}\n\n"
                         :m.equals("tool")?"event: output\ndata: {\"tool_calls\":[{\"id\":\"call_fixture_123\",\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]}\n\n"+END
                         :"event: output\ndata: {\"content\":\"hello\"}\n\n";
+                if (m.startsWith("format-")) {
+                    String content = m.startsWith("format-bad") ? "{\"id\":7}" : m.equals("format-prose") ? "not JSON"
+                            : m.equals("format-length") ? "{\"id\":" : "```json\n{\"id\":\"work-12\",\"note\":\"<tool_call>literal</tool_call>\"}\n```";
+                    String finish = m.equals("format-length") ? "length" : "stop";
+                    text = "event: output\ndata: " + new JSONObject().put("content", content) + "\n\n"
+                            + "event: done\ndata: " + new JSONObject().put("finish_reason", finish) + "\n\n";
+                    if (m.equals("format-bad-after-reasoning")) {
+                        text = "event: output\ndata: " + new JSONObject().put("reasoning_content", "checking format") + "\n\n" + text;
+                    }
+                }
                 OutputStream out=c.getOutputStream(); out.write(bytes("HTTP/1.1 "+status+" Fixture\r\nContent-Type: "+(json?"application/json":"text/event-stream")+"\r\nConnection: close\r\n\r\n"));out.write(bytes(text));out.flush();wrote.countDown();
                 if(m.equals("hold")) {release.await(10,TimeUnit.SECONDS); try {out.write(bytes(END));out.flush();}catch(IOException disconnected) {}}
                 else if(m.equals("cancel")) {
@@ -144,6 +154,67 @@ public final class TraeGatewayHttpTest {
         check(u.body.contains("<tool_call>")&&u.body.contains("Result of run (call call_fixture_123):"),"text form went upstream: "+u.body);
         u.mode="ok";
     }
+    static void structuredOutput(Gateway gateway, Upstream upstream) throws Exception {
+        JSONObject simple = new JSONObject().put("type", "json_object");
+        JSONObject schema = new JSONObject("{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"enum\":[\"work-12\"]},\"note\":{\"type\":\"string\"}},\"required\":[\"id\",\"note\"],\"additionalProperties\":false}");
+        JSONObject properties = schema.getJSONObject("properties");
+        schema.put("$defs", new JSONObject().put("TicketId", properties.getJSONObject("id")));
+        properties.put("id", new JSONObject().put("$ref", "#/$defs/TicketId"));
+        JSONObject descriptor = new JSONObject().put("name", "ticket").put("strict", true).put("schema", schema);
+        JSONObject strict = new JSONObject().put("type", "json_schema").put("json_schema", descriptor);
+        upstream.mode = "format-ok";
+        for (JSONObject format : new JSONObject[]{simple, strict}) for (boolean stream : new boolean[]{false, true}) {
+            JSONObject request = chat("trae-cn/fixture", stream).put("response_format", format);
+            int before = upstream.count.get();
+            Result result = post(gateway, "/v1/chat/completions", request);
+            check(result.status == 200 && upstream.count.get() == before + 1, "structured format one upstream send: " + result.body);
+            JSONObject wire = new JSONObject(upstream.body);
+            JSONObject system = wire.getJSONArray("messages").getJSONObject(0);
+            check(!wire.has("response_format") && "system".equals(system.getString("role")), "format translated to system message");
+            check(system.toString().contains("JSON object"), "format instruction reaches Trae");
+            check(result.body.contains("work-12") && result.body.contains("<tool_call>literal") && !result.body.contains("```"), "validated JSON preserved and unfenced: " + result.body);
+            if (stream) check(result.body.contains("[DONE]") && result.body.contains("\"finish_reason\":\"stop\""), "valid structured stream terminal");
+            else check(new JSONObject(new JSONObject(result.body).getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content")).getString("note").equals("<tool_call>literal</tool_call>"), "structured completion parsed by client");
+        }
+        JSONObject responses = new JSONObject().put("model", "trae-cn/fixture").put("input", "extract ticket")
+                .put("text", new JSONObject().put("format", new JSONObject(descriptor.toString()).put("type", "json_schema")));
+        Result result = post(gateway, "/v1/responses", responses);
+        check(result.status == 200 && result.body.contains("work-12") && result.body.contains("completed"), "Responses schema route: " + result.body);
+        JSONObject anthropic = new JSONObject().put("model", "trae-cn/fixture").put("max_tokens", 512)
+                .put("messages", new JSONArray().put(new JSONObject().put("role", "user").put("content", "extract ticket")))
+                .put("output_config", new JSONObject().put("format", new JSONObject().put("type", "json_schema").put("schema", schema)));
+        result = post(gateway, "/v1/messages", anthropic);
+        check(result.status == 200 && result.body.contains("work-12"), "Messages schema route: " + result.body);
+        upstream.mode = "format-bad";
+        for (boolean stream : new boolean[]{false, true}) {
+            int before = upstream.count.get();
+            result = post(gateway, "/v1/chat/completions", chat("trae-cn/fixture", stream).put("response_format", strict));
+            check(result.status == 502 && upstream.count.get() == before + 1 && result.body.contains("invalid structured output"), "schema mismatch failed before success without replay: " + result.body);
+        }
+        upstream.mode = "format-bad-after-reasoning";
+        int sentBeforeFailure = upstream.count.get();
+        result = post(gateway, "/v1/chat/completions", chat("trae-cn/fixture", true).put("response_format", strict));
+        check(result.status == 200 && upstream.count.get() == sentBeforeFailure + 1
+                && result.body.contains("checking format") && result.body.contains("invalid structured output")
+                && !result.body.contains("[DONE]") && !result.body.contains("work-12"), "a late format failure is an incomplete stream: " + result.body);
+        upstream.mode = "format-prose";
+        result = post(gateway, "/v1/chat/completions", chat("trae-cn/fixture", false).put("response_format", simple));
+        check(result.status == 502 && !result.body.contains("not JSON"), "non-JSON object rejected");
+        upstream.mode = "format-length";
+        result = post(gateway, "/v1/chat/completions", chat("trae-cn/fixture", true).put("response_format", strict));
+        check(result.status == 200 && result.body.contains("\"finish_reason\":\"length\"") && result.body.contains("[DONE]"), "length terminal remains visible: " + result.body);
+        upstream.mode = "tool";
+        JSONObject tool = new JSONObject().put("type", "function").put("function",
+                new JSONObject().put("name", "run").put("parameters", new JSONObject().put("type", "object")));
+        result = post(gateway, "/v1/chat/completions", chat("trae-cn/fixture", true).put("response_format", strict).put("tools", new JSONArray().put(tool)));
+        check(result.status == 200 && result.body.contains("call_fixture_123") && result.body.contains("[DONE]"), "tool turn remains valid under strict final format: " + result.body);
+        int before = upstream.count.get();
+        schema.put("unsupported_constraint", true);
+        result = post(gateway, "/v1/chat/completions", chat("trae-cn/fixture", false).put("response_format", strict));
+        check(result.status == 400 && upstream.count.get() == before, "unknown constraint rejected before sending");
+        upstream.mode = "ok";
+    }
+
     static String sessionRequest(Gateway g, Upstream u, JSONObject request, String session) throws Exception {
         HttpURLConnection c=(HttpURLConnection)new URL("http://127.0.0.1:"+g.getListeningPort()+"/v1/chat/completions").openConnection();
         c.setConnectTimeout(5000); c.setReadTimeout(10000); c.setRequestProperty("Authorization","Bearer "+AUTH);
@@ -400,7 +471,7 @@ public final class TraeGatewayHttpTest {
     }
     public static void main(String[] args) throws Exception {
         Path dir=Files.createTempDirectory("trae-gateway-http");UsageLedger.init(dir.toFile());GatewayManagementCredential.init(dir.toFile());
-        try(Upstream u=new Upstream();Upstream fallback=new Upstream()){if(args.length>0 && args[0].equals("--sessions")) sessions(dir,u,fallback); else if(args.length>0 && args[0].equals("--functions")) functions(dir,u,fallback); else if(args.length>0 && args[0].equals("--verdicts")) verdicts(dir,u,fallback); else if(args.length>0 && args[0].equals("--cancel")) cancel(dir,u,fallback); else {JSONObject cfg=config(fallback);try(Gateway g=new Gateway(cfg,dir,u)){successes(g,u);failures(g,u,fallback);api(g,u,cfg);}u.mode="ok";sessions(dir,u,fallback);functions(dir,u,fallback);verdicts(dir,u,fallback);cancel(dir,u,fallback);}}
+        try(Upstream u=new Upstream();Upstream fallback=new Upstream()){if(args.length>0 && args[0].equals("--sessions")) sessions(dir,u,fallback); else if(args.length>0 && args[0].equals("--functions")) functions(dir,u,fallback); else if(args.length>0 && args[0].equals("--verdicts")) verdicts(dir,u,fallback); else if(args.length>0 && args[0].equals("--cancel")) cancel(dir,u,fallback); else {JSONObject cfg=config(fallback);try(Gateway g=new Gateway(cfg,dir,u)){successes(g,u);structuredOutput(g,u);failures(g,u,fallback);api(g,u,cfg);}u.mode="ok";sessions(dir,u,fallback);functions(dir,u,fallback);verdicts(dir,u,fallback);cancel(dir,u,fallback);}}
         System.out.println("TraeGatewayHttpTest OK");
     }
 }

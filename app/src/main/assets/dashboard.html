@@ -1211,6 +1211,20 @@
     }
 
     /* Daily check-in center: theme-aware cards, no external assets or fonts. */
+    .home-quota {margin-top:12px; border-inline-start:3px solid var(--primary);}
+    .home-quota-head,.home-quota-account {display:flex; align-items:center; justify-content:space-between; gap:12px; min-width:0}
+    .home-quota-head h2 {font-size:16px; margin:0; color:var(--text)}
+    .home-quota-head .btn {flex:none; min-height:40px; margin:0; white-space:nowrap}
+    .home-quota-total {display:flex; flex-wrap:wrap; align-items:baseline; gap:6px 10px; margin:5px 0; color:var(--primary);}
+    .home-quota-total strong {font-size:clamp(30px,8vw,42px); font-weight:760; line-height:1.1; letter-spacing:-.04em; font-variant-numeric:tabular-nums; word-break:break-word}
+    .home-quota-total span,.home-quota-status,.home-quota-hint {font-size:12px; color:var(--text-muted)}
+    .home-quota-status,.home-quota-hint {margin:2px 0 0}
+    .home-quota-details {border-top:1px solid var(--card-border); margin-top:12px; padding-top:4px}
+    .home-quota-details summary {font-size:13px; cursor:pointer; padding:9px 0; min-height:39px; color:var(--text); font-weight:650}
+    .home-quota-list {display:grid; gap:8px; list-style:none; margin:0; padding:2px 0 4px}
+    .home-quota-account {align-items:flex-start; font-size:12px; color:var(--text-muted)}
+    .home-quota-account span:first-child {min-width:0; overflow-wrap:anywhere}
+    .home-quota-account span:last-child {flex:0 1 auto; max-width:55%; text-align:right; color:var(--text); font-variant-numeric:tabular-nums; overflow-wrap:anywhere}
     .checkin-entry{display:flex;align-items:center;justify-content:space-between;gap:16px;overflow:hidden;background:linear-gradient(115deg,var(--primary-weak),var(--card-bg) 75%);border:1px solid var(--card-border)}
     .checkin-entry h2{font-size:19px;margin:4px 0;color:var(--text)}.checkin-entry p{margin:0;color:var(--text-muted);font-size:12px;line-height:1.6}.checkin-kicker{font-size:10px;letter-spacing:1.4px;font-weight:700;color:var(--primary)}
     .checkin-entry .btn,.checkin-row .btn{flex-shrink:0;min-height:44px;white-space:nowrap}.checkin-page{color:var(--text);padding-bottom:18px}.checkin-back{margin-bottom:14px!important;background:transparent!important;color:var(--text-muted)!important;border:0!important;padding-left:0!important;min-height:44px}
@@ -1232,6 +1246,8 @@
     (function () {
       var KEY = 'allin_theme';
       function sysDark() {
+        // The trusted local document receives this before its first frame, even if the bridge is not ready.
+        if (typeof window.__allinInitialSystemDark === 'boolean') return window.__allinInitialSystemDark;
         try {
           if (window.AllInNative && typeof window.AllInNative.isSystemDark === 'function') {
             return !!window.AllInNative.isSystemDark();
@@ -2020,6 +2036,19 @@ html[data-theme="dark"] .glass-switch-shell {
           <div class="stat-sub">累计条目</div>
         </div>
       </div>
+      <section class="card home-quota" id="home-quota" aria-labelledby="home-quota-heading">
+        <div class="home-quota-head">
+          <h2 id="home-quota-heading">额度总览</h2>
+          <button type="button" id="home-quota-refresh" class="btn btn-outline" onclick="refreshHomeQuota(true)" aria-label="刷新首页额度">刷新</button>
+        </div>
+        <div class="home-quota-total"><strong id="home-quota-total">—</strong><span>积分</span></div>
+        <p id="home-quota-status" class="home-quota-status" role="status">等待读取账号</p>
+        <details class="home-quota-details" id="home-quota-details" hidden>
+          <summary>按账号查看</summary>
+          <ul class="home-quota-list" id="home-quota-list"></ul>
+          <p class="home-quota-hint">仅汇总以积分计量的余额，各供应商积分独立使用。</p>
+        </details>
+      </section>
       <div class="glass-section-heading"><h2>快捷入口</h2></div>
       <div class="glass-quick">
       <div class="card gateway-entry">
@@ -3414,6 +3443,7 @@ html[data-theme="dark"] .glass-switch-shell {
         clearGatewayEndpoints();
       }
       renderGatewayConnectionState();
+      if (stopped && typeof markHomeQuotaOffline === 'function') markHomeQuotaOffline();
       const btn = document.getElementById('gw-toggle');
       const txt = document.getElementById('gw-toggle-text');
       if (!btn || !txt) return;
@@ -3742,10 +3772,9 @@ html[data-theme="dark"] .glass-switch-shell {
           }})
         });
         const d = await res.json();
-        if (d.ok) {
-          showToast((enabled && enabled.checked) ? '🛡️ 脱敏已开启' : '⚠️ 脱敏已关闭');
-          await loadPrivacy();
-        }
+        if (!res.ok || !d.ok) throw new Error((d.error && d.error.message) || '隐私设置未保存');
+        showToast((enabled && enabled.checked) ? '🛡️ 脱敏已开启' : '⚠️ 脱敏已关闭');
+        await loadPrivacy();
       } catch (e) {
         alert('保存失败: ' + e.message);
       }
@@ -7701,6 +7730,176 @@ html[data-theme="dark"] .glass-switch-shell {
       finally { providerWrites.delete(id); providerWriteRevision++; await loadConfig(); applyProviderView(); }
     }
 
+    // A home refresh only reads billing; provider details can separately refresh their model catalog.
+    const homeQuotaProviders = new Set(['trae-cn','workbuddy','workbuddy-ai','raccoon','loomy',
+      'qoder_cn','catpaw','codex','cline','github-copilot','minimax-code','zcode']);
+    const homeQuotaFormat = new Intl.NumberFormat('zh-CN', {maximumFractionDigits:2});
+    const homeQuotaCache = new Map();
+    let homeQuotaRecent = '', homeQuotaAttempt = '', homeQuotaBusy = false;
+
+    function homeQuotaAccounts() {
+      return (appConfig?.providers || []).filter(p => p && p.enabled !== false).flatMap(p => {
+        const seen = new Set();
+        return (Array.isArray(p.accounts) ? p.accounts : []).filter(a => {
+          if (!a || typeof a.id !== 'string' || !a.id || seen.has(a.id) || a.enabled === false
+              || a.off === true || String(a.status || '').toLowerCase() === 'off') return false;
+          seen.add(a.id);
+          return true;
+        }).map(a => ({provider:p.id, id:a.id, key:JSON.stringify([p.id,a.id]), name:a.name || a.label || '未命名账号',
+          label:p.name || p.id, readable:homeQuotaProviders.has(p.id)}));
+      });
+    }
+
+    function homeQuotaCredits(provider, allowance) {
+      if (!allowance || allowance.scope !== 'account' || allowance.unit !== 'credits' || allowance.unlimited === true) return null;
+      const read = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+      const direct = read(allowance.remaining);
+      const windows = Array.isArray(allowance.windows) ? allowance.windows : [];
+      if (provider === 'trae-cn' && direct === null) {
+        const totals = windows.filter(w => w?.name === 'Credits' && w.unit === 'credits' && w.scope !== 'model' && !w.aside);
+        return totals.length === 1 ? read(totals[0].remaining) : null;
+      }
+      if (provider === 'loomy') {
+        // The adapter exposes permanent balance and the separate daily wallet.
+        const daily = windows.find(w => w?.name === 'daily' && w.unit === 'credits' && w.scope !== 'model');
+        const dailyAmount = read(daily?.remaining);
+        if (daily && (direct === null || dailyAmount === null)) return null;
+        if (dailyAmount !== null) {
+          const sum = direct + dailyAmount;
+          return Number.isFinite(sum) ? sum : null;
+        }
+      }
+      return direct;
+    }
+
+    function homeQuotaValue(account, entry, amount) {
+      if (amount !== null) return '剩 ' + homeQuotaFormat.format(amount) + ' 积分';
+      const allowance = entry?.allowance;
+      if (allowance) {
+        const direct = billingAllowanceText(allowance);
+        if (direct && allowance.unit !== 'credits') return direct === '不限额' ? direct : '剩 ' + direct;
+        if (allowance.unlimited === true) return '不限额';
+        const windows = Array.isArray(allowance.windows) ? allowance.windows : [];
+        const amounts = windows.map(w => {
+          const value = billingAllowanceText(w, allowance.unit);
+          return value ? (w?.name ? w.name + ' ' : '') + value : '';
+        }).filter(Boolean);
+        if (direct) amounts.unshift((account.provider === 'loomy' ? '永久额度 ' : '') + direct);
+        if (amounts.length) return amounts.join(' · ');
+        if (Array.isArray(allowance.modelPools) && allowance.modelPools.length) return '按模型查看额度';
+      }
+      if (!account.readable || ['unsupported','not_provided','key_not_supported'].includes(entry?.errorKind)) return '暂无可查询额度';
+      if (entry?.errorKind === 'sign_in_required') return '需重新登录';
+      if (entry?.errorKind) return '额度暂不可用';
+      return homeQuotaBusy ? '正在读取…' : '等待读取';
+    }
+
+    function renderHomeQuota(accounts) {
+      const card = document.getElementById('home-quota');
+      if (!card) return;
+      let total = 0, known = 0, observed = 0, stale = 0;
+      const rows = accounts.map(account => {
+        const saved = homeQuotaCache.get(account.key);
+        const amount = homeQuotaCredits(account.provider, saved?.allowance);
+        if (amount !== null) { total += amount; known++; }
+        if (amount !== null) observed = Math.max(observed, saved.observed);
+        if (saved?.stale && saved.allowance) stale++;
+        const value = homeQuotaValue(account, saved, amount) + (saved?.stale && saved.allowance ? ' · 上次结果' : '');
+        return [account.label + ' · ' + account.name, value];
+      });
+      const refresh = document.getElementById('home-quota-refresh');
+      const status = document.getElementById('home-quota-status');
+      const details = document.getElementById('home-quota-details');
+      const number = document.getElementById('home-quota-total');
+      const list = document.getElementById('home-quota-list');
+      const note = !gatewayRunning ? '网关关闭 · ' + (observed ? '显示上次结果' : '开启后可查询')
+        : homeQuotaBusy ? '正在同步账号额度…'
+        : !appConfig ? '等待读取账号' : !accounts.length ? '暂无启用账号'
+        : known ? `${known}/${accounts.length} 个账号计入积分${stale ? ' · 部分为上次结果' : ''}`
+        : homeQuotaAttempt ? '暂无可汇总的积分' : '等待读取额度';
+      const stamp = gatewayRunning && !homeQuotaBusy && observed ? ' · 最近更新 ' + new Date(observed).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}) : '';
+      const value = known && Number.isFinite(total) ? homeQuotaFormat.format(total) : '—';
+      const signature = JSON.stringify([rows,note,stamp,value,gatewayRunning,homeQuotaBusy]);
+      if (signature === homeQuotaRecent) return;
+      homeQuotaRecent = signature;
+      refresh.disabled = !gatewayRunning || homeQuotaBusy || !accounts.some(a => a.readable);
+      refresh.textContent = homeQuotaBusy ? '刷新中…' : '刷新';
+      card.setAttribute('aria-busy', String(homeQuotaBusy));
+      number.textContent = value;
+      status.textContent = note + stamp;
+      details.hidden = !rows.length;
+      const items = rows.map(([name,value]) => {
+        const row = document.createElement('li'); row.className = 'home-quota-account';
+        const label = document.createElement('span'); label.textContent = name;
+        const amount = document.createElement('span'); amount.textContent = value;
+        row.append(label,amount);
+        return row;
+      });
+      list.replaceChildren(...items);
+    }
+
+    function markHomeQuotaOffline() {
+      homeQuotaAttempt = '';
+      for (const entry of homeQuotaCache.values()) if (entry.allowance) entry.stale = true;
+      renderHomeQuota(homeQuotaAccounts());
+    }
+
+    function homeQuotaVisible() {
+      const overview = document.getElementById('tab-overview');
+      return !document.hidden && overview?.classList.contains('active') && !document.getElementById('overview-main-view')?.hidden;
+    }
+
+    async function refreshHomeQuota(manual = false) {
+      if (typeof gatewayRunning === 'undefined' || !document.getElementById('home-quota')) return;
+      const accounts = homeQuotaAccounts();
+      const currentKeys = new Set(accounts.map(a => a.key));
+      for (const key of homeQuotaCache.keys()) if (!currentKeys.has(key)) homeQuotaCache.delete(key);
+      renderHomeQuota(accounts);
+      if (!gatewayRunning || !appConfig || !homeQuotaVisible() || homeQuotaBusy) return;
+      const providers = Array.from(new Set(accounts.filter(a => a.readable).map(a => a.provider)));
+      const signature = JSON.stringify(accounts.filter(a => a.readable).map(a => a.key).sort());
+      if (!providers.length || (!manual && homeQuotaAttempt === signature)) return;
+      const revision = statusRevision, writes = providerWriteRevision;
+      const current = () => gatewayRunning && revision === statusRevision && writes === providerWriteRevision;
+      homeQuotaAttempt = signature;
+      homeQuotaBusy = true;
+      renderHomeQuota(accounts);
+      const queue = providers.values();
+      const read = async () => {
+        for (const provider of queue) {
+          if (!current()) return;
+          let rows = null;
+          try {
+            const response = await fetch(API_BASE + '/api/providers/billing?provider=' + encodeURIComponent(provider), {cache:'no-store'});
+            const data = await response.json();
+            if (response.ok && data.ok === true && data.provider === provider && Array.isArray(data.accounts)) {
+              rows = new Map(data.accounts.filter(a => a && typeof a.accountId === 'string').map(a => [a.accountId,a]));
+            }
+          } catch (_) { /* Retain known balances with their original observation time. */ }
+          if (!current()) return;
+          const active = new Set(homeQuotaAccounts().map(a => a.key));
+          for (const account of accounts) {
+            if (account.provider !== provider || !active.has(account.key)) continue;
+            const row = rows?.get(account.id);
+            const previous = homeQuotaCache.get(account.key);
+            const errorKind = row?.errorKind || 'unavailable';
+            if (row?.allowance && !row.errorKind) {
+              const at = row.allowance.observedAt;
+              homeQuotaCache.set(account.key,{allowance:row.allowance,observed:typeof at === 'number' && Number.isFinite(at) && at > 0 && at <= Date.now() ? at : Date.now()});
+            } else if (previous?.allowance && !['sign_in_required','unsupported','not_provided','key_not_supported'].includes(errorKind)) {
+              homeQuotaCache.set(account.key,{...previous,stale:true,errorKind});
+            } else homeQuotaCache.set(account.key,{errorKind});
+          }
+        }
+      };
+      try { await Promise.all([read(),read(),read()]); }
+      finally {
+        homeQuotaBusy = false;
+        if (!current()) homeQuotaAttempt = '';
+        renderHomeQuota(homeQuotaAccounts());
+      }
+    }
+
     const providerBillingCache = Object.create(null);
     function billingSnapshot(previous, data, now) {
       if (!data || data.ok !== true || !Array.isArray(data.accounts) || !data.models || typeof data.models !== 'object' || Array.isArray(data.models))
@@ -7908,6 +8107,7 @@ html[data-theme="dark"] .glass-switch-shell {
         if (configRequestId !== providerConfigRequest || providerWriteRevision !== requestWriteRevision || providerWrites.size) return;
         providerConfigError = false; renderProviderStatus();
         appConfig = incoming;
+        void refreshHomeQuota();
         const modalHasEditor = typeof currentModalProviderId !== 'undefined' && currentModalProviderId && document.querySelector('#acc-modal-list .account-label-editor');
         const menuOpen = typeof activeAccountActions !== 'undefined' && activeAccountActions;
         if (typeof currentModalProviderId !== 'undefined' && currentModalProviderId && typeof renderAccountModalList === 'function' && !modalHasEditor && !menuOpen) renderAccountModalList(currentModalProviderId);
@@ -11883,6 +12083,8 @@ html[data-theme="dark"] .glass-switch-shell {
         if (data.providerId !== providerId || (action === 'remove' && typeof data.removed !== 'boolean') || (action === 'label' && data.id !== payload.id)) { showToast('操作结果未确认，请刷新列表核对'); return false; }
         acknowledgeProviderToken(providerId,data.stateToken);
         if (typeof providerBillingCache !== 'undefined') delete providerBillingCache[providerId];
+        for (const account of homeQuotaAccounts()) if (account.provider === providerId) homeQuotaCache.delete(account.key);
+        homeQuotaAttempt = '';
         if (typeof billingRequests !== 'undefined') billingRequests[providerId] = (billingRequests[providerId] || 0) + 1;
         showToast(action === 'remove' && !data.removed ? (payload.id === 'all' ? '当前没有可清空的账号，列表已刷新' : '该账号已不在池中，列表已刷新') : successText);
         succeeded = true; return true;

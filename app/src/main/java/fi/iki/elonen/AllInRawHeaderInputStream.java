@@ -163,6 +163,11 @@ public final class AllInRawHeaderInputStream extends InputStream {
             }
             if (complete && bodyRemaining > 0) armBodyDeadline();
             return complete;
+        } catch (RejectedHeader invalid) {
+            if (!disarmHeaderDeadline(generation)) throw headerDeadlineFailure(invalid);
+            if (deadline != null) deadline.cancel(false);
+            writeRejection(invalid.status);
+            throw invalid;
         } catch (IOException | RuntimeException | Error failure) {
             disarmHeaderDeadline(generation);
             throw failure;
@@ -370,13 +375,19 @@ public final class AllInRawHeaderInputStream extends InputStream {
                 || "!#$%&'*+-.^_`|~".indexOf(c) >= 0;
     }
 
-    private void reject(int status) throws IOException {
+    private static final class RejectedHeader extends IOException {
+        final int status;
+        RejectedHeader(int status) { super("Invalid HTTP request framing"); this.status = status; }
+    }
+
+    private void reject(int status) throws RejectedHeader { throw new RejectedHeader(status); }
+
+    private void writeRejection(int status) throws IOException {
         closed = true;
         String reason = status == 501 ? "Not Implemented" : "Bad Request";
         byte[] message = ("HTTP/1.1 " + status + " " + reason + "\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").getBytes(StandardCharsets.US_ASCII);
         response.write(message);
         response.flush();
-        throw new IOException("Invalid HTTP request framing");
     }
 
     /** Visible for tests: header budgets still scheduled (must return to zero once headers finish). */

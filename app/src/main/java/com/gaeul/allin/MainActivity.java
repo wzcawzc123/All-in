@@ -7,6 +7,8 @@ import android.content.SharedPreferences;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
@@ -27,6 +29,7 @@ public class MainActivity extends Activity {
     private static final int GATEWAY_PORT = 3425;
 
     private WebView webView;
+    private final Handler panelRefreshHandler = new Handler(Looper.getMainLooper());
     private int statusBarInsetPx;
     private final BridgeStreamOwner bridgeStreams = new BridgeStreamOwner();
     private java.util.Set<LocalBridge.Call> bridgeCalls;
@@ -78,35 +81,6 @@ public class MainActivity extends Activity {
         } catch (Throwable ignored) {
         }
 
-        // 明文 HTTP 与本地回环自检（结果落盘，便于无 logcat 时排查）
-        try {
-            StringBuilder sb = new StringBuilder();
-            sb.append("sdk=").append(Build.VERSION.SDK_INT).append('\n');
-            Class<?> nspCls = Class.forName("android.security.NetworkSecurityPolicy");
-            Object nsp = nspCls.getMethod("getInstance").invoke(null);
-            sb.append("cleartext global=").append(nspCls.getMethod("isCleartextTrafficPermitted").invoke(nsp));
-            sb.append(" 127.0.0.1=").append(nspCls.getMethod("isCleartextTrafficPermitted", String.class)
-                    .invoke(nsp, "127.0.0.1")).append('\n');
-            try {
-                java.net.HttpURLConnection hc = (java.net.HttpURLConnection)
-                        new java.net.URL("http://127.0.0.1:3425/api/status").openConnection(java.net.Proxy.NO_PROXY);
-                hc.setRequestProperty("X-All-In-Management", GatewayManagementCredential.get());
-                hc.setConnectTimeout(1500);
-                hc.setReadTimeout(1500);
-                sb.append("http loopback code=").append(hc.getResponseCode()).append('\n');
-                hc.disconnect();
-            } catch (Throwable t) {
-                sb.append("http loopback err=").append(t).append('\n');
-            }
-            java.io.FileOutputStream fo = new java.io.FileOutputStream(
-                    new java.io.File(getFilesDir(), "diag.txt"));
-            fo.write(sb.toString().getBytes("UTF-8"));
-            fo.close();
-            Log.e("Magpie", sb.toString().replace('\n', ' '));
-        } catch (Throwable t) {
-            Log.e("Magpie", "cleartext probe failed: " + t);
-        }
-
         // 构建全屏且具备完整触控焦点的 WebView
         webView = new WebView(this);
         FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
@@ -148,10 +122,11 @@ public class MainActivity extends Activity {
         settings.setJavaScriptEnabled(true);
         settings.setDomStorageEnabled(true);
         settings.setDatabaseEnabled(true);
-        settings.setAllowFileAccess(true);
-        settings.setAllowContentAccess(true);
-        settings.setAllowFileAccessFromFileURLs(true);
-        settings.setAllowUniversalAccessFromFileURLs(true);
+        // Packaged assets remain available; gateway API requests use the native bridge.
+        settings.setAllowFileAccess(false);
+        settings.setAllowContentAccess(false);
+        settings.setAllowFileAccessFromFileURLs(false);
+        settings.setAllowUniversalAccessFromFileURLs(false);
         settings.setUseWideViewPort(true);
         settings.setLoadWithOverviewMode(true);
 
@@ -266,6 +241,14 @@ public class MainActivity extends Activity {
 
             @Override
             public android.webkit.WebResourceResponse shouldInterceptRequest(WebView view, String url) {
+                if (view == webView && !bridgeDestroyed && "file:///android_asset/dashboard.html".equals(url)) {
+                    try {
+                        return new android.webkit.WebResourceResponse("text/html", "UTF-8",
+                                PanelThemePage.readAndSeed(getAssets().open("dashboard.html"), isSystemDark()));
+                    } catch (java.io.IOException | IllegalArgumentException failure) {
+                        Log.w("Magpie", "Local panel theme bootstrap unavailable", failure);
+                    }
+                }
                 if (isTrustedPanelResource(url)) return null;
                 return new android.webkit.WebResourceResponse("text/plain", "UTF-8", new java.io.ByteArrayInputStream(new byte[0]));
             }
@@ -273,24 +256,34 @@ public class MainActivity extends Activity {
             @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
+                if (view != webView || bridgeDestroyed || isFinishing() || isDestroyed()) return;
                 currentPageUrl = url == null ? "" : url;
+                notifySystemTheme(view);
                 updateWebStatusBarInset();
                 pushGatewayStateToWeb();
-                view.postDelayed(new Runnable() {
-                    @Override
-                    public void run() {
-                        pushGatewayStateToWeb();
-                        if (GatewayService.isRunning()) {
-                            view.loadUrl("javascript:if(typeof refreshGatewayPanel==='function'){refreshGatewayPanel();}");
-                        }
+                postPanelRefresh(view, () -> {
+                    pushGatewayStateToWeb();
+                    if (GatewayService.isRunning()) {
+                        view.loadUrl("javascript:if(typeof refreshGatewayPanel==='function'){refreshGatewayPanel();}");
                     }
-                }, 400);
+                });
+            }
+
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, android.webkit.WebResourceRequest request) {
+                return !request.isForMainFrame() || shouldOverrideUrlLoading(view, request.getUrl().toString());
             }
 
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, String url) {
+                Uri destination = url == null ? null : Uri.parse(url);
+                String route = null;
+                if (destination != null && "magpie".equals(destination.getScheme())) {
+                    if (view != webView || !bridgeAllowed()) return true;
+                    route = destination.getAuthority();
+                }
                 // 一键连 ETA：拉起 ETA 主界面（不写对方数据，纯 startActivity，不需要 root）
-                if (url != null && url.startsWith("magpie://eta")) {
+                if ("eta".equals(route)) {
                     try {
                         android.content.Intent i = getPackageManager()
                                 .getLaunchIntentForPackage("io.github.mangi.eta");
@@ -308,8 +301,10 @@ public class MainActivity extends Activity {
                     return true;
                 }
                 // 网关开关的回退通道：magpie://gateway?on=1 / 0
-                if (url != null && url.startsWith("magpie://gateway")) {
-                    boolean enable = (url.contains("on=1"));
+                if ("gateway".equals(route)) {
+                    String flag = destination.getQueryParameter("on");
+                    if (!"0".equals(flag) && !"1".equals(flag)) return true;
+                    boolean enable = "1".equals(flag);
                     if (enable) {
                         setGatewayEnabledPref(true);
                         startGatewayService();
@@ -320,7 +315,7 @@ public class MainActivity extends Activity {
                     return true;
                 }
                 // 权限管理：magpie://settings/notifications|battery|autostart|app
-                if (url != null && url.startsWith("magpie://settings")) {
+                if ("settings".equals(route)) {
                     String target = "app";
                     int idx = url.indexOf("target=");
                     if (idx >= 0) {
@@ -348,7 +343,7 @@ public class MainActivity extends Activity {
                     });
                     return true;
                 }
-                if (url != null && url.startsWith("magpie://login")) {
+                if ("login".equals(route)) {
                     Intent intent = new Intent(MainActivity.this, LoginActivity.class);
                     try {
                         android.net.Uri u = android.net.Uri.parse(url);
@@ -466,7 +461,7 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** 是否装了 ETA：隐式/显式都探一次；都探不到就当作已装（让按钮可点，点失败会 toast） */
+    /** 检查已在清单声明可见的 ETA 启动界面。 */
     private boolean etaInstalled() {
         try {
             if (getPackageManager().getLaunchIntentForPackage(ETA_PKG) != null) return true;
@@ -479,7 +474,7 @@ public class MainActivity extends Activity {
             if (getPackageManager().resolveActivity(probe, 0) != null) return true;
         } catch (Throwable ignored) {
         }
-        return true;   // 包可见性可能挡住探测，别误报“没安装”
+        return false;
     }
 
     /**
@@ -967,18 +962,30 @@ public class MainActivity extends Activity {
             GatewayService.requestHealthCheck(this, "resume");
             GatewayService.refreshKeepAlive(this);
         }
-        if (webView != null) {
-            webView.postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    pushGatewayStateToWeb();
-                    webView.loadUrl("javascript:window.appUpdateResume&&window.appUpdateResume()");
-                    if (GatewayService.isRunning()) {
-                        webView.loadUrl("javascript:if(typeof loadConfig==='function'){loadConfig();}");
-                    }
+        final WebView view = webView;
+        if (view != null) {
+            postPanelRefresh(view, () -> {
+                pushGatewayStateToWeb();
+                notifySystemTheme(view);
+                view.loadUrl("javascript:window.appUpdateResume&&window.appUpdateResume()");
+                if (GatewayService.isRunning()) {
+                    view.loadUrl("javascript:if(typeof loadConfig==='function'){loadConfig();}");
                 }
-            }, 400);
+            });
         }
+    }
+
+    private void notifySystemTheme(WebView view) {
+        if (view != webView || bridgeDestroyed || !bridgeAllowed() || isFinishing() || isDestroyed()) return;
+        // The snapshot is only for startup; live bridge/media updates take over once the page is ready.
+        view.evaluateJavascript("window.__allinInitialSystemDark=null;"
+                + "if(typeof window.__onSystemThemeChanged==='function'){window.__onSystemThemeChanged();}", null);
+    }
+
+    private void postPanelRefresh(WebView view, Runnable refresh) {
+        panelRefreshHandler.postDelayed(() -> {
+            if (view == webView && !isFinishing() && !isDestroyed() && bridgeAllowed()) refresh.run();
+        }, 400);
     }
 
     // ===================== 网关开关核心逻辑 =====================
@@ -1095,13 +1102,19 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         bridgeDestroyed = true;
+        panelRefreshHandler.removeCallbacksAndMessages(null);
         bridgeStreams.close();
         cancelBridgeCalls();
         if (accountTransferController != null) accountTransferController.destroy();
         if (backupController != null) backupController.destroy();
-        if (webView != null) {
-            webView.destroy();
-            webView = null;
+        WebView view = webView;
+        webView = null;
+        if (view != null) {
+            view.removeJavascriptInterface("AllInNative");
+            if (view.getParent() instanceof android.view.ViewGroup)
+                ((android.view.ViewGroup) view.getParent()).removeView(view);
+            view.stopLoading();
+            view.destroy();
         }
         super.onDestroy();
     }

@@ -80,13 +80,15 @@ public final class NetworkPolicy {
         public JSONObject toJson() { JSONObject o = new JSONObject(); try { o.put("mode",mode); if (host != null) { o.put("host",host); o.put("port",port); } } catch (Exception e) { throw new IllegalStateException(e); } return o; }
         public HttpURLConnection openHttp(String value) throws IOException {
             URL url = new URL(value);
+            Proxy proxy = httpProxy(url);
+            return (HttpURLConnection) (proxy == null ? url.openConnection() : url.openConnection(proxy));
+        }
+        Proxy httpProxy(URL url) throws IOException {
             if (!url.getProtocol().equalsIgnoreCase("http") && !url.getProtocol().equalsIgnoreCase("https")) throw new IOException("unsupported URL scheme");
             if (mode.equals("blocked") && !loopback(url.getHost())) throw new IOException("Outbound network configuration is invalid");
-            URLConnection c;
-            if (loopback(url.getHost()) || mode.equals("direct")) c=url.openConnection(Proxy.NO_PROXY);
-            else if (mode.equals("http_proxy")) c=url.openConnection(new Proxy(Proxy.Type.HTTP, InetSocketAddress.createUnresolved(host,port)));
-            else c=url.openConnection();
-            return (HttpURLConnection)c;
+            if (loopback(url.getHost()) || mode.equals("direct")) return Proxy.NO_PROXY;
+            if (mode.equals("http_proxy")) return new Proxy(Proxy.Type.HTTP, InetSocketAddress.createUnresolved(host, port));
+            return null;
         }
         private Proxy select(String target, int targetPort) throws IOException {
             if (loopback(target) || mode.equals("direct")) return Proxy.NO_PROXY;

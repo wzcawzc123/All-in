@@ -284,6 +284,29 @@ public final class GatewayStreamingHttpTest {
             System.out.println(label + " truncated stream OK");
         }
     }
+    static void failureFollowedByTruncatedFrame() throws Exception {
+        String error = event(new JSONObject().put("error", new JSONObject().put("message", "fixture terminal error")));
+        String wire = chatDelta(call(FIRST, true)) + error + "data: {\"choices\":[";
+        try (VendorPolicyGatewayHttpTest.Upstream upstream = new VendorPolicyGatewayHttpTest.Upstream(
+                (request, count) -> new VendorPolicyGatewayHttpTest.Reply(200, "text/event-stream", wire))) {
+            JSONObject provider = VendorPolicyGatewayHttpTest.provider("fixture", "openai",
+                    "http://127.0.0.1:" + upstream.server.getLocalPort() + "/fixture", "m");
+            try (VendorPolicyGatewayHttpTest.Gateway gateway = new VendorPolicyGatewayHttpTest.Gateway(
+                    VendorPolicyGatewayHttpTest.config(provider), upstream, false)) {
+                VendorPolicyGatewayHttpTest.Result result = VendorPolicyGatewayHttpTest.post(gateway, "/v1/chat/completions",
+                        VendorPolicyGatewayHttpTest.body("fixture/m", true));
+                int errors = 0;
+                for (String line : result.body.split("\n")) {
+                    if (!line.startsWith("data: {")) continue;
+                    if (new JSONObject(line.substring(6)).optJSONObject("error") != null) errors++;
+                }
+                check(result.status == 200 && result.body.contains("fixture terminal error") && result.body.contains("call1"),
+                        "preserve committed tool fragment and original error");
+                check(errors == 1 && !result.body.contains("[DONE]") && upstream.requests.size() == 1,
+                        "one failure, no successful terminal or resend. Observed errors=" + errors);
+            }
+        }
+    }
     static void compressedNonSse() throws Exception {
         try (Fixture fixture = new Fixture(1, "openai")) {
             for (String mime : new String[]{"text/event-stream", "Text/Event-Stream; charset=UTF-8"}) {
@@ -308,6 +331,7 @@ public final class GatewayStreamingHttpTest {
             Files.write(dir.resolve("config.json"), "{\"server\":{\"authKey\":\"secret\"}}".getBytes(StandardCharsets.UTF_8));
             GatewayAuthKeyHolder.init(dir.toFile());
             String chat = "/v1/chat/completions", messages = "/v1/messages", responses = "/v1/responses";
+            failureFollowedByTruncatedFrame();
             paced("Chat native from Chat", chat, false);
             paced("Messages converted from Chat", messages, false);
             paced("Responses converted from Chat", responses, false);

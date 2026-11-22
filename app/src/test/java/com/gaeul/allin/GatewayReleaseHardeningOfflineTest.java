@@ -8,6 +8,7 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.InputStream;
+import java.io.IOException;
 import java.io.OutputStream;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -20,6 +21,7 @@ import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Release-audit regression for the parts of the gateway that block a public release:
@@ -1001,6 +1003,33 @@ public final class GatewayReleaseHardeningOfflineTest {
     }
 
     /** The 499 response says what happened instead of "Upstream Error". */
+    static void callbackOwnerLifecycle() throws Exception {
+        int port;
+        try (ServerSocket available = GatewayServer.openLoopbackCallbackPort(0)) { port = available.getLocalPort(); }
+        File dir = tempDir("oauth-owner-");
+        GatewayServer gateway = fixture(new JSONObject().put("providers", new JSONArray()), new File(dir, "config.json"));
+        AtomicInteger calls = new AtomicInteger();
+        gateway.runLoopbackCallbackListener(port, "callback-owner", 300, query -> "owner-" + calls.incrementAndGet());
+        gateway.runLoopbackCallbackListener(port, "callback-duplicate", 5000, query -> "duplicate");
+        Thread.sleep(350);
+        try {
+            try (Socket socket = new Socket("127.0.0.1", port)) {
+                socket.setSoTimeout(2000);
+                String crlf = "" + (char) 13 + (char) 10;
+                socket.getOutputStream().write(("GET /callback HTTP/1.1" + crlf + crlf).getBytes(StandardCharsets.UTF_8));
+                String reply = new String(readAll(socket.getInputStream()), StandardCharsets.UTF_8);
+                check(reply.contains("owner-1") && calls.get() == 1, "renewed flow reuses single callback listener");
+            }
+        } finally { gateway.stop(); }
+        try (ServerSocket rebound = GatewayServer.openLoopbackCallbackPort(port)) {
+            check(rebound.isBound(), "stopping closes callback accept socket before returning");
+        }
+        try {
+            gateway.runLoopbackCallbackListener(port, "callback-stopped", 5000, query -> "closed");
+            throw new AssertionError("stopped gateway started a callback listener");
+        } catch (IOException expected) { }
+    }
+
     static void cancelledResponseShape() throws Exception {
         File dir = tempDir("hardening-cancel-");
         GatewayServer server = fixture(new JSONObject("{\"providers\":[]}"),
@@ -1009,7 +1038,7 @@ public final class GatewayReleaseHardeningOfflineTest {
         builder.setAccessible(true);
         NanoHTTPD.Response response = (NanoHTTPD.Response) builder.invoke(server, "fixture cancelled");
         check(response.getStatus().getRequestStatus() == 499, "499 status");
-        check("Client Closed Request".equals(response.getStatus().getDescription()),
+        check("499 Client Closed Request".equals(response.getStatus().getDescription()),
                 "reason phrase is honest, got " + response.getStatus().getDescription());
         String body = new String(readAll(response.getData()), StandardCharsets.UTF_8);
         JSONObject parsed = new JSONObject(body);
@@ -3797,6 +3826,7 @@ public final class GatewayReleaseHardeningOfflineTest {
         etaImportDoesNotExportDeadKey();
         antigravitySendVerdictClassifiesConservatively();
         cancelledResponseShape();
+        callbackOwnerLifecycle();
         antigravityAccountAddReportsSaveFailure();
         carryKeepsNewAccountsAndProviders();
         carryRefusesIdReuseAndIdentityConflict();

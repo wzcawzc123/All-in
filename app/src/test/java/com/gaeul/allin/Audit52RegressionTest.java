@@ -27,9 +27,9 @@ public final class Audit52RegressionTest {
         UsageLedger.Row r=row(1);String wire=consume(GatewayStreamReadOfflineTest.stream(ResponsesGatewayOfflineTest.gateway(1),bad,new GatewayStreamReadOfflineTest.Connection(),null,r));
         check(wire.contains("Upstream stream read failed"),"late read failure delivered");check(r.failed()&&r.in==3&&r.out==2&&rows.size()==1,"late read failure records once without losing usage");
         for(String newline:new String[]{"\n","\r\n"}){
-            String source=": heartbeat"+newline+newline+"data: {\"choices\":"+newline+"data: [{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}"+newline+newline+"data: [DONE]"+newline;
+            String source=": heartbeat"+newline+newline+"data: {\"choices\":"+newline+"data: [{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}"+newline+newline+"data: [DONE]"+newline+newline;
             wire=consume(GatewayStreamReadOfflineTest.stream(ResponsesGatewayOfflineTest.gateway(1),new ByteArrayInputStream(source.getBytes(StandardCharsets.UTF_8)),new GatewayStreamReadOfflineTest.Connection(),null,null));
-            check(wire.contains("[DONE]")&&!wire.contains("error"),"valid multiline, heartbeat, EOF frame and newline style");
+            check(wire.contains("[DONE]")&&!wire.contains("error"),"valid multiline, heartbeat, framed terminal and newline style");
             for(String line:wire.split("\n"))if(line.startsWith("data: {")&&!line.contains("error"))check(new JSONObject(line.substring(6)).getJSONArray("choices").getJSONObject(0).optString("finish_reason").equals("stop"),"joined multiline JSON emitted correctly");
         }
         for(boolean failure:new boolean[]{false,true}){

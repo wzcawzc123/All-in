@@ -17,6 +17,49 @@ public final class GatewayAccessHttpOfflineTest {
   body=new JSONObject(new String(r.getData().readAllBytes(),"UTF-8"));
   check(body.getJSONArray("models").length()==0,"fresh configuration");
   check(RoutingSetupOfflineTest.status(s,"127.0.0.1","/api/gateway-access","POST","",null)==405,"read only");
+  privacySettingsPreserveSavedRules(s, cfg);
   System.out.println("GatewayAccessHttpOfflineTest PASS");
+ }
+
+ static void privacySettingsPreserveSavedRules(GatewayServer server, JSONObject config) throws Exception {
+  java.nio.file.Path dir = java.nio.file.Files.createTempDirectory("privacy-settings-");
+  java.nio.file.Path file = dir.resolve("config.json");
+  java.lang.reflect.Field configFile = GatewayServer.class.getDeclaredField("configFile");
+  configFile.setAccessible(true);
+  configFile.set(server, file.toFile());
+  try {
+   java.nio.file.Files.writeString(file, config.toString());
+   JSONObject valid = new JSONObject().put("customPatterns", new JSONArray().put("fixture-[0-9]+"));
+   try (NanoHTTPD.Response response = privacyRequest(server, valid)) {
+    check(response.getStatus().getRequestStatus() == 200, "valid privacy settings saved");
+    check(responseJson(response).getBoolean("ok"), "valid settings acknowledged");
+   }
+   byte[] saved = java.nio.file.Files.readAllBytes(file);
+   JSONObject invalid = new JSONObject().put("enabled", false).put("customPatterns", new JSONArray().put("["));
+   try (NanoHTTPD.Response response = privacyRequest(server, invalid)) {
+    check(response.getStatus().getRequestStatus() == 400, "invalid regex rejected before save");
+    check(responseJson(response).getJSONObject("error").getString("message").contains("正则"), "regex error is actionable");
+   }
+   check(java.util.Arrays.equals(saved, java.nio.file.Files.readAllBytes(file)), "invalid patch preserves durable bytes");
+   try (NanoHTTPD.Response response = privacyRequest(server, null)) {
+    JSONObject privacy = responseJson(response).getJSONObject("privacy");
+    check(privacy.getBoolean("enabled"), "invalid patch preserves active switch");
+    PrivacyMasker.Config active = PrivacyMasker.Config.fromJson(privacy);
+    check(!PrivacyMasker.maskText("fixture-123", new PrivacyMasker.Session(), active).contains("fixture-123"),
+      "previously saved regex still masks");
+   }
+  } finally {
+   java.nio.file.Files.deleteIfExists(file);
+   java.nio.file.Files.deleteIfExists(dir);
+  }
+ }
+
+ static NanoHTTPD.Response privacyRequest(GatewayServer server, JSONObject patch) {
+  return server.serve(RoutingSetupOfflineTest.request("127.0.0.1", "/api/privacy", patch == null ? "GET" : "POST",
+    patch == null ? "" : new JSONObject().put("privacy", patch).toString(), null));
+ }
+
+ static JSONObject responseJson(NanoHTTPD.Response response) throws Exception {
+  return new JSONObject(new String(response.getData().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8));
  }
 }

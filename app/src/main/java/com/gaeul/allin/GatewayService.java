@@ -16,7 +16,6 @@ public class GatewayService extends Service {
     private static final String CHANNEL_ID = "magpie_pocket_channel";
     private static final int NOTIFICATION_ID = 3425;
 
-    private static volatile boolean RUNNING;
     private static volatile boolean TYPED_FOREGROUND_OK;
     private static volatile int FOREGROUND_TYPE_MASK;
     private static volatile GatewayService current;
@@ -30,6 +29,7 @@ public class GatewayService extends Service {
     // A failed stop keeps the retired listener visible to lifecycle management.
     private volatile boolean backupStopUncertain;
     private volatile boolean disposed;
+    private volatile boolean running;
     private volatile boolean foreground;
     private volatile long createdAt, lastProbeAt, lastProbeMs;
     private volatile int lastCode, failures, restartCount;
@@ -70,7 +70,10 @@ public class GatewayService extends Service {
         return s != null && s.foreground ? ForegroundServicePolicy.name(FOREGROUND_TYPE_MASK) : "unknown";
     }
     public static boolean isForegroundStarted() { GatewayService s = current; return s != null && s.foreground; }
-    public static boolean isRunning() { return RUNNING; }
+    public static boolean isRunning() {
+        GatewayService owner = current;
+        return owner != null && !owner.disposed && owner.running;
+    }
     public static boolean isGatewayEnabled(Context context) {
         try { return context.getSharedPreferences("magpie_prefs", MODE_PRIVATE)
                 .getBoolean("gateway_enabled", true); }
@@ -144,11 +147,11 @@ public class GatewayService extends Service {
     @Override public void onCreate() {
         super.onCreate();
         createdAt = System.currentTimeMillis();
-        synchronized (ENGINE_SERIAL) { current = this; }
+        current = this;
         createNotificationChannel();
         if (!startForegroundNotification()) {
             phase = "foregroundStartFailed";
-            RUNNING = false;
+            running = false;
             KeepAliveScheduler.cancel(this);
             KeepAliveScheduler.recordOutcome(this, "foregroundStartFailed", foregroundStartError);
             stopSelf();
@@ -166,7 +169,7 @@ public class GatewayService extends Service {
         worker = java.util.concurrent.Executors.newSingleThreadScheduledExecutor();
         worker.scheduleWithFixedDelay(new Runnable() {
             public void run() {
-                try { check("periodic"); } catch (Throwable t) { RUNNING = false; errorType = t.getClass().getSimpleName(); phase = "checkError"; }
+                try { check("periodic"); } catch (Throwable t) { running = false; errorType = t.getClass().getSimpleName(); phase = "checkError"; }
             }
         }, 2, 12, java.util.concurrent.TimeUnit.SECONDS);
     }
@@ -175,7 +178,7 @@ public class GatewayService extends Service {
         java.util.concurrent.ScheduledExecutorService w = worker;
         if (w == null || disposed || !checkQueued.compareAndSet(false, true)) return;
         try { w.execute(new Runnable() { public void run() {
-            try { check(reason); } catch (Throwable t) { RUNNING = false; errorType = t.getClass().getSimpleName(); phase = "checkError"; }
+            try { check(reason); } catch (Throwable t) { running = false; errorType = t.getClass().getSimpleName(); phase = "checkError"; }
             finally { checkQueued.set(false); }
         } }); } catch (java.util.concurrent.RejectedExecutionException ignored) { checkQueued.set(false); }
     }
@@ -191,14 +194,14 @@ public class GatewayService extends Service {
                     if (own != null) own.stop();
                     synchronized (lifecycle) { if (server == own) server = null; backupStopUncertain = false; }
                 } catch (Throwable stopFailure) {
-                    RUNNING = false; phase = "restoreStopFailed"; errorType = stopFailure.getClass().getSimpleName();
+                    running = false; phase = "restoreStopFailed"; errorType = stopFailure.getClass().getSimpleName();
                     scheduleFollowup(2000L); return;
                 }
             }
             startEngine(); return;
         }
         if (own == null || !own.isAlive()) {
-            RUNNING = false;
+            running = false;
             startEngine();
             return;
         }
@@ -217,13 +220,13 @@ public class GatewayService extends Service {
                 recoveryPolicy.probeSucceeded();
                 failures = 0;
                 phase = "healthy";
-                RUNNING = own.isAlive();
+                running = own.isAlive();
             }
             return;
         }
         synchronized (lifecycle) {
             if (disposed || !isGatewayEnabled(this) || server != own) return;
-            RUNNING = false;
+            running = false;
             recoveryPolicy.probeFailed();
             failures = recoveryPolicy.failures();
             phase = "unhealthy";
@@ -296,7 +299,7 @@ public class GatewayService extends Service {
                     if (disposed || !isGatewayEnabled(this)) return;
                     server = candidate;
                     published = true;
-                    RUNNING = false; // Only the identity probe establishes health.
+                    running = false; // Only the identity probe establishes health.
                     phase = "awaitingProbe";
                     errorType = "";
                 }
@@ -307,7 +310,7 @@ public class GatewayService extends Service {
                 }
             } catch (Throwable t) {
                 if (!disposed) {
-                    RUNNING = false;
+                    running = false;
                     phase = "startFailed";
                     errorType = t.getClass().getSimpleName();
                     long delay = recoveryPolicy.startFailed(android.os.SystemClock.elapsedRealtime());
@@ -479,8 +482,9 @@ public class GatewayService extends Service {
         return new AccountTransferPlan.Backend() {
             public byte[] readConfig() throws Exception {
                 synchronized(ENGINE_SERIAL) {
+                    GatewayService owner=current;
                     if(PENDING_STOPS.get()!=0)throw new java.io.IOException("网关正在停止，请稍后再试");
-                    GatewayService owner=current;GatewayServer own=owner==null?null:owner.server;
+                    GatewayServer own=owner==null?null:owner.server;
                     if(own!=null)return own.accountTransferSnapshot();
                     if(isGatewayEnabled(app))throw new java.io.IOException("网关尚未就绪，请稍后再试");
                     return BackupFiles.readFile(new java.io.File(app.getFilesDir(),"config.json"),AccountTransferCodec.MAX_BYTES);
@@ -488,8 +492,9 @@ public class GatewayService extends Service {
             }
             public byte[] export(byte[] expectedHash,java.util.Set<Integer> selected,long now) throws Exception {
                 synchronized(ENGINE_SERIAL) {
+                    GatewayService owner=current;
                     if(PENDING_STOPS.get()!=0)throw AccountTransferCodec.invalid("网关正在停止，请稍后重新导出");
-                    GatewayService owner=current;GatewayServer own=owner==null?null:owner.server;
+                    GatewayServer own=owner==null?null:owner.server;
                     if(own!=null)return own.exportAccountTransfer(expectedHash,selected,now);
                     if(isGatewayEnabled(app))throw AccountTransferCodec.invalid("网关尚未就绪，请稍后重新导出");
                     byte[] bytes=readConfig();
@@ -505,8 +510,9 @@ public class GatewayService extends Service {
             public com.gaeul.allin.json.JSONObject commit(byte[] expectedHash,AccountTransferCodec.Document document,
                     java.util.Set<Integer> selected,boolean updates,long now) throws Exception {
                 synchronized(ENGINE_SERIAL) {
+                    GatewayService owner=current;
                     if(PENDING_STOPS.get()!=0)throw new java.io.IOException("网关正在停止，请稍后重新预览");
-                    GatewayService owner=current;GatewayServer own=owner==null?null:owner.server;
+                    GatewayServer own=owner==null?null:owner.server;
                     if(own!=null)return own.commitAccountTransfer(expectedHash,document,selected,updates,now);
                     if(isGatewayEnabled(app))throw new java.io.IOException("网关尚未就绪，请稍后重新预览");
                     java.io.File file=new java.io.File(app.getFilesDir(),"config.json");
@@ -534,8 +540,8 @@ public class GatewayService extends Service {
              */
             public byte[] readConfig() throws Exception {
                 synchronized (ENGINE_SERIAL) {
-                    if (PENDING_STOPS.get() != 0) throw new IllegalStateException("gateway stopping");
                     GatewayService s = current;
+                    if (PENDING_STOPS.get() != 0) throw new IllegalStateException("gateway stopping");
                     GatewayServer own = s == null ? null : s.server;
                     return own != null ? own.backupDurableConfig() : BackupFiles.readFile(
                             new java.io.File(app.getFilesDir(), "config.json"), EncryptedConfigBackup.MAX_CONFIG_BYTES);
@@ -556,13 +562,13 @@ public class GatewayService extends Service {
             }
             public void restoreIfUnchanged(byte[] hash, byte[] replacement, byte[] rollback) throws Exception {
                 synchronized (ENGINE_SERIAL) {
+                    final GatewayService owner = current;
                     if (PENDING_STOPS.get() != 0) throw new IllegalStateException("gateway stopping");
                     com.gaeul.allin.json.JSONObject restoreConfig = EncryptedConfigBackup.validateConfig(replacement);
                     Object restoreNetwork = restoreConfig.opt("network");
                     if (restoreConfig.has("network") && !(restoreNetwork instanceof com.gaeul.allin.json.JSONObject))
                         throw new IllegalArgumentException("network config");
                     NetworkPolicy.parse((com.gaeul.allin.json.JSONObject) restoreNetwork);
-                    final GatewayService owner = current;
                     final boolean enabled = isGatewayEnabled(app);
                     if (enabled && (owner == null || owner.disposed)) throw new IllegalStateException("gateway unavailable");
                     final java.io.File config = new java.io.File(app.getFilesDir(), "config.json");
@@ -574,7 +580,7 @@ public class GatewayService extends Service {
                         public void retireAndStop() throws Exception {
                             if (owner == null) return;
                             GatewayServer own;
-                            synchronized (owner.lifecycle) { own = owner.server; if (own != null) own.retireForRestore(); RUNNING = false; owner.phase = "restoring"; }
+                            synchronized (owner.lifecycle) { own = owner.server; if (own != null) own.retireForRestore(); owner.running = false; owner.phase = "restoring"; }
                             if (own != null) {
                                 try { own.stop(); }
                                 catch (Throwable failure) { owner.backupStopUncertain = true; throw new IllegalStateException("gateway stop failed", failure); }
@@ -582,15 +588,22 @@ public class GatewayService extends Service {
                             }
                         }
                         public void restart() throws Exception {
-                            if (!enabled) return;
-                            if (owner.disposed || current != owner || !isGatewayEnabled(app)) throw new IllegalStateException("gateway lifecycle changed");
+                            // An in-flight restore can commit after this service instance is stopped.
+                            // The next instance reads the newly durable config after ENGINE_SERIAL is released.
+                            if (!enabled || owner.disposed || current != owner || !isGatewayEnabled(app)) return;
                             GatewayServer candidate = createGatewayServer(owner);
                             boolean published = false;
                             synchronized (owner.lifecycle) { owner.server = candidate; }
                             try {
+                                if (owner.disposed) return;
                                 candidate.start();
                                 if (!candidate.isAlive()) throw new IllegalStateException("gateway failed to start");
-                                synchronized (owner.lifecycle) { owner.server = candidate; RUNNING = false; owner.phase = "awaitingProbe"; published = true; }
+                                synchronized (owner.lifecycle) {
+                                    if (owner.disposed) return;
+                                    owner.running = false;
+                                    owner.phase = "awaitingProbe";
+                                    published = true;
+                                }
                                 owner.scheduleFollowup(2000L);
                             } finally {
                                 if (!published) {
@@ -607,7 +620,7 @@ public class GatewayService extends Service {
                     } catch (Exception failure) {
                         if (owner != null) {
                             synchronized (owner.lifecycle) {
-                                RUNNING = false;
+                                owner.running = false;
                                 owner.phase = "restoreFailed";
                                 owner.errorType = failure.getClass().getSimpleName();
                             }
@@ -621,28 +634,13 @@ public class GatewayService extends Service {
     }
 
     @Override public void onDestroy() {
-        final GatewayServer toStop;
+        // Publish the stop before detaching current. A new service or disk transaction
+        // must wait for any engine work already holding the monitor to finish.
+        PENDING_STOPS.incrementAndGet();
+        disposed = true;
+        if (current == this) current = null;
+        new Thread(this::stopEngineAfterDestroy, "gateway-stop").start();
         if (backgroundKeepAlive != null) backgroundKeepAlive.close();
-        synchronized (ENGINE_SERIAL) {
-            disposed = true;
-            if (worker != null) worker.shutdownNow();
-            synchronized (lifecycle) {
-                if (current == this) current = null;
-                RUNNING = false;
-                toStop = server;
-                if (toStop != null) PENDING_STOPS.incrementAndGet();
-                server = null;
-            }
-        }
-        if (toStop != null) {
-            new Thread(new Runnable() { public void run() {
-                synchronized (ENGINE_SERIAL) {
-                    try { toStop.stop(); } catch (Throwable t) {
-                        Log.w("Magpie", "Gateway stop: " + t.getClass().getSimpleName());
-                    } finally { PENDING_STOPS.decrementAndGet(); }
-                }
-            } }, "gateway-stop").start();
-        }
         TYPED_FOREGROUND_OK = false;
         FOREGROUND_TYPE_MASK = 0;
         foreground = false;
@@ -651,6 +649,25 @@ public class GatewayService extends Service {
         try { if (wifiLock != null && wifiLock.isHeld()) wifiLock.release(); } catch (Throwable ignored) { }
         if (!isGatewayEnabled(this)) KeepAliveScheduler.cancel(this);
         super.onDestroy();
+    }
+
+    private void stopEngineAfterDestroy() {
+        synchronized (ENGINE_SERIAL) {
+            try {
+                if (worker != null) worker.shutdownNow();
+                GatewayServer toStop;
+                synchronized (lifecycle) {
+                    toStop = server;
+                    server = null;
+                    running = false;
+                }
+                if (toStop != null) toStop.stop();
+            } catch (Throwable failure) {
+                Log.w("Magpie", "Gateway stop: " + failure.getClass().getSimpleName());
+            } finally {
+                PENDING_STOPS.decrementAndGet();
+            }
+        }
     }
 
     @Override public IBinder onBind(Intent intent) { return null; }

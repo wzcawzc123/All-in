@@ -5,7 +5,6 @@ import com.gaeul.allin.json.JSONObject;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
-import java.util.Base64;
 import java.util.Iterator;
 import java.util.Locale;
 import java.util.UUID;
@@ -80,7 +79,7 @@ final class MiniMaxMediaInput {
             if (file != null) {
                 if ("mask".equals(name)) throw new MiniMaxMedia.Failure(400, "MiniMax Image does not support mask edits");
                 if (data.length == 0 || !mime.matches("image/(jpeg|png|webp|heic|heif)")) throw new IllegalArgumentException();
-                String encoded = "data:" + mime + ";base64," + Base64.getEncoder().encodeToString(data);
+                String encoded = "data:" + mime + ";base64," + MediaBase64.standard(data);
                 if ("image".equals(name) || "image[]".equals(name) || "reference_images".equals(name) || "reference_images[]".equals(name)) {
                     if (images.length() >= 10) throw new IllegalArgumentException();
                     images.put(encoded);
@@ -111,7 +110,7 @@ final class MiniMaxMediaInput {
         String id = model + "::" + task;
         String material = new JSONArray().put("minimax-cn-video/v1").put(id).put(account).put(caller).toString();
         byte[] tag = mac.doFinal(material.getBytes(StandardCharsets.UTF_8));
-        return id + "." + Base64.getUrlEncoder().withoutPadding().encodeToString(tag);
+        return id + "." + MediaBase64.urlNoPadding(tag);
     }
 
     static boolean matches(String handle, String task, String model, String account, String caller, String key) throws Exception {
