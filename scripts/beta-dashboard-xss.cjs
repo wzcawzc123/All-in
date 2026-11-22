@@ -98,7 +98,7 @@ function readFunction(src, name) {
 const WANTED = ['esc', 'jsAttr', 'fmtDupTime', 'visibleProviders', 'providerHasCredential',
   'selectableModels', 'groupEsc', 'renderGroups', 'showDupAccountModal',
   'renderGroupModelFilters', 'selectionModelsOf', 'modelRefAllowed', 'modelShowAll', 'modelMatches', 'modelFilterValue', 'modelPage',
-  'codexOAuthLogin', 'pollCodexFlow', 'submitCodexCode', 'checkCodexUsage'];
+  'codexOAuthLogin', 'pollCodexFlow', 'submitCodexCode', 'finishCodexLogin', 'checkCodexUsage'];
 const OPTIONAL = new Set(['groupEsc']);
 const fnSources = {};
 for (const name of WANTED) {
@@ -317,6 +317,7 @@ function buildContext(extra) {
     'dup-account-modal': el({ style: { display: 'none' } }),
     'dup-btn-cancel': el({ focus() {} }),
     'codex-status': el(),
+    'codex-usage-status': el(),
     'codex-manual-code': el({ value: 'synthetic-code' }),
   }, (extra && extra.ids) || {});
   const doc = makeDocument(ids);
@@ -335,7 +336,6 @@ function buildContext(extra) {
     console: { log() {}, warn() {}, error() {} },
     alert: m => log.alerts.push(String(m)),
     showToast: m => log.toasts.push(String(m)),
-    loadStatus: () => {},
     loadConfig: () => {},
     loadRoutingState: () => {},
     syncGroupDraft: () => {},
@@ -536,8 +536,7 @@ async function scenarioCodexPollAndSubmit() {
     const markup = s.ids['codex-status'].innerHTML;
     const { tokens } = auditMarkup('codex.poll', markup, ALL_PAYLOADS, { allowHandlers: [] });
     const text = textOf(tokens);
-    ok(text.indexOf(P.img) >= 0, 'codex.poll', '账号名没显示出来');
-    ok(text.indexOf(P.dq) >= 0, 'codex.poll', '套餐名没显示出来');
+    ok(!text.includes(P.img) && !text.includes(P.dq), 'codex.poll', '授权回执不能渲染为当前账号');
     ok(log.toasts.length === 1, 'codex.poll', '成功提示没有被触发');
   }
   // D2 submitCodexCode 成功态
@@ -550,8 +549,8 @@ async function scenarioCodexPollAndSubmit() {
     const markup = s.ids['codex-status'].innerHTML;
     const { tokens } = auditMarkup('codex.submit', markup, ALL_PAYLOADS, { allowHandlers: [] });
     const text = textOf(tokens);
-    ok(text.indexOf(P.sq) >= 0, 'codex.submit', '账号名没显示出来');
-    ok(text.indexOf(P.entity) >= 0, 'codex.submit', '套餐名没显示出来');
+    ok(!text.includes(P.sq) && !text.includes(P.entity), 'codex.submit', '手工提交回执不能渲染为当前账号');
+    ok(log.toasts.length === 1 && log.alerts.length === 0, 'codex.submit', '保存成功不应触发失败提示');
   }
   // D3 checkCodexUsage 官方额度
   {
@@ -567,7 +566,7 @@ async function scenarioCodexPollAndSubmit() {
       }),
     }]);
     await ctx.__api.checkCodexUsage();
-    const markup = s.ids['codex-status'].innerHTML;
+    const markup = s.ids['codex-usage-status'].innerHTML;
     const { tokens } = auditMarkup('codex.usage', markup, ALL_PAYLOADS, { allowHandlers: [] });
     const text = textOf(tokens);
     ok(text.indexOf(P.img) >= 0, 'codex.usage', 'plan 没显示出来');

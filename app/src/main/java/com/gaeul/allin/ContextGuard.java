@@ -23,7 +23,7 @@ import java.util.List;
  */
 public class ContextGuard {
 
-    public static final int DEFAULT_MAX_BODY_BYTES = 1900 * 1024;
+    public static final int DEFAULT_MAX_BODY_BYTES = 0;
     public static final int DEFAULT_KEEP_RECENT = 12;
     public static final int DEFAULT_RESERVE_TOKENS = 4096;
     private static final String TRUNCATE_MARKER = "\n\n…[内容过长，已由掌上网关截断]";

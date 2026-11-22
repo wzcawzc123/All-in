@@ -2,6 +2,9 @@
 const fs=require('fs'),path=require('path'),cp=require('child_process');
 const root=path.resolve(__dirname,'..');
 const scripts=[
+  "tests/dashboard-custom-motion.cjs",
+  "tests/dashboard-custom-selection.cjs",
+  "tests/dashboard-custom-providers.cjs",
   "tests/dashboard-startup-theme.cjs",
   "tests/dashboard-cache-usage.cjs",
   "tests/dashboard-usage-hours.cjs",
@@ -26,6 +29,7 @@ const scripts=[
   "tests/dashboard-provider-badges.cjs",
   "tests/dashboard-account-json-files.cjs",
   "tests/dashboard-stream-observation.cjs",
+  "tests/dashboard-codex-card-stream.cjs",
   "tests/dashboard-catpaw-auth-feedback.cjs",
   "tests/provider-upstream-defaults.cjs",
   "tests/dashboard-checkin-center.cjs",
@@ -52,6 +56,7 @@ const scripts=[
   "tests/dashboard-diagnostics.cjs",
   "tests/dashboard-combined.cjs",
   "tests/dashboard-q2.cjs",
+  "tests/dashboard-guard-defaults.cjs",
   "tests/dashboard-image-body.cjs",
   "tests/dashboard-trae.cjs",
   "tests/dashboard-account-ops.cjs",

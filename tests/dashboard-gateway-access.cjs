@@ -42,6 +42,34 @@ const model=(id,provider='pool')=>({id,name:id.split('/').slice(1).join('/'),pro
  assert.deepEqual(p.calls.slice(1).map(x=>x.url),['/api/config','/api/auth/workbuddy/sync-models','/api/auth/trae-cn/sync-models','/api/gateway-access']);
  assert.equal(p.calls.find(x=>x.url.includes('trae-cn')).opts.method,'POST');
  p.c.copyGatewayModelIds();assert.equal(p.copied.at(-1),'workbuddy/current');assert.equal(p.run('gatewayAccessRows.length'),1,'removed model is gone');
+ // A leftover or static key alone must not trigger a subscription directory request.
+ const codex=page();
+ const codexProvider={id:'codex',keys:['old-reference'],accounts:[{authMode:'apikey',token:'key-reference'},{authMode:'chatgpt',token:'disabled-reference',enabled:false}]};
+ codex.queue.push({providers:[codexProvider]},{ok:true,models:[]});
+ await codex.c.refreshGatewayAccess(true);
+ assert.deepEqual(codex.calls.map(x=>x.url),['/api/config','/api/gateway-access']);
+ assert.equal(codex.run('gatewayAccessSyncFailures'),0);
+ codexProvider.accounts.push({authMode:'chatgpt',access:'active-reference'});
+ codex.queue.push({providers:[codexProvider]},{ok:true},{ok:true,models:[model('codex/live','codex')]});
+ await codex.c.refreshGatewayAccess(true);
+ assert.deepEqual(codex.calls.slice(2).map(x=>x.url),['/api/config','/api/auth/codex/sync-models','/api/gateway-access']);
+ assert.equal(codex.run('gatewayAccessRows[0].id'),'codex/live');
+ // The server publishes selected custom models under their exact aliases, including bare names.
+ const mixed=page();
+ const custom={id:'relay-chat',name:'relay-chat',provider:'custom-api-demo',providerName:'Custom Relay',kind:'model'};
+ const mixedRows=[model('codex/live','codex'),custom,model('group/main','group')];
+ mixed.queue.push({ok:true,models:mixedRows});
+ await mixed.c.refreshGatewayAccess(false);
+ assert.equal(mixed.nodes['access-model-count'].textContent,'2','a bare custom alias must not invalidate the whole catalog');
+ assert.equal(mixed.nodes['access-provider-count'].textContent,'2');
+ assert.equal(mixed.nodes['access-group-count'].textContent,'1');
+ mixed.c.copyGatewayModelIds();assert.equal(mixed.copied.at(-1),'codex/live\nrelay-chat\ngroup/main');
+ mixed.queue.push({providers:[]},{ok:true,models:mixedRows});
+ await mixed.c.refreshGatewayAccess(true);
+ assert.equal(mixed.run('gatewayAccessReady'),true,'manual refresh also accepts the mixed catalog');
+ mixed.queue.push({ok:true,models:[...mixedRows,{...custom,id:'  '}]});
+ mixed.run('gatewayAccessLast=0');await mixed.c.refreshGatewayAccess(false);
+ assert.equal(mixed.nodes['access-copy-all'].disabled,true,'an invalid blank model ID still invalidates the inventory');
  // Errors clear stale IDs and disable copy instead of presenting old inventory as current.
  p.queue.push(new Error('offline'));p.run('gatewayAccessLast=0');await p.c.refreshGatewayAccess(false);
  assert.equal(p.run('gatewayAccessRows.length'),0);assert.equal(p.nodes['access-copy-all'].disabled,true);let count=p.copied.length;p.c.copyGatewayModelIds();assert.equal(p.copied.length,count);

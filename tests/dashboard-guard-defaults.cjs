@@ -1,0 +1,30 @@
+const fs=require('fs'),vm=require('vm'),assert=require('assert'),path=require('path');
+const root=path.join(__dirname,'..');
+const html=fs.readFileSync(path.join(root,'app/src/main/assets/dashboard.html'),'utf8');
+const defaults=JSON.parse(fs.readFileSync(path.join(root,'app/src/main/assets/default_config.json'),'utf8')).guard;
+let checks=0;const eq=(a,b)=>{checks++;assert.equal(a,b);};
+eq(defaults.maxBodyBytes,0);eq(defaults.maxContextTokens,0);eq(defaults.maxOutputTokens,0);
+assert(html.includes('id="guard-max-body" min="0" step="0.1" placeholder="0"'));checks++;
+const elements={};
+const context={document:{getElementById:id=>elements[id]||null},API_BASE:'',esc:s=>String(s),showToast:()=>{},alert:()=>{throw new Error('unexpected alert');},console};
+vm.createContext(context);
+const from=html.indexOf('    function guardFormValues() {'),to=html.indexOf('    // ============ 隐私脱敏开关',from);
+vm.runInContext(html.slice(from,to),context);
+eq(context.guardFormValues().maxBodyBytes,0);
+for(const value of ['','0','bad','Infinity','-2']){elements['guard-max-body']={value};eq(context.guardFormValues().maxBodyBytes,0);}
+elements['guard-max-body']={value:'3'};eq(context.guardFormValues().maxBodyBytes,3*1048576);
+elements['guard-status']={innerHTML:''};
+context.renderGuardStatus(defaults);assert(elements['guard-status'].innerHTML.includes('请求体 <b style="color:#38bdf8;">不限制</b>'));checks++;
+context.renderGuardStatus({...defaults,maxBodyBytes:1945600});assert(elements['guard-status'].innerHTML.includes('1.86 MB'));checks++;
+const start=html.indexOf('    async function loadGuard() {'),end=html.indexOf('    async function saveFailover()',start);
+vm.runInContext(html.slice(start,end),context);
+(async()=>{
+ let stored={...defaults},posts=[];
+ context.fetch=async(url,options)=>{if(options&&options.method==='POST'){const patch=JSON.parse(options.body);posts.push(patch);stored={...stored,...patch.guard};}return {json:async()=>({ok:true,guard:stored})};};
+ for(const id of ['guard-enabled','guard-max-context','guard-max-output','guard-max-body','guard-keep-recent','guard-reserve','guard-read-timeout','failover-enabled','failover-targets'])elements[id]={value:'',checked:false};
+ await context.loadGuard();eq(Number(elements['guard-max-body'].value),0);eq(elements['guard-enabled'].checked,true);
+ await context.saveGuard();eq(posts.length,1);eq(posts[0].guard.maxBodyBytes,0);eq(stored.maxBodyBytes,0);
+ stored={...defaults,maxBodyBytes:3*1048576};await context.loadGuard();eq(Number(elements['guard-max-body'].value),3);await context.saveGuard();eq(stored.maxBodyBytes,3*1048576);
+ stored={...defaults,maxBodyBytes:1945600};await context.loadGuard();eq(Number(elements['guard-max-body'].value),1.86);
+ console.log('dashboard guard defaults PASS checks='+checks);
+})().catch(e=>{console.error(e);process.exitCode=1;});

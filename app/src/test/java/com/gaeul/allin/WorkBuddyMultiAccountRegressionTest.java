@@ -128,9 +128,11 @@ public final class WorkBuddyMultiAccountRegressionTest {
             JSONArray accounts=new JSONArray().put(enterprise).put(oauth("personal","fixture-B","",System.currentTimeMillis()+3600000));
             JSONObject p=provider(provider,accounts,"model");JSONObject cfg=VendorPolicyGatewayHttpTest.config(p);
             try(VendorPolicyGatewayHttpTest.Upstream upstream=new VendorPolicyGatewayHttpTest.Upstream((r,n)->new VendorPolicyGatewayHttpTest.Reply(200,"text/event-stream",DeepSeekHarnessGatewayHttpTest.sse()));VendorPolicyGatewayHttpTest.Gateway gateway=new VendorPolicyGatewayHttpTest.Gateway(cfg,upstream,false)) {
-                for(int i=0;i<4;i++)check(VendorPolicyGatewayHttpTest.post(gateway,"/v1/chat/completions",VendorPolicyGatewayHttpTest.body(provider+"/model",i%2==0),"session").status==200,"Actual local HTTP account request succeeds");
+                for(int i=0;i<4;i++)check(VendorPolicyGatewayHttpTest.post(gateway,"/v1/chat/completions",VendorPolicyGatewayHttpTest.body(provider+"/model",i%2==0),"session-"+i).status==200,"Actual local HTTP account request succeeds");
                 check(upstream.requests.size()==4,"Exactly one physical send per normal request");
                 for(int i=0;i<4;i++){Map<String,String> sent=upstream.requests.get(i).headers;check((i%2==0?"Bearer fixture-A":"Bearer fixture-B").equals(sent.get("Authorization")),"Actual outgoing credentials rotate, not just UI rows");check(i%2==0?"team-1".equals(sent.get("X-Enterprise-Id")) && "team-1".equals(sent.get("X-Tenant-Id")):sent.get("X-Enterprise-Id")==null && sent.get("X-Tenant-Id")==null,"No enterprise identity crosses accounts");}
+                check(VendorPolicyGatewayHttpTest.post(gateway,"/v1/chat/completions",VendorPolicyGatewayHttpTest.body(provider+"/model",false),"session-3").status==200 && upstream.requests.size()==5,"Existing conversation continues successfully");
+                check("Bearer fixture-B".equals(upstream.requests.get(4).headers.get("Authorization")),"Same conversation retains the prior account instead of rotating");
             }
         }
         JSONObject cfg=VendorPolicyGatewayHttpTest.config(provider("workbuddy",new JSONArray().put(enterprise).put(oauth("spare","fixture-B","",System.currentTimeMillis()+3600000)),"model"));

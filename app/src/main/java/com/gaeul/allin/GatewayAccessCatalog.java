@@ -77,6 +77,7 @@ final class GatewayAccessCatalog {
         return !scoped || contains(a.optJSONArray("models"), model);
     }
     private static boolean usableKey(JSONObject p, String model) {
+        if(CustomProvider.isCustom(p)) return CustomProvider.credentialsReady(p);
         JSONArray keys=p.optJSONArray("keys"), accounts=p.optJSONArray("accounts");
         boolean scoped=p.optBoolean("accessAccountCatalogScoped", false) || hasAccountCatalog(accounts);
         for (CommercialKeyPool.Credential c : CommercialKeyPool.list(keys)) {
@@ -94,6 +95,17 @@ final class GatewayAccessCatalog {
                 && (account.optLong("expiresAt", 0) <= 0 || account.optLong("expiresAt", 0) > now)
                 && supportsAccountModel(account, model, scoped);
     }
+    static boolean codexCredential(JSONObject provider, String model, long now) {
+        boolean scoped = provider.optBoolean("accessAccountCatalogScoped", false)
+                || hasAccountCatalog(provider.optJSONArray("accounts"));
+        for (JSONObject account : AccountPoolPolicy.routingAccounts(provider)) {
+            if (model != null && !supportsAccountModel(account, model, scoped)) continue;
+            if ("legacy-key".equals(account.optString("source")) || "apikey".equalsIgnoreCase(account.optString("authMode"))
+                    || CodexAuth.catalogAccount(account, now)) return true;
+        }
+        return false;
+    }
+
     private static boolean accountUsable(JSONObject p, String model, long now) {
         String id=p.optString("id"), protocol=p.optString("protocol", "openai");
         JSONArray accounts=p.optJSONArray("accounts");
@@ -101,6 +113,7 @@ final class GatewayAccessCatalog {
         boolean ownCatalog=hasAccountCatalog(accounts) || p.optJSONObject("legacyKeyCatalog")!=null;
         if (p.has("accessCatalogPool") && !p.optString("accessCatalogPool").equals(poolFingerprint(p))
                 && !(workbuddy && ownCatalog)) return false;
+        if ("codex".equals(id)) return codexCredential(p, model, now);
         if(workbuddy) {
             boolean scoped=p.optBoolean("accessAccountCatalogScoped",false) || ownCatalog;
             for(JSONObject account:AccountPoolPolicy.routingAccounts(p)) {
@@ -187,12 +200,14 @@ final class GatewayAccessCatalog {
     }
 
     static JSONObject build(JSONObject cfg, long now, GiftSnapshot gift) throws com.gaeul.allin.json.JSONException {
+        CustomModelNames customNames=new CustomModelNames(cfg);
         JSONObject exposed=cfg.optJSONObject("exposed"); boolean filtered=exposed!=null && exposed.optBoolean("enabled",false);
         JSONArray whitelist=exposed==null?null:exposed.optJSONArray("items");
         LinkedHashMap<String,JSONObject> available=new LinkedHashMap<>(); int unknown=0;
         JSONArray providers=cfg.optJSONArray("providers");
         for (int i=0; providers!=null && i<providers.length(); i++) {
             JSONObject p=providers.optJSONObject(i); if (!enabled(p) || "placeholder".equalsIgnoreCase(p.optString("status", "").trim())) continue;
+            if(CustomProvider.isCustom(p) && !CustomProvider.ready(p)) continue;
             String id=p.optString("id",""); if (id.isEmpty()) continue;
             Set<String> candidates=new java.util.LinkedHashSet<>(); JSONArray models=p.optJSONArray("models");
             for (int j=0; models!=null && j<models.length(); j++) { String m=models.optString(j,"").trim(); if (!m.isEmpty()) candidates.add(m); }
@@ -219,7 +234,7 @@ final class GatewayAccessCatalog {
                 boolean usable="zcode".equals(id) ? (gifts.contains(m) || (!giftOnly && accountUsable(p,m,now))) : accountUsable(p,m,now);
                 if (!usable) continue;
                 String full=id+"/"+m;
-                available.put(full,new JSONObject().put("id",id+"/"+identities.publicId(m)).put("name",identities.name(m)).put("provider",id).put("providerName",p.optString("name",id)).put("kind","model"));
+                available.put(full,new JSONObject().put("id",CustomProvider.isCustom(p)?customNames.publicId(p,m):id+"/"+identities.publicId(m)).put("name",identities.name(m)).put("provider",id).put("providerName",p.optString("name",id)).put("kind","model"));
             }
         }
         JSONArray result=new JSONArray();
@@ -236,9 +251,9 @@ final class GatewayAccessCatalog {
             JSONArray targets=g.optJSONArray("targets"); boolean live=false;
             if ("manual".equals(g.optString("strategy", "order"))) {
                 String pick=g.optString("pick", "");
-                live=!pick.isEmpty() && contains(targets,pick) && available.containsKey(QoderModelIdentity.upstreamRef(cfg,pick));
+                live=!pick.isEmpty() && contains(targets,pick) && available.containsKey(QoderModelIdentity.upstreamRef(cfg,customNames.canonical(pick)));
             } else {
-                for(int j=0; targets!=null && j<targets.length(); j++) if(available.containsKey(QoderModelIdentity.upstreamRef(cfg,targets.optString(j,"")))) { live=true; break; }
+                for(int j=0; targets!=null && j<targets.length(); j++) if(available.containsKey(QoderModelIdentity.upstreamRef(cfg,customNames.canonical(targets.optString(j,""))))) { live=true; break; }
             }
             if(live) result.put(new JSONObject().put("id",full).put("name",g.optString("name",id)).put("provider","group").put("providerName","路由组").put("kind","group"));
         }

@@ -22,6 +22,13 @@ final class StandardModelCatalog {
 
     static List<String> fetch(String provider, String baseUrl, String token, JSONObject metaOut,
                               ConnectionFactory factory) {
+        return fetch(provider,baseUrl,token,metaOut,factory,null);
+    }
+    static List<String> fetchCustom(JSONObject custom, String token, JSONObject metaOut, ConnectionFactory factory) {
+        return fetch(custom.optString("protocol"),custom.optString("baseUrl"),token,metaOut,factory,custom);
+    }
+    private static List<String> fetch(String provider, String baseUrl, String token, JSONObject metaOut,
+                                     ConnectionFactory factory, JSONObject custom) {
         try {
             URI base = new URI(baseUrl == null ? "" : baseUrl.trim());
             if (base.getHost() == null || base.getUserInfo() != null || base.getFragment() != null
@@ -30,7 +37,7 @@ final class StandardModelCatalog {
             String path = base.getRawPath();
             if (path == null) path = "";
             while (path.endsWith("/")) path = path.substring(0, path.length() - 1);
-            if (path.endsWith("/v1")) path = path.substring(0, path.length() - 3);
+            if (custom==null && path.endsWith("/v1")) path = path.substring(0, path.length() - 3);
             String query = base.getRawQuery();
             // A configured cursor makes the catalog incomplete and must never be silently overwritten.
             if (query != null) for (String part : query.split("&")) {
@@ -38,7 +45,7 @@ final class StandardModelCatalog {
                 if ("after_id".equals(java.net.URLDecoder.decode(key, "UTF-8")))
                     throw new IOException("Configured pagination cursor");
             }
-            String endpoint = base.getScheme() + "://" + base.getRawAuthority() + path + "/v1/models"
+            String endpoint = base.getScheme() + "://" + base.getRawAuthority() + path + (custom==null?"/v1/models":"/models")
                     + (query == null || query.isEmpty() ? "" : "?" + query);
             LinkedHashSet<String> models = new LinkedHashSet<>();
             Set<String> cursors = new HashSet<>();
@@ -56,7 +63,8 @@ final class StandardModelCatalog {
                     conn.setReadTimeout(15000);
                     conn.setRequestProperty("Content-Type", "application/json");
                     conn.setRequestProperty("User-Agent", "MagpiePocket/1.0");
-                    if ("anthropic".equals(provider)) {
+                    if(custom!=null) CustomProvider.apply(conn,custom,token,false);
+                    else if ("anthropic".equals(provider)) {
                         conn.setRequestProperty("x-api-key", token);
                         conn.setRequestProperty("anthropic-version", "2023-06-01");
                     } else conn.setRequestProperty("Authorization", "Bearer " + token);
@@ -92,7 +100,7 @@ final class StandardModelCatalog {
                         models.add((String) id);
                     }
                     Object more = root.opt("has_more");
-                    if (more == null && !"anthropic".equals(provider)) return new ArrayList<>(models);
+                    if (more == null && (custom!=null || !"anthropic".equals(provider))) return new ArrayList<>(models);
                     if (!(more instanceof Boolean)) throw new IOException("Invalid pagination flag");
                     if (!((Boolean) more)) return new ArrayList<>(models);
                     Object next = root.opt("last_id");

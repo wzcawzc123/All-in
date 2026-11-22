@@ -106,10 +106,13 @@ final class AccountPoolPolicy {
             if(AccountGenerations.enabled(account) && !token.isEmpty())result.add(account);
         }
         JSONArray keys=provider.optJSONArray("keys");
+        String providerId=provider.optString("id","");
         for(CommercialKeyPool.Credential key : CommercialKeyPool.list(keys)) {
             String token=key.secret();
+            // A Codex subscription bearer needs its saved account context. A legacy
+            // OpenAI API key is independent and can still be routed without an account.
+            if ("codex".equals(providerId) && !token.startsWith("sk-")) continue;
             if(token.isEmpty() || !owned.add(token))continue;
-            String providerId=provider.optString("id","");
             String id="legacy-key_"+UUID.nameUUIDFromBytes((providerId+"\u0000"+token).getBytes(java.nio.charset.StandardCharsets.UTF_8));
             String type="workbuddy".equals(providerId) && !token.startsWith("ck_") && !token.startsWith("pt_")?"token":"api";
             JSONObject slot=new JSONObject().put("id",id).put("token",token).put("type",type).put("source","legacy-key").put("enabled",true);

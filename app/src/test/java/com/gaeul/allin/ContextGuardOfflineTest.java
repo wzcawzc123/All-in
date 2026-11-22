@@ -8,6 +8,8 @@ public final class ContextGuardOfflineTest {
     private static int checks;
 
     public static void main(String[] args) throws Exception {
+        defaultsAndExplicitLimits();
+        unlimitedDefaultPreservesLargePayload();
         untouchedPayloadKeepsUnpairedToolMessages();
         completionTokenCapPreservesField();
         singleMaxTokensAndMissingFields();
@@ -17,6 +19,50 @@ public final class ContextGuardOfflineTest {
         disabledGuardLeavesPayloadUnchanged();
         trimmingKeepsSurvivingToolPairsAndCountsRemovals();
         System.out.println("ContextGuard offline checks passed: " + checks);
+    }
+
+    private static void defaultsAndExplicitLimits() {
+        equal(0, ContextGuard.DEFAULT_MAX_BODY_BYTES, "default bytes unlimited");
+        for (ContextGuard.Config cfg : new ContextGuard.Config[]{new ContextGuard.Config(),
+                ContextGuard.Config.fromJson(null), ContextGuard.Config.fromJson(new JSONObject()),
+                ContextGuard.Config.fromJson(new JSONObject().put("enabled", true))}) {
+            equal(0, cfg.maxBodyBytes, "missing byte setting unlimited");
+            check(cfg.enabled, "default guard remains enabled");
+            equal(12, cfg.keepRecent, "recent preference unchanged");
+            equal(4096, cfg.reserveTokens, "reserve unchanged");
+            equal(120, cfg.requestTimeoutSeconds, "read timeout unchanged");
+            equal(0, ContextGuard.Config.fromJson(cfg.toJson()).maxBodyBytes, "zero roundtrip");
+        }
+        for (int limit : new int[]{0, 1945600, 3145728}) {
+            JSONObject saved = new JSONObject().put("maxBodyBytes", limit).put("maxContextTokens", 200000)
+                    .put("maxOutputTokens", 8192).put("requestTimeoutSeconds", 180);
+            ContextGuard.Config cfg = ContextGuard.Config.fromJson(saved);
+            equal(limit, cfg.maxBodyBytes, "explicit byte limit retained");
+            equal(200000, cfg.maxContextTokens, "explicit token budget retained");
+            equal(8192, cfg.maxOutputTokens, "explicit output cap retained");
+            equal(180, cfg.requestTimeoutSeconds, "explicit timeout retained");
+            equal(limit, ContextGuard.Config.fromJson(cfg.toJson()).maxBodyBytes, "explicit roundtrip");
+        }
+    }
+
+    private static void unlimitedDefaultPreservesLargePayload() {
+        JSONObject input = new JSONObject().put("messages", new JSONArray()
+                .put(new JSONObject().put("role", "system").put("content", repeat("x", 2100000)))
+                .put(new JSONObject().put("role", "user").put("content", "latest")));
+        String original = input.toString();
+        ContextGuard.Result result = ContextGuard.fit(input, ContextGuard.Config.fromJson(null));
+        check(result.originalBytes > 1945600, "sample exceeds legacy byte budget");
+        check(result.originalTokens > 200000, "sample estimate exceeds 200K, not model tokenizer");
+        equal(null, result.error, "large default request not rejected");
+        check(!result.budgetExceeded && !result.changed, "large default not trimmed or exceeded");
+        equal(0, result.dropped, "large default dropped zero");
+        equal(0, result.truncated, "large default truncated zero");
+        equal(original, result.payload.toString(), "large default complete content preserved");
+        equal(original, input.toString(), "large input not mutated");
+        ContextGuard.Config explicit = ContextGuard.Config.fromJson(new JSONObject().put("maxBodyBytes", 1945600));
+        ContextGuard.Result limited = ContextGuard.fit(input, explicit);
+        equal("budget_exceeded", limited.error, "explicit legacy cap still rejects protected system");
+        check(limited.budgetExceeded, "explicit cap remains effective");
     }
 
     private static void untouchedPayloadKeepsUnpairedToolMessages() throws Exception {

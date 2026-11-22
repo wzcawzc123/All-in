@@ -88,7 +88,7 @@ public final class ConfigurationView {
                 boolean isKeys = key.equalsIgnoreCase("keys") && object.opt(key) instanceof JSONArray;
                 result.put(key, transform(object.get(key), old == null ? null : old.opt(key),
                         path + part("f", key), salt, restoring,
-                        sensitive(key) || (keys && key.equalsIgnoreCase("key"))
+                        sensitive(key) || path.endsWith(part("f", "headers")) || (keys && key.equalsIgnoreCase("key"))
                                 || (path.contains(part("d","zcode")) && ("plan".equals(key) || "gift".equals(key))), isKeys));
             }
             return result;

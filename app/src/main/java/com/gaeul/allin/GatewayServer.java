@@ -718,6 +718,8 @@ public class GatewayServer extends NanoHTTPD {
     private volatile String quirksLoadError;
     private volatile SessionAffinity affinity = new SessionAffinity();
     private synchronized SessionAffinity affinity() { if(affinity==null) affinity=new SessionAffinity(); return affinity; }
+    private volatile ConversationHistory historyAffinity;
+    private synchronized ConversationHistory historyAffinity() {if(historyAffinity==null)historyAffinity=new ConversationHistory();return historyAffinity;}
     private volatile long affinityEpoch;
 
     private AccountGenerations accountGenerations;
@@ -2298,7 +2300,7 @@ public class GatewayServer extends NanoHTTPD {
         if (minimaxLifecycle == null) minimaxLifecycle = new MiniMaxLifecycle(System::currentTimeMillis);
         return minimaxLifecycle;
     }
-    synchronized void retireForRestore() { backupRetired=true; if(catalogRefresh!=null)catalogRefresh.close(); minimaxLifecycle().retire(); closeTrae(); affinityEpoch++; affinity().clear(); }
+    synchronized void retireForRestore() { backupRetired=true; if(catalogRefresh!=null)catalogRefresh.close(); minimaxLifecycle().retire(); closeTrae(); affinityEpoch++; affinity().clear(); if(historyAffinity!=null)historyAffinity.clear(); }
 
     private static JSONObject miniAccount(JSONObject config, String id) {
         JSONArray providers=config.optJSONArray("providers"); JSONObject provider=null;
@@ -2442,7 +2444,7 @@ public class GatewayServer extends NanoHTTPD {
         GatewayQuirksBridge bridge=quirksBridge;
         return bridge==null?new JSONObject().put("enabled",false).put("result",quirksUpdateUnavailable):bridge.status();
     }
-    private synchronized void configChangedAffinity() { affinityEpoch++; affinity().clear(); }
+    private synchronized void configChangedAffinity() { affinityEpoch++; affinity().clear(); if(historyAffinity!=null)historyAffinity.clear(); }
 
 
     public final AtomicInteger totalRequests = new AtomicInteger(0);
@@ -2458,12 +2460,15 @@ public class GatewayServer extends NanoHTTPD {
 
     private final AtomicInteger wbRoundRobin = new AtomicInteger(0);
     private volatile java.util.concurrent.ConcurrentHashMap<String,java.util.concurrent.atomic.AtomicLong> accountTurns;
-    private int nextAccountIndex(String provider,int size) {
-        if(size<1)throw new IllegalArgumentException("empty account pool");
+    private java.util.concurrent.atomic.AtomicLong accountCounter(String provider) {
         if(accountTurns==null)synchronized(this){if(accountTurns==null)accountTurns=new java.util.concurrent.ConcurrentHashMap<>();}
         java.util.concurrent.atomic.AtomicLong n=accountTurns.get(provider);
         if(n==null){java.util.concurrent.atomic.AtomicLong created=new java.util.concurrent.atomic.AtomicLong();java.util.concurrent.atomic.AtomicLong prior=accountTurns.putIfAbsent(provider,created);n=prior==null?created:prior;}
-        return (int)Math.floorMod(n.getAndIncrement(),(long)size);
+        return n;
+    }
+    private int nextAccountIndex(String provider,int size) {
+        if(size<1)throw new IllegalArgumentException("empty account pool");
+        return (int)Math.floorMod(accountCounter(provider).getAndIncrement(),(long)size);
     }
 
 
@@ -2490,7 +2495,26 @@ public class GatewayServer extends NanoHTTPD {
     }
     private int routingAccountIndex(String id,List<JSONObject> accounts,String model) {
         JSONObject provider=getProviderById(id);String mode=AccountRoutingPolicy.mode(provider);
-        if("rotate".equals(mode)||accounts.size()<2)return nextAccountIndex(id,accounts.size());
+        RequestContext request=REQUEST_CONTEXT.get();
+        if(request!=null && request.accountConversation && request.conversationLease!=null
+                && request.conversationLease.state==SessionAffinity.State.BOUND) {
+            for(int i=0;i<accounts.size();i++) {
+                RouteTarget candidate=new RouteTarget();candidate.providerId=id;candidate.account=accounts.get(i);
+                candidate.apiKey=storedAccess(candidate.account);candidate.upstreamModel=model;
+                candidate.baseUrl=provider.optString("baseUrl","");candidate.protocol=provider.optString("protocol","openai");
+                if(affinityAccountAvailable(candidate,request.conversationLease.preferred)) return i;
+            }
+        }
+        if("rotate".equals(mode)||accounts.size()<2) {
+            if(request!=null && request.accountConversation && "rotate".equals(mode)) {
+                String ref=id+"/"+model;long ordinal=accountCounter(id).getAndIncrement();
+                request.conversationRotations.put(ref,new long[]{ordinal,ordinal+1});
+                List<String> slots=new ArrayList<>();for(JSONObject account:accounts)slots.add(account.optString("id",""));
+                request.conversationRotationSlots.put(ref,slots);
+                return (int)Math.floorMod(ordinal,(long)accounts.size());
+            }
+            return nextAccountIndex(id,accounts.size());
+        }
         List<AccountRoutingPolicy.Seat> seats=new ArrayList<>();List<Integer> indices=new ArrayList<>();
         for(int i=0;i<accounts.size();i++) {
             JSONObject a=accounts.get(i);RouteTarget t=new RouteTarget();t.providerId=id;t.account=a;t.apiKey=storedAccess(a);t.upstreamModel=model;
@@ -3258,6 +3282,7 @@ public class GatewayServer extends NanoHTTPD {
         setAsyncRunner(new BoundedAsyncRunner(connectionLimit(configJson)));
         try { GatewayAccessCatalog.preserveAccountScope(null,configJson); } catch (Exception e) { throw new IllegalStateException("Cannot initialize account catalog scope",e); }
         configureLoadedNetworkPolicy();
+        migrateCustomModelNames();
         restoreAntigravityBases();
         try {
             UsageLedger.init(context.getFilesDir());
@@ -4119,6 +4144,7 @@ public class GatewayServer extends NanoHTTPD {
         // Persisted and fsynced. Everything below is bookkeeping over the new durable state:
         // a failure here is reported as a degraded side effect, never as a failed save, and
         // never triggers a rollback of the configuration that is already on disk.
+        customNamesSource=null;customNamesCache=null;
         publishConfig(newConfig);
         traeConfigEpoch++;
         runPostCommitEffects();
@@ -6035,6 +6061,7 @@ public class GatewayServer extends NanoHTTPD {
                     newConf.remove("providerStateTokens");
                     newConf.remove("miniMaxMediaModels");
                     newConf.remove("codexImageModels");
+                    newConf.remove("codexIndependentKeyCount");
                     if(configJson.has("checkin")) newConf.put("checkin",new JSONObject(configJson.getJSONObject("checkin").toString())); else newConf.remove("checkin");
                     if(configJson.has("affinity")) newConf.put("affinity",configJson.opt("affinity")); else newConf.remove("affinity");
                     if(configJson.has("resilience")) newConf.put("resilience",configJson.opt("resilience")); else newConf.remove("resilience");
@@ -6067,6 +6094,8 @@ public class GatewayServer extends NanoHTTPD {
                     if (newConf.optJSONObject("privacy") == null && configJson.optJSONObject("privacy") != null) {
                         newConf.put("privacy", new JSONObject(configJson.optJSONObject("privacy").toString()));
                     }
+                    try { validateCustomProviders(newConf); }
+                    catch(IllegalArgumentException invalid) {return errorResponse(400,invalid.getMessage());}
                     try { persistConfigStrict(newConf); }
                     catch(IOException e) { return errorResponse(500,"配置保存失败"); }
                     JSONObject ret = new JSONObject();
@@ -6090,6 +6119,9 @@ public class GatewayServer extends NanoHTTPD {
                         snapshot.put("miniMaxMediaModels", miniMaxMediaModels);
                         JSONObject codexImage = GatewayAccessCatalog.codexImage(configJson, System.currentTimeMillis(), true);
                         snapshot.put("codexImageModels", codexImage == null ? new JSONArray() : new JSONArray().put(codexImage));
+                        JSONObject codex = findProviderById(providers, "codex");
+                        if (codex != null) snapshot.put("codexIndependentKeyCount", AccountPoolPolicy.routingAccounts(codex).stream()
+                                .filter(account -> "legacy-key".equals(account.optString("source"))).count());
                         snapshot.put("revision", configRevision());
                         return jsonResponse(snapshot);
                     }
@@ -7571,6 +7603,9 @@ public class GatewayServer extends NanoHTTPD {
                         keys=restored.getJSONArray("providers").getJSONObject(0).getJSONArray("keys");
                     } catch(IllegalArgumentException invalidReference) { return errorResponse(409,"密钥引用已失效，请刷新后重试"); }
                     target.put("keys", keys);
+                    if(CustomProvider.isCustom(target)) {
+                        try {CustomProvider.validate(target);} catch(IllegalArgumentException invalid) {return errorResponse(400,invalid.getMessage());}
+                    }
                     if (!saveConfig(staged)) {
                         return errorResponse(500, "保存供应商密钥失败");
                     }
@@ -7647,6 +7682,15 @@ public class GatewayServer extends NanoHTTPD {
                     result.put("stateToken", providerStateToken(target));
                     return jsonResponse(result);
                 }
+            }
+
+            if("/api/providers/custom/catalog".equals(uri)) {
+                if(!"POST".equalsIgnoreCase(method)) return errorResponse(405,"POST required");
+                return previewCustomCatalog(rawBody);
+            }
+            if("/api/providers/custom".equals(uri)) {
+                if(!"POST".equalsIgnoreCase(method)) return errorResponse(405,"POST required");
+                return customProviderMutation(rawBody);
             }
 
             // 3.10.2 供应商能力状态板：ported / passthrough / placeholder
@@ -7903,6 +7947,8 @@ public class GatewayServer extends NanoHTTPD {
                 }
 
                 if(!prov.optBoolean("enabled",true))return errorResponse(403,"供应商已禁用");
+                if(CustomProvider.isCustom(prov)) return syncCustomProvider(new JSONObject(prov.toString()));
+                if ("codex".equals(provId)) return syncCodexProviderCatalog(prov);
                 if ("deepseek-web".equals(prov.optString("protocol"))) {
                     if (!providerHasCredential(prov)) return errorResponse(401,"请先添加网页账号");
                     JSONArray modes=new JSONArray(); for(String m:DeepSeekWeb.MODELS) modes.put(m);
@@ -7948,7 +7994,7 @@ public class GatewayServer extends NanoHTTPD {
                         token = keys.optString(0, "");
                     }
                 }
-                if (token.isEmpty() && !"cline".equals(provId) && !"codex".equals(provId)) {
+                if (token.isEmpty() && !"cline".equals(provId)) {
                     JSONArray existingModels = prov.optJSONArray("models");
                     if (existingModels != null && existingModels.length() > 0) {
                         JSONObject ret = new JSONObject();
@@ -7975,25 +8021,7 @@ public class GatewayServer extends NanoHTTPD {
                 List<String> fetched;
                 JSONObject modelMeta = new JSONObject();
 
-                if ("codex".equals(provId)) {
-                    CodexAuth.SignInInfo cinfo = new CodexAuth.SignInInfo();
-                    JSONArray caccs = prov.optJSONArray("accounts");
-                    if (caccs != null && caccs.length() > 0) {
-                        JSONObject ca = caccs.optJSONObject(0);
-                        if (ca != null) {
-                            cinfo.accessToken = ca.optString("access", ca.optString("token", ""));
-                            cinfo.refreshToken = ca.optString("refresh", "");
-                            cinfo.idToken = ca.optString("idToken", "");
-                            cinfo.accountId = ca.optString("accountId", "");
-                            cinfo.authMode = ca.optString("authMode", "chatgpt");
-                            cinfo.expiresAt = ca.optLong("expires", 0);
-                            bindCodexPersistence(ca, cinfo);
-                        }
-                    }
-                    fetched = CodexAuth.syncModelsStrict(cinfo);
-                    prov = getProviderById("codex");
-                    if (prov == null) return errorResponse(409, "Codex account unavailable");
-                } else if ("cline".equals(provId)) {
+                if ("cline".equals(provId)) {
                     fetched = new ArrayList<String>();
                     JSONObject cmeta = new JSONObject();
                     List<String> cms = ClineAuth.fetchFeedStrict(cmeta);
@@ -8364,6 +8392,7 @@ public class GatewayServer extends NanoHTTPD {
                     listAll = "1".equals(av) || "true".equalsIgnoreCase(av);
                 }
 
+                CustomModelNames customNames=customNames();
                 JSONObject res = new JSONObject();
                 res.put("object", "list");
                 JSONArray arr = new JSONArray();
@@ -8440,13 +8469,15 @@ public class GatewayServer extends NanoHTTPD {
                                     if (!found) continue;
                                 }
                                 String rawId = pid + "/" + mName;
-                                String fullId = pid + "/" + identities.publicId(mName);
+                                String fullId = CustomProvider.isCustom(p)?customNames.publicId(p,mName):pid + "/" + identities.publicId(mName);
                                 if (onlyListed && !allowSet.contains(rawId) && !allowSet.contains(fullId)) continue;
                                 JSONObject m = new JSONObject();
                                 m.put("id", fullId);
                                 m.put("object", "model");
-                                m.put("owned_by", pid);
-                                if ("qoder".equals(p.optString("protocol"))) {
+                                m.put("owned_by", CustomProvider.isCustom(p)?p.optString("name", "Custom API"):pid);
+                                if (CustomProvider.isCustom(p)) {
+                                    m.put("name",mName).put("display_name",mName).put("provider_name",p.optString("name"));
+                                } else if ("qoder".equals(p.optString("protocol"))) {
                                     m.put("name", identities.name(mName));
                                     m.put("display_name", identities.name(mName));
                                 }
@@ -8719,6 +8750,7 @@ public class GatewayServer extends NanoHTTPD {
                 // 用第一个候选直到它答不出来，再换下一个；
                 // 且只在「还没有把任何回复字节写给客户端」之前换，
                 // 所以客户端永远不会拿到半段 A、半段 B 的回复。
+                beginAccountConversation(requestedModel, payload);
                 List<RouteTarget> candidates = resolveCandidates(requestedModel);
                 if (candidates.isEmpty()) {
                     // A candidate that was dropped for an unknown refresh outcome is not the same
@@ -10501,17 +10533,7 @@ public class GatewayServer extends NanoHTTPD {
     /** 从请求头里认会话：各家客户端用的名字不一样，按优先级取第一个非空的 */
     private static String pickSession(Map<String, String> h) {
         if (h == null) return "";
-        String[] keys = new String[]{"x-magpie-session", "x-claude-code-session-id",
-                "x-session-id", "session_id", "x-conversation-id"};
-        for (String k : keys) {
-            for (Map.Entry<String, String> e : h.entrySet()) {
-                if (e.getKey() != null && e.getKey().equalsIgnoreCase(k)) {
-                    String v = e.getValue();
-                    if (v != null && !v.trim().isEmpty()) return v.trim();
-                }
-            }
-        }
-        return "";
+        return ConversationSession.header(h);
     }
 
     private static void beginUsage(String prov, String reqModel, String upModel) {
@@ -10548,6 +10570,8 @@ public class GatewayServer extends NanoHTTPD {
         String sess = U_SESSION.get();
         r.session = sess == null ? "" : sess;
         RequestContext request=REQUEST_CONTEXT.get();
+        if(r.session.isEmpty() && request!=null && request.conversationHistory!=null
+                && ("workbuddy".equals(prov)||"workbuddy-ai".equals(prov)))r.session="history:"+request.conversationSession;
         RequestDiagnostics.begin(r,logical==null?(request==null?null:request.diagnosticScope):logical.diagnostics,request);
         U_ROW.set(r);
         U_START.set(Long.valueOf(System.currentTimeMillis()));
@@ -10942,6 +10966,138 @@ public class GatewayServer extends NanoHTTPD {
             if(g!=null && model.substring(6).equals(g.optString("id"))) return "manual".equals(g.optString("strategy","order")); }
         return false;
     }
+    private void recordConversationWinner(RequestContext request,RouteTarget target,SessionAffinity.Lease lease) {
+        if(target==null || target.account==null || lease.state!=SessionAffinity.State.OWNER || !"rotate".equals(AccountRoutingPolicy.mode(getProviderById(target.providerId))))return;
+        String ref=target.providerId+"/"+target.upstreamModel;long[] ticket=request.conversationRotations.get(ref);
+        List<String> slots=request.conversationRotationSlots.get(ref);
+        java.util.concurrent.atomic.AtomicLong counter=accountCounter(target.providerId);
+        if(ticket==null || slots==null) {
+            long next=counter.get();ticket=new long[]{next,next};slots=new ArrayList<>();
+            for(JSONObject account:AccountPoolPolicy.routingAccounts(getProviderById(target.providerId)))
+                if(!account.has("models") || qoderAccountLists(account,target.upstreamModel))slots.add(account.optString("id",""));
+        }
+        int selected=slots.indexOf(target.account.optString("id",""));if(selected<0 || slots.isEmpty())return;
+        long wanted=ticket[0]+Math.floorMod(selected-Math.floorMod(ticket[0],(long)slots.size()),(long)slots.size())+1;
+        // A late response must not rewind a newer conversation's allocation.
+        counter.compareAndSet(ticket[1],wanted);
+    }
+    private static SessionAffinity.Target affinityAccountTarget(RouteTarget target) {
+        if(target==null || target.account==null || !AccountGenerations.enabled(target.account)) return null;
+        try {
+            // Verified ownership is stable over token refresh; names and credentials are not identities.
+            JSONObject owner=new JSONObject();
+            for(String field:new String[]{"id","accountId","uid","userId","subject","email","enterpriseId","domain","site","authMode","type"})
+                owner.put(field,target.account.optString(field,""));
+            if(target.account.optString("id","").isEmpty())return null;
+            return new SessionAffinity.Target(target.providerId,CredentialIdentity.origin(target.providerId,target.baseUrl),
+                    target.upstreamModel,"account:"+routingHash(owner.toString()));
+        } catch(Exception invalid) {return null;}
+    }
+    private boolean affinityAccountAvailable(RouteTarget candidate,SessionAffinity.Target preferred) {
+        if(preferred==null || !preferred.equals(affinityAccountTarget(candidate)))return false;
+        JSONObject provider=getProviderById(candidate.providerId);
+        if(provider==null || !provider.optBoolean("enabled",true))return false;
+        JSONArray accounts=provider.optJSONArray("accounts");JSONObject current=null;
+        for(int i=0;accounts!=null && i<accounts.length();i++) {
+            JSONObject account=accounts.optJSONObject(i);
+            if(account!=null && account.optString("id","").equals(candidate.account.optString("id","")))current=account;
+        }
+        if(current==null)for(JSONObject slot:AccountPoolPolicy.routingAccounts(provider))
+            if(slot.optString("id","").equals(candidate.account.optString("id","")))current=slot;
+        if(current==null || !AccountGenerations.enabled(current))return false;
+        if(current.has("models") && !qoderAccountLists(current,candidate.upstreamModel))return false;
+        RouteTarget live=new RouteTarget();live.providerId=candidate.providerId;live.baseUrl=candidate.baseUrl;
+        live.upstreamModel=candidate.upstreamModel;live.account=current;live.apiKey=storedAccess(current);
+        if(!preferred.equals(affinityAccountTarget(live)))return false;
+        return accountRefusalWait(live)==0 && workBuddyQuotaReset(live,System.currentTimeMillis())==0;
+    }
+    private java.util.concurrent.ConcurrentHashMap<String,Long> conversationRefusals;
+    private synchronized java.util.concurrent.ConcurrentHashMap<String,Long> conversationRefusals() {
+        if(conversationRefusals==null)conversationRefusals=new java.util.concurrent.ConcurrentHashMap<>();return conversationRefusals;
+    }
+    private long accountRefusalWait(RouteTarget target) {
+        long wait=preflightRateWait(target),now=System.currentTimeMillis();String key=restKeyOf(target);
+        Long until=conversationRefusals().get(key);
+        if(until!=null){if(until<=now)conversationRefusals().remove(key,until);else wait=Math.max(wait,until-now);}
+        return Math.max(0,wait);
+    }
+    private void rememberAccountRefusal(RouteTarget target,Attempt attempt) {
+        if(target.account==null || (attempt.status!=429 && attempt.status!=402) || !accountSwitchAllowed(attempt))return;
+        // These adapters own their typed cooldown and no-replay policies; do not duplicate them.
+        if(java.util.Arrays.asList("trae-cn","qoder_cn","raccoon","loomy","cline","catpaw","github-copilot","minimax-code").contains(target.providerId))return;
+        long now=System.currentTimeMillis();String hint=attempt.retryAfter;
+        if(hint==null && attempt.response!=null)hint=attempt.response.getHeader("Retry-After");
+        long until=Math.min(now+CooldownFeedback.MAX_MS,CommercialKeyPool.retryAfterDeadline(hint,now,REST_QUOTA_MS));
+        java.util.concurrent.ConcurrentHashMap<String,Long> holds=conversationRefusals();
+        if(holds.size()>=4096)holds.entrySet().removeIf(row->row.getValue()<=now);
+        String key=restKeyOf(target);if(holds.size()<4096 || holds.containsKey(key))holds.merge(key,until,Math::max);
+    }
+    private boolean affinityAvailable(RouteTarget target,SessionAffinity.Target preferred) {
+        return target.account!=null?affinityAccountAvailable(target,preferred):affinityCredential(target,preferred)!=null;
+    }
+    private boolean hasConversationAccounts(String id) {
+        JSONObject provider=id==null?null:getProviderById(id);
+        return provider!=null && provider.optBoolean("enabled",true) && provider.optJSONArray("accounts")!=null
+                && provider.optJSONArray("accounts").length()>0;
+    }
+    private SessionAffinity.Lease acquireConversation(SessionAffinity.Key key,RequestContext request) throws IOException,InterruptedException {
+        SessionAffinity.Lease lease;
+        do { request.check();lease=affinity().acquire(key,request.remainingMillis()+1000L);
+            if(lease.state==SessionAffinity.State.WAIT)lease.await(Math.min(100,request.remainingMillis()));
+        } while(lease.state==SessionAffinity.State.WAIT);
+        if(lease.state==SessionAffinity.State.OWNER) {final SessionAffinity.Lease owned=lease;request.onClose(owned::close);}
+        return lease;
+    }
+    /** Acquire before rotation or refresh, so concurrent first turns share a successful answerer. */
+    private void beginAccountConversation(String model, JSONObject payload) throws IOException,InterruptedException {
+        RequestContext request=REQUEST_CONTEXT.get();
+        if(request==null || isManualGroup(model) || request.affinityEpoch!=affinityEpoch) return;
+        boolean accounts=false;
+        if(model!=null && model.startsWith("group/")) {
+            JSONArray groups=configJson.optJSONArray("groups");
+            for(int i=0;groups!=null && i<groups.length();i++) {
+                JSONObject group=groups.optJSONObject(i);
+                if(group==null || !model.substring(6).equals(group.optString("id"))) continue;
+                JSONArray refs=group.optJSONArray("targets");
+                for(int j=0;refs!=null && j<refs.length();j++) if(hasConversationAccounts(providerIdOf(refs.optString(j)))) accounts=true;
+            }
+        } else accounts=hasConversationAccounts(providerIdOf(model));
+        if(!accounts) return;
+        String identity=request.explicitSession;
+        if(identity.isEmpty()) {
+            JSONObject original=RESP_REQUEST.get()!=null?RESP_REQUEST.get():NATIVE_REQUEST.get();
+            identity=affinity().fingerprint(ConversationSession.body(original==null?payload:original));
+        }
+        if(identity.isEmpty()) {
+            String scope=request.authScope+":"+request.affinityEpoch+":"+request.protocol+":"+model;
+            request.conversationHistory=historyAffinity().start(payload.optJSONArray("messages"),scope);
+            if(request.conversationHistory!=null)identity=affinity().fingerprint(request.conversationHistory.identity);
+        }
+        if(identity.isEmpty()) return; // Missing/ambiguous lineage: never merge by first prompt, IP or user.
+        request.accountConversation=true;request.conversationSession=identity;request.conversationModel=model;
+        request.conversationKey=affinity().key(true,identity,request.authScope+":"+request.affinityEpoch,request.protocol,model);
+        request.conversationLease=acquireConversation(request.conversationKey,request);
+        if(request.conversationHistory!=null){
+            final ConversationHistory.Context linked=request.conversationHistory;request.onClose(()->historyAffinity().abandon(linked));
+            if(linked.matchedPending && request.conversationLease.state!=SessionAffinity.State.BOUND){request.conversationLease.close();throw new IOException("Previous conversation reply did not complete; account replay refused");}
+        }
+    }
+    private static boolean confirmedAccountRefusal(int status,String body) {
+        if(status!=401 && status!=402 && status!=429)return false;
+        try {
+            JSONObject root=new JSONObject(body),error=root.optJSONObject("error");
+            if(error==null || body.contains("unavailable or truncated"))return false;
+            if(status==401)return true;
+            String code=error.optString("code",root.optString("code","")),type=error.optString("type","");
+            return java.util.Arrays.asList("rate_limit_error","rate_limit","rate_limit_exceeded","quota_exceeded","insufficient_quota","credits_exhausted","14018").contains(code)
+                    || java.util.Arrays.asList("rate_limit_error","rate_limit","rate_limit_exceeded","quota_exceeded","insufficient_quota","credits_exhausted").contains(type);
+        } catch(Exception malformed){return false;}
+    }
+    private static boolean accountSwitchAllowed(Attempt attempt) {
+        if(attempt==null || attempt.executionUnknown || attempt.protocolFailure || attempt.stopFallback)return false;
+        if(attempt.localRejection && !"Account is in rate-limit cooldown".equals(attempt.body))return false;
+        return attempt.status==429 || attempt.status==402 || attempt.status==401;
+    }
     private static SessionAffinity.Target affinityTarget(RouteTarget t, CommercialKeyPool.Credential c) {
         if(t==null || c==null || t.providerId==null || t.baseUrl==null || t.upstreamModel==null) return null;
         try { return new SessionAffinity.Target(t.providerId,t.baseUrl.trim(),t.upstreamModel,c.credentialId); }
@@ -11047,16 +11203,28 @@ public class GatewayServer extends NanoHTTPD {
     }
     private final class AffinityDelivery extends java.io.FilterInputStream implements fi.iki.elonen.AllInTrackedResponse.WriteCompletion {
         private final SessionAffinity.Lease lease; private final SessionAffinity.Target target; private final RequestContext request;
+        private final RouteTarget targetRoute;
         private final java.util.concurrent.atomic.AtomicBoolean semantic;
         private final java.util.concurrent.atomic.AtomicBoolean done=new java.util.concurrent.atomic.AtomicBoolean();
+        private final ConversationHistory.Capture historyCapture;
         private boolean writing;
-        AffinityDelivery(InputStream in,SessionAffinity.Lease lease,SessionAffinity.Target target,RequestContext request) { super(in); this.lease=lease; this.target=target; this.request=request; this.semantic=request.affinitySemantic; }
+        AffinityDelivery(InputStream in,SessionAffinity.Lease lease,SessionAffinity.Target target,RequestContext request) {this(in,lease,target,request,null);}
+        AffinityDelivery(InputStream in,SessionAffinity.Lease lease,SessionAffinity.Target target,RequestContext request,RouteTarget route) { super(in); this.lease=lease; this.target=target; this.request=request; this.targetRoute=route;this.semantic=request.affinitySemantic; this.historyCapture=request.conversationHistory==null?null:new ConversationHistory.Capture(); }
+        private void reserveReply(){if(historyCapture==null || request.isCancelled() || request.affinityEpoch!=affinityEpoch)return;JSONObject partial=historyCapture.pendingAssistant();if(partial!=null)historyAffinity().reserve(request.conversationHistory,partial);}
+        @Override public int read() throws IOException {int value=in.read();if(historyCapture!=null){historyCapture.write(value);reserveReply();}return value;}
+        @Override public int read(byte[] bytes,int offset,int length) throws IOException {int count=in.read(bytes,offset,length);if(historyCapture!=null && count>0){historyCapture.write(bytes,offset,count);reserveReply();}return count;}
         public void onWriteStart() { writing=true; if(in instanceof fi.iki.elonen.AllInTrackedResponse.WriteCompletion) ((fi.iki.elonen.AllInTrackedResponse.WriteCompletion)in).onWriteStart(); }
         public void onWriteComplete(boolean ok) {
             if(!done.compareAndSet(false,true)) return;
             try { if(in instanceof fi.iki.elonen.AllInTrackedResponse.WriteCompletion) ((fi.iki.elonen.AllInTrackedResponse.WriteCompletion)in).onWriteComplete(ok);
-                synchronized(GatewayServer.this) { if(ok && semantic.get() && !backupRetired && !request.isCancelled() && request.affinityEpoch==affinityEpoch) lease.bind(target); }
-            } finally { lease.close(); }
+                synchronized(GatewayServer.this) {
+                    if(ok && semantic.get() && !backupRetired && !request.isCancelled() && request.affinityEpoch==affinityEpoch
+                            && lease.renew(target)) {
+                        if(request.accountConversation)recordConversationWinner(request,this.targetRoute,lease);
+                        if(historyCapture!=null)historyAffinity().delivered(request.conversationHistory,historyCapture.assistant());
+                    }
+                }
+            } finally { if(request.conversationHistory!=null)historyAffinity().abandon(request.conversationHistory);lease.close(); }
         }
         @Override public void close() throws IOException { try { super.close(); } finally { if(!writing) onWriteComplete(false); } }
     }
@@ -11239,9 +11407,11 @@ public class GatewayServer extends NanoHTTPD {
             if(request!=null) request.check();
             JSONObject provider=getProviderById(target.providerId);
             if(provider==null || !provider.optBoolean("enabled",true)) throw new OutboundRejected(403,"Provider disabled while waiting",0);
+            if(target.customProvider!=null && (!jsonEquivalent(target.customProvider,provider) || CustomProvider.self(provider,customListeningPort())))
+                throw new OutboundRejected(409,"Custom provider changed while waiting; retry with current settings",0);
             if(target.commercialCredential!=null) {
                 boolean exists=false;
-                for(CommercialKeyPool.Credential c:CommercialKeyPool.list(provider.optJSONArray("keys"))) if(c.credentialId.equals(target.commercialCredential.credentialId)) { exists=true; break; }
+                for(CommercialKeyPool.Credential c:CommercialKeyPool.list(CustomProvider.routeKeys(provider))) if(c.credentialId.equals(target.commercialCredential.credentialId)) { exists=true; break; }
                 if(!exists || !commercialPool().available(commercialScope(target),target.upstreamModel,target.commercialCredential)) throw new OutboundRejected(429,"Credential removed or cooled while waiting",0);
             } else if("raccoon".equals(target.providerId)) {
                 boolean exists=false; JSONArray keys=provider.optJSONArray("keys");
@@ -11481,7 +11651,9 @@ public class GatewayServer extends NanoHTTPD {
         boolean isAnthropic;
         String protocol;      // "openai" / "anthropic" / "qoder"
         JSONObject catalogMetadata;
+        JSONObject customProvider; // immutable user-owned endpoint snapshot
         MiniMaxLifecycle.Lease miniLease;
+        boolean deferredAccountPreparation;
         JSONObject account;   // qoder 等账号池供应商的完整账号
         List<CommercialKeyPool.Credential> commercialCandidates;
         CommercialKeyPool.Credential commercialCredential;
@@ -11533,6 +11705,7 @@ public class GatewayServer extends NanoHTTPD {
         for(RouteTarget t:retries) if(recentRef(t).equals(recentRef(source))) { result=t;break; }
         if(result==null) {
             result=new RouteTarget();result.providerId=source.providerId;result.baseUrl=source.baseUrl;result.apiKey=source.apiKey;
+            result.customProvider=source.customProvider;
             result.upstreamModel=source.upstreamModel;result.protocol=source.protocol;result.isAnthropic=source.isAnthropic;result.catalogMetadata=source.catalogMetadata;result.account=source.account;
             if(source.commercialCredential!=null) result.commercialCandidates=new ArrayList<>();
             retries.add(result);
@@ -11567,7 +11740,10 @@ public class GatewayServer extends NanoHTTPD {
         boolean cooled = false, exhausted = false, success = false;
         SessionAffinity.Key affinityKey=null; SessionAffinity.Lease affinityLease=null;
         SessionAffinity.Target preferred=null; boolean affinityTransferred=false;
-        if(request!=null && !isManualGroup(requestedModel) && configJson.optJSONObject("affinity")!=null
+        if(request!=null && request.accountConversation && request.conversationLease!=null) {
+            affinityKey=request.conversationKey;affinityLease=request.conversationLease;
+            if(affinityLease.state==SessionAffinity.State.BOUND)preferred=affinityLease.preferred;
+        } else if(request!=null && !isManualGroup(requestedModel) && configJson.optJSONObject("affinity")!=null
                 && configJson.optJSONObject("affinity").optBoolean("enabled",false) && request.affinityEpoch==affinityEpoch
                 && !request.explicitSession.isEmpty()) {
             affinityKey=affinity().key(true,request.explicitSession,request.authScope+":"+request.affinityEpoch,request.protocol,requestedModel);
@@ -11598,6 +11774,11 @@ public class GatewayServer extends NanoHTTPD {
                 long quotaCheckAt = System.currentTimeMillis();
                 for (java.util.Iterator<RouteTarget> it = remaining.iterator(); it.hasNext();) {
                     RouteTarget candidate = it.next();
+                    if(candidate.account!=null && !AccountGenerations.enabled(candidate.account)) {it.remove();continue;}
+                    if(request!=null && request.accountConversation && candidate.account!=null) {
+                        long wait=accountRefusalWait(candidate);
+                        if(wait>0) {cooled=true;earliest=Math.min(earliest,quotaCheckAt+wait);it.remove();continue;}
+                    }
                     long reset = workBuddyQuotaReset(candidate, quotaCheckAt);
                     if (reset > 0) {
                         if (reset < earliestWorkBuddyReset) {
@@ -11613,7 +11794,7 @@ public class GatewayServer extends NanoHTTPD {
                 RecentUsageScheduler.Lease selectedLease = null;
                 RouteTarget target;
                 RouteTarget preferredRoute=null;
-                if(preferred!=null) for(RouteTarget candidate:remaining) if(affinityCredential(candidate,preferred)!=null) { preferredRoute=candidate; break; }
+                if(preferred!=null) for(RouteTarget candidate:remaining) if(affinityAvailable(candidate,preferred)) { preferredRoute=candidate; break; }
                 if(preferred!=null && preferredRoute==null) {
                     affinity().invalidate(affinityKey,preferred); preferred=null;
                     if(affinityLease!=null && affinityLease.state==SessionAffinity.State.BOUND) {
@@ -11652,7 +11833,8 @@ public class GatewayServer extends NanoHTTPD {
                     }
                     List<RouteTarget> immediatelyReady=new ArrayList<>();
                     for(RouteTarget candidate:eligible) if(outboundReady(candidate)) immediatelyReady.add(candidate);
-                    if(!immediatelyReady.isEmpty()) eligible=immediatelyReady;
+                    if(request!=null && request.accountConversation && preferredRoute!=null && preferredRoute.account!=null)eligible=java.util.Collections.singletonList(preferredRoute);
+                    else if(!immediatelyReady.isEmpty()) eligible=immediatelyReady;
                     if (eligible.isEmpty()) eligible = resting;
                     if (eligible.isEmpty()) break;
                     List<String> refs = new ArrayList<String>();
@@ -11665,7 +11847,7 @@ public class GatewayServer extends NanoHTTPD {
                     if (target == null) { selectedLease.cancel(); break; }
                 } else {
                     target=preferredRoute!=null?preferredRoute:remaining.get(0);
-                    if(!outboundReady(target)) for(RouteTarget candidate:remaining) if(outboundReady(candidate)) { target=candidate; break; }
+                    if(!(request!=null && request.accountConversation && preferredRoute!=null && target.account!=null) && !outboundReady(target)) for(RouteTarget candidate:remaining) if(outboundReady(candidate)) { target=candidate; break; }
                 }
                 final String chosenRef = recentRef(target);
                 if(!logicalTargets.contains(chosenRef)) {
@@ -11733,6 +11915,7 @@ public class GatewayServer extends NanoHTTPD {
                     }
                     if (!budget.tryStart()) { if (selectedLease != null) selectedLease.cancel(); exhausted = true; break; }
                     if (selectedLease == null) selectedLease = RECENT_USAGE.reserve(recentRef(target));
+                    boolean boundAccount=preferred!=null && target.account!=null && preferred.equals(affinityAccountTarget(target));
                     // Existing order/rotate/manual and direct routes remain available if optional tracking is full.
                     if (selectedLease == null && usageStrategy) { terminalStatus = 503; terminalError = "Recent usage tracking capacity exhausted"; return errorResponse(503, terminalError); }
                     RecentUsageScheduler.Lease attemptLease = selectedLease;
@@ -11768,13 +11951,14 @@ public class GatewayServer extends NanoHTTPD {
                         }
                     }
                     if(!last.ok)last.response=visibleCooldown(last,target,guardResult);
+                    if(!last.ok && request!=null && request.accountConversation)rememberAccountRefusal(target,last);
                     if (last.ok) {
                         success = true;
                         if(request!=null && last.affinitySemanticComplete) request.affinitySemantic.set(true);
-                        if(affinityLease!=null && affinityLease.state==SessionAffinity.State.OWNER
-                                && request!=null && target.commercialCredential!=null && last.response!=null && last.response.getData()!=null) {
-                            SessionAffinity.Target actual=affinityTarget(target,target.commercialCredential);
-                            if(actual!=null) { last.response.setData(new AffinityDelivery(last.response.getData(),affinityLease,actual,request)); affinityTransferred=true; }
+                        if(affinityLease!=null && (affinityLease.state==SessionAffinity.State.OWNER || affinityLease.state==SessionAffinity.State.BOUND)
+                                && request!=null && last.response!=null && last.response.getData()!=null) {
+                            SessionAffinity.Target actual=target.account!=null?affinityAccountTarget(target):affinityTarget(target,target.commercialCredential);
+                            if(actual!=null) { last.response.setData(new AffinityDelivery(last.response.getData(),affinityLease,actual,request,target)); affinityTransferred=true; }
                         }
                         return last.response;
                     }
@@ -11784,10 +11968,18 @@ public class GatewayServer extends NanoHTTPD {
                         terminalStatus=last.status>0?last.status:502; terminalError=last.body;
                         return last.response;
                     }
-                    if(preferred!=null) { affinity().invalidate(affinityKey,preferred); preferred=null; }
+                    if(boundAccount && !accountSwitchAllowed(last)) return last.response;
+                    if(preferred!=null) {
+                        affinity().invalidate(affinityKey,preferred); preferred=null;
+                        if(request!=null && request.accountConversation) {
+                            try { affinityLease=acquireConversation(affinityKey,request);request.conversationLease=affinityLease; }
+                            catch(InterruptedException interrupted) {Thread.currentThread().interrupt();return last.response;}
+                            catch(IOException cancelled) {return last.response;}
+                        }
+                    }
                     terminalStatus = last.status > 0 ? last.status : 502;
                     terminalError = last.body == null ? "upstream failed" : last.body;
-                    if (!enabled || (last.localRejection && !last.zcodePlanDenied) || last.protocolFailure) return last.response;
+                    if (!enabled || (last.localRejection && !last.zcodePlanDenied && !(request!=null && request.accountConversation && accountSwitchAllowed(last))) || last.protocolFailure) return last.response;
                     if(last.safeZcodeRejection) break;
                     if("raccoon".equals(target.providerId) && last.sent) {
                         if(last.status<=0 || last.failure!=null && last.failure.kind==UpstreamFailure.Kind.UNKNOWN_EXECUTION)
@@ -11900,6 +12092,7 @@ public class GatewayServer extends NanoHTTPD {
     private boolean providerHasCredential(JSONObject p) {
         if (p == null) return false;
         if (!p.optBoolean("enabled", true)) return false;
+        if ("codex".equals(p.optString("id"))) return GatewayAccessCatalog.codexCredential(p, null, System.currentTimeMillis());
         JSONArray accs = p.optJSONArray("accounts");
         if ("deepseek-web".equals(p.optString("protocol"))) {
             for (int i=0;accs!=null && i<accs.length();i++) {
@@ -11915,6 +12108,7 @@ public class GatewayServer extends NanoHTTPD {
             }
         }
         JSONArray keys = p.optJSONArray("keys");
+        if(CustomProvider.isCustom(p)) return CustomProvider.ready(p) && !CustomProvider.self(p,customListeningPort());
         if (isCommercialProvider(p)) return !CommercialKeyPool.list(keys).isEmpty();
         if (keys != null) {
             for (int i = 0; i < keys.length(); i++) {
@@ -12509,11 +12703,13 @@ public class GatewayServer extends NanoHTTPD {
 
     /** 单个模型引用是否当前真的可用：其供应商有凭据，且（若有模型清单）模型在清单内 */
     private boolean isModelRefLive(String modelRef) {
+        modelRef=customNames().canonical(modelRef);
         String pid = providerIdOf(modelRef);
         if (pid == null) return false;
         JSONObject p = getProviderById(pid);
         if (!providerHasCredential(p)) return false;
         JSONArray models = p.optJSONArray("models");
+        if(CustomProvider.isCustom(p)) return CustomProvider.selected(p,modelRef.substring(pid.length()+1));
         if (models == null || models.length() == 0) return true;   // 未同步清单时不做模型名校验
         String m = QoderModelIdentity.of(p).upstreamId(modelRef.substring(pid.length() + 1));
         for (int i = 0; i < models.length(); i++) {
@@ -12970,7 +13166,9 @@ public class GatewayServer extends NanoHTTPD {
                 JSONObject reduced=send==0 && WorkBuddyNativeSignatureRecovery.isSignatureRefusal(out.status,error)
                         ? WorkBuddyNativeSignatureRecovery.withoutThinkingBlocks(bodyForSend) : null;
                 if(reduced==null) {
-                    out.ok=false; out.stopFallback=true; out.body=safeUpstreamErrorJson(error,target);
+                    out.ok=false;
+                    out.stopFallback=!(request!=null && request.accountConversation && confirmedAccountRefusal(out.status,error));
+                    out.body=safeUpstreamErrorJson(error,target);
                     out.response=errorResponse(out.status,"WorkBuddy native Messages request rejected: "+out.body);
                     copyProviderRetryAfter(transportResponse.headers(),out.response);
                     return result;
@@ -13403,6 +13601,7 @@ public class GatewayServer extends NanoHTTPD {
         }
 
         out.ok = true;
+        out.affinitySemanticComplete=affinitySemanticComplete(simulatedResp.toString(),"openai");
         out.textOut = finalContent;
         out.reasoningOut = reasonAcc.toString();
         if (wantsAnthropicOut()) {
@@ -13422,6 +13621,16 @@ public class GatewayServer extends NanoHTTPD {
         applyGuardHeaders(resp, guardResult);
         out.response = resp;
         return out;
+    }
+
+    private void prepareDeferredAccount(RouteTarget target) throws Exception {
+        if(!target.deferredAccountPreparation || target.account==null)return;
+        if("github-copilot".equals(target.providerId))target.account=ensureStoredToken(target.providerId,target.account,null);
+        else if("cline".equals(target.providerId))target.account=refreshClineAccount(target.account);
+        else if("minimax-code".equals(target.providerId))target.miniLease=miniLease(target.account,false,null);
+        else if("raccoon".equals(target.providerId) && !prepareRaccoonAccount(target))throw new IOException("Selected account refresh unavailable; request was not sent");
+        target.apiKey=target.miniLease==null?storedAccess(target.account):target.miniLease.credentials.access;
+        target.deferredAccountPreparation=false;
     }
 
     private Attempt forwardUnheldAttempt(RouteTarget target, JSONObject payloadIn, boolean clientWantsStream,
@@ -13503,6 +13712,7 @@ public class GatewayServer extends NanoHTTPD {
                     return out;
                 }
             }
+            prepareDeferredAccount(target);
             // 每个候选独立一份请求体，避免改动互相污染
             JSONObject payload = new JSONObject(payloadIn.toString());
             payload.put("model", target.upstreamModel);
@@ -13772,7 +13982,9 @@ public class GatewayServer extends NanoHTTPD {
             conn.setReadTimeout(guardCfg.requestTimeoutSeconds * 1000);
             conn.setRequestProperty("Content-Type", "application/json");
 
-            if (target.isAnthropic) {
+            if (target.customProvider != null) {
+                CustomProvider.apply(conn,target.customProvider,target.apiKey,clientWantsStream);
+            } else if (target.isAnthropic) {
                 conn.setRequestProperty("x-api-key", target.apiKey);
                 conn.setRequestProperty("anthropic-version", "2023-06-01");
             } else if ("cline".equals(target.providerId)) {
@@ -13839,6 +14051,7 @@ public class GatewayServer extends NanoHTTPD {
                 conn.setRequestProperty("Accept", "text/event-stream, application/json");
             }
 
+            CustomProvider.apply(conn,target.customProvider,target.apiKey,clientWantsStream);
             if("zcode".equals(target.providerId)) {
                 ZCodeRefusalPolicy.Hold held=zcodeRefusals().before(targetUrl,zcodeAccountScope(target),zcodeNetworkScope());
                 if(held!=null){out.safeZcodeRejection=true;out.status=429;out.body="ZCode local refusal cooldown";out.response=errorResponse(429,out.body);out.response.addHeader("Retry-After",Long.toString((held.retryAfterMillis+999)/1000));return out;}
@@ -13874,6 +14087,7 @@ public class GatewayServer extends NanoHTTPD {
             os.close();
 
             statusCode = conn.getResponseCode();
+            if(customRedirect(out,target,statusCode)) return out;
             okStatus = statusCode >= 200 && statusCode < (target.commercialCandidates != null || "raccoon".equals(target.providerId) ? 300 : 400);
             is = okStatus ? conn.getInputStream() : null;
             if (!isWorkBuddy) {
@@ -13984,6 +14198,7 @@ public class GatewayServer extends NanoHTTPD {
                 }
                 out.ok = false;
                 out.body = errBody;
+                if(isWorkBuddy && request!=null && request.accountConversation && confirmedAccountRefusal(statusCode,errBody))out.stopFallback=false;
                 Status st = Status.lookup(statusCode);
                 Response.IStatus responseStatus = st;
                 if (responseStatus == null) { final int c = statusCode; responseStatus = new Response.IStatus() { public int getRequestStatus() { return c; } public String getDescription() { return c + " Upstream Error"; } }; }
@@ -14053,7 +14268,7 @@ public class GatewayServer extends NanoHTTPD {
                 Object value = parser.nextValue();
                 if (!(value instanceof JSONObject) || parser.nextClean() != 0) throw new IOException("Invalid upstream JSON");
             } catch (Exception invalid) { return failedProtocolAttempt(out); }
-            out.affinitySemanticComplete=target.commercialCandidates!=null && affinitySemanticComplete(rawResponse,target.protocol);
+            out.affinitySemanticComplete=affinitySemanticComplete(rawResponse,target.protocol);
             String unmaskedResponse = PrivacyMasker.unmaskText(rawResponse, maskSession);
 
             // 用量：非流式响应里一次带走整个 usage
@@ -14461,6 +14676,7 @@ public class GatewayServer extends NanoHTTPD {
             if(!content.isEmpty() || !message.isNull("content")) message.put("content",content);
             if(!transformed[1].isEmpty()) message.put("reasoning_content",transformed[1]);else message.remove("reasoning_content");
             out.textOut=content;out.reasoningOut=transformed[1];
+            out.affinitySemanticComplete=affinitySemanticComplete(modified.toString(),"openai");
             out.response=newFixedLengthResponse(Status.OK,"application/json; charset=UTF-8",toAnthropicBodyIfNeeded(modified.toString(),requested));
             out.response.addHeader("X-Magpie-Served-By",out.modelRef);addCorsHeaders(out.response);applyGuardHeaders(out.response,guard);
             out.ok=true;out.status=200;return out;
@@ -15407,6 +15623,7 @@ public class GatewayServer extends NanoHTTPD {
         out.modelRef = target.providerId + "/" + target.upstreamModel;
         HttpURLConnection conn = null;
         boolean handedOff = false;
+        OutboundLimiter.Ticket customTicket = null;
         try {
             boolean genericAnthropic = target.isAnthropic && !"minimax".equals(target.protocol)
                     && !"minimax-code".equals(target.providerId);
@@ -15505,7 +15722,9 @@ public class GatewayServer extends NanoHTTPD {
                 conn.setConnectTimeout(20000);
                 conn.setReadTimeout(15 * 60 * 1000);
                 conn.setRequestProperty("Content-Type", "application/json");
-                if (genericAnthropic) {
+                if(target.customProvider!=null) {
+                    CustomProvider.apply(conn,target.customProvider,target.apiKey,clientWantsStream);
+                } else if (genericAnthropic) {
                     conn.setRequestProperty("x-api-key", token);
                     conn.setRequestProperty("anthropic-version", "2023-06-01");
                     java.util.Map<String, String> protocolHeaders = NATIVE_HEADERS.get();
@@ -15520,6 +15739,13 @@ public class GatewayServer extends NanoHTTPD {
                 }
                 byte[] requestBytes = anth.toString().getBytes("UTF-8");
                 conn.setFixedLengthStreamingMode(requestBytes.length);
+                if(target.customProvider!=null) {
+                    RequestContext customRequest=REQUEST_CONTEXT.get();
+                    customTicket=admitOutbound(target,customRequest);
+                    attachResponsesConnection(conn,customRequest);
+                    if(customRequest!=null) customRequest.onClose(customTicket::close);
+                    customTicket.markSent(); markResponsesSent(out);
+                }
                 if(zcodeMessages) {conn.setRequestProperty("x-session-id",zcodeSession);conn.setInstanceFollowRedirects(false);RequestContext current=REQUEST_CONTEXT.get();if(current!=null){current.check();current.attach(conn);}out.sent=true;}
                 if (!genericAnthropic) {
                     conn.setInstanceFollowRedirects(false);
@@ -15540,6 +15766,7 @@ public class GatewayServer extends NanoHTTPD {
                 os.close();
 
                 status = conn.getResponseCode();
+                if(customRedirect(out,target,status)) return out;
                 // A redirect is an answer, and it is not this request being served. The reference
                 // siteFetch sends every call with redirect "manual", follows a same-host hop at most
                 // five times, and never takes a cross-host one for anything but a failed call
@@ -15659,7 +15886,7 @@ public class GatewayServer extends NanoHTTPD {
             if(search!=null && search.renamed) {msg=search.restoreJson(msg);text=msg.toString();}
             try { ZCodeAnthropic.validateStopReason(msg); }
             catch (IllegalArgumentException invalid) { return failedProtocolAttempt(out); }
-            out.affinitySemanticComplete=target.commercialCandidates!=null && affinitySemanticComplete(text,"anthropic");
+            out.affinitySemanticComplete=affinitySemanticComplete(text,"anthropic");
             UsageLedger.Row nativeRow = U_ROW.get();
             if (nativeRow != null) absorbUsage(nativeRow, msg.optJSONObject("usage"));
             StringBuilder sb = new StringBuilder();
@@ -15689,6 +15916,9 @@ public class GatewayServer extends NanoHTTPD {
             return out;
         } catch (ResponseBodyLimitException oversized) {
             return oversizedInferenceResponse(out);
+        } catch (OutboundRejected rejected) {
+            out.localRejection=true; out.status=rejected.status; out.body=rejected.getMessage();
+            out.response=errorResponse(out.status,out.body); return out;
         } catch (IllegalArgumentException invalidRequest) {
             out.ok=false; out.localRejection=true; out.stopFallback=true; out.status=400;
             out.body=invalidRequest.getMessage()==null?"Invalid Anthropic reasoning request":invalidRequest.getMessage();
@@ -15708,7 +15938,8 @@ public class GatewayServer extends NanoHTTPD {
             }
             return out;
         } finally {
-            if (conn != null && !handedOff) {
+            if(target.customProvider!=null) finishResponsesConnection(out,handedOff,conn,customTicket,REQUEST_CONTEXT.get());
+            else if (conn != null && !handedOff) {
                 RequestContext current=REQUEST_CONTEXT.get(); if(current!=null) current.detach(conn);
                 try {
                     conn.disconnect();
@@ -16011,7 +16242,8 @@ public class GatewayServer extends NanoHTTPD {
                 JSONObject mw=configJson.optJSONObject("middleware");
                 if(message!=null && format==null) {String content=message.optString("content",""); String[] transformed=Middleware.applyThinkTags(content,message.optString("reasoning_content",""),mw);content=transformed[0];message.put("reasoning_content",transformed[1]);
                     if(Middleware.wordGuardEnabled(mw))content=Middleware.maskWords(content,mw); message.put("content",content);out.textOut=content;out.reasoningOut=message.optString("reasoning_content","");}
-                out.response=newFixedLengthResponse(Status.OK,"application/json; charset=UTF-8",toAnthropicBodyIfNeeded(modified.toString(),requested));
+                out.affinitySemanticComplete=affinitySemanticComplete(modified.toString(),"openai");
+            out.response=newFixedLengthResponse(Status.OK,"application/json; charset=UTF-8",toAnthropicBodyIfNeeded(modified.toString(),requested));
                 addCorsHeaders(out.response);applyGuardHeaders(out.response,guard);out.response.addHeader("X-Magpie-Served-By",out.modelRef);
                 out.ok=true;out.status=200;return out;
             }
@@ -16209,6 +16441,7 @@ public class GatewayServer extends NanoHTTPD {
 
     /** 把 "provider/model" 解析成一个可发包的目标；解析不出返回 null */
     private RouteTarget buildTarget(String targetModel) {
+        targetModel=customNames().canonical(targetModel);
         String provId = null;
         String mName = targetModel;
         if (targetModel.contains("/")) {
@@ -16234,7 +16467,7 @@ public class GatewayServer extends NanoHTTPD {
         if (chosenProvider == null) {
             for (int i = 0; i < providers.length(); i++) {
                 JSONObject p = providers.optJSONObject(i);
-                if (p == null) continue;
+                if (p == null || CustomProvider.isCustom(p)) continue;
                 JSONArray ms = p.optJSONArray("models");
                 if (ms != null) {
                     for (int mi = 0; mi < ms.length(); mi++) {
@@ -16255,7 +16488,7 @@ public class GatewayServer extends NanoHTTPD {
         if (chosenProvider == null && targetModel.indexOf('/') < 0 && bareModelFallbackEnabled()) {
             for (int i = 0; i < providers.length(); i++) {
                 JSONObject p = providers.optJSONObject(i);
-                if (p != null && p.optBoolean("enabled", true)) {
+                if (p != null && !CustomProvider.isCustom(p) && p.optBoolean("enabled", true)) {
                     JSONArray keys = p.optJSONArray("keys");
                     if (keys != null && keys.length() > 0) {
                         chosenProvider = p;
@@ -16266,6 +16499,7 @@ public class GatewayServer extends NanoHTTPD {
         }
 
         if (chosenProvider == null || !chosenProvider.optBoolean("enabled", true)) return null;
+        if(CustomProvider.isCustom(chosenProvider) && !CustomProvider.selected(chosenProvider,mName)) return null;
         // Client-facing Qoder labels reverse to the saved official slot before account selection.
         mName = QoderModelIdentity.of(chosenProvider).upstreamId(mName);
 
@@ -16277,7 +16511,17 @@ public class GatewayServer extends NanoHTTPD {
         boolean accountPoolOwns=!commercial && ((poolAccounts!=null && poolAccounts.length()>0)
                 || (("workbuddy".equals(chosenId) || "workbuddy-ai".equals(chosenId) || "zcode".equals(chosenId)) && keys!=null && keys.length()>0));
         if (!commercial && !accountPoolOwns && keys != null && keys.length() > 0) {
-            if("rotate".equals(AccountRoutingPolicy.mode(chosenProvider)))selectedKey=keys.optString(nextAccountIndex(chosenId,keys.length()));
+            if ("codex".equals(chosenId)) {
+                List<CommercialKeyPool.Credential> staticKeys = new ArrayList<>(CommercialKeyPool.list(keys));
+                staticKeys.removeIf(key -> !key.secret().startsWith("sk-"));
+                if (staticKeys.isEmpty()) return null;
+                if ("rotate".equals(AccountRoutingPolicy.mode(chosenProvider)))
+                    selectedKey = staticKeys.get(nextAccountIndex(chosenId, staticKeys.size())).secret();
+                else {
+                    CommercialKeyPool.Credential key = routingKey(chosenId, mName, staticKeys, java.util.Collections.emptySet());
+                    if (key != null) selectedKey = key.secret();
+                }
+            } else if("rotate".equals(AccountRoutingPolicy.mode(chosenProvider)))selectedKey=keys.optString(nextAccountIndex(chosenId,keys.length()));
             else {CommercialKeyPool.Credential c=routingKey(chosenId,mName,CommercialKeyPool.list(keys),java.util.Collections.emptySet());if(c!=null)selectedKey=c.secret();}
         }
         JSONObject pooledAccount=null;
@@ -16300,6 +16544,8 @@ public class GatewayServer extends NanoHTTPD {
         route.upstreamModel = mName;
         route.isAnthropic = "anthropic".equalsIgnoreCase(chosenProvider.optString("protocol"));
         route.protocol = chosenProvider.optString("protocol", route.isAnthropic ? "anthropic" : "openai");
+        route.customProvider = CustomProvider.isCustom(chosenProvider) ? new JSONObject(chosenProvider.toString()) : null;
+        if(route.customProvider!=null && (!CustomProvider.ready(route.customProvider) || CustomProvider.self(route.customProvider,customListeningPort()))) return null;
         route.catalogMetadata = chosenProvider.optJSONObject("modelMeta");
         route.account=pooledAccount;
         if(pooledAccount!=null && "zcode".equals(chosenId) && !pooledAccount.optString("site","").isEmpty())
@@ -16307,7 +16553,7 @@ public class GatewayServer extends NanoHTTPD {
         if(pooledAccount!=null && ("workbuddy".equals(chosenId) || "workbuddy-ai".equals(chosenId)) && pooledAccount.has("models"))
             route.catalogMetadata=pooledAccount.optJSONObject("modelMeta");
         if (commercial) {
-            route.commercialCandidates = CommercialKeyPool.list(keys);
+            route.commercialCandidates = CommercialKeyPool.list(CustomProvider.routeKeys(chosenProvider));
             if (route.commercialCandidates.isEmpty()) return null;
             return route;
         }
@@ -16725,7 +16971,7 @@ public class GatewayServer extends NanoHTTPD {
             if((account.has("models") || (workbuddy && scoped)) && !qoderAccountLists(account,selected.upstreamModel))continue;
             RouteTarget target=new RouteTarget();target.providerId=selected.providerId;target.protocol=selected.protocol;
             target.baseUrl=selected.baseUrl;target.upstreamModel=selected.upstreamModel;target.isAnthropic=selected.isAnthropic;
-            target.account=account;target.apiKey=storedAccess(account);
+            target.account=account;target.apiKey=storedAccess(account);target.deferredAccountPreparation=true;
             target.catalogMetadata=account.has("models")?account.optJSONObject("modelMeta"):selected.catalogMetadata;
             if("zcode".equals(target.providerId) && !account.optString("site","").isEmpty())target.baseUrl=ZCodeAuth.baseOf(account.optString("site"));
             result.add(target);
@@ -16734,6 +16980,7 @@ public class GatewayServer extends NanoHTTPD {
     }
 
     private List<RouteTarget> resolveCandidates(String model) {
+        model=customNames().canonical(model);
         List<String> refs = new ArrayList<String>();
         if (model != null && model.startsWith("group/") && !groupsEnabled()) {
             // 组是「按需开启」的：关着的时候不解析，交给调用方回 403 并提示直接用 provider/model
@@ -17413,6 +17660,136 @@ public class GatewayServer extends NanoHTTPD {
      * 供应商能力状态板：把「看着有 21 家，其实只有几家真能调」这件事显式化。
      * status 取值：ported（按 plugins 真移植）/ passthrough（OpenAI 兼容直连）/ placeholder（尚未实装）
      */
+    private volatile JSONObject customNamesSource;
+    private volatile CustomModelNames customNamesCache;
+    private synchronized CustomModelNames customNames() {
+        if(customNamesCache==null || customNamesSource!=configJson) {
+            customNamesCache=new CustomModelNames(configJson);customNamesSource=configJson;
+        }
+        return customNamesCache;
+    }
+    private synchronized void migrateCustomModelNames() {
+        try { JSONObject staged=new JSONObject(configJson.toString());new CustomModelNames(staged).persist(staged);
+            if(!jsonEquivalent(staged,configJson) && !saveConfig(staged)) android.util.Log.w("Magpie","自定义模型可读名称尚未持久化，原调用地址保留");
+        } catch(Exception invalid) {android.util.Log.w("Magpie","自定义模型名称未迁移，原配置保留");}
+    }
+    private int customListeningPort() { JSONObject server=configJson.optJSONObject("server"); return server==null?3425:server.optInt("port",3425); }
+
+    private void validateCustomProviders(JSONObject config) {
+        JSONObject server=config.optJSONObject("server"); int port=server==null?3425:server.optInt("port",3425);
+        JSONArray providers=config.optJSONArray("providers"); Set<String> ids=new HashSet<>(); int count=0;
+        for(int i=0;providers!=null&&i<providers.length();i++) { JSONObject p=providers.optJSONObject(i); if(p==null) continue;
+            String id=p.optString("id"); if(!ids.add(id)) throw new IllegalArgumentException("供应商 ID 重复");
+            if(CustomProvider.isCustom(p)) { CustomProvider.validate(p); if(++count>64) throw new IllegalArgumentException("最多 64 个自定义供应商");
+                if(CustomProvider.self(p,port)) throw new IllegalArgumentException("上游地址不可指向本机 All In 网关，避免循环转发"); }
+            else if(id.startsWith("custom-")) throw new IllegalArgumentException("custom- ID 仅用于自定义供应商");
+        }
+    }
+    private Response customProviderMutation(String body) {
+        try {
+            JSONObject req=new JSONObject(body); String action=CustomProvider.text(req,"action");
+            if(!Arrays.asList("save","remove").contains(action)) return errorResponse(400,"未知操作");
+            synchronized(this) {
+                JSONObject staged=new JSONObject(configJson.toString()); JSONArray providers=staged.getJSONArray("providers");
+                JSONObject draft="save".equals(action)?req.getJSONObject("provider"):null;
+                String id=draft==null?CustomProvider.text(req,"providerId"):CustomProvider.text(draft,"id");
+                if(req.length()!=(req.has("expectedStateToken")?3:2) || !validExpectedStateToken(req)) return errorResponse(400,"无效请求字段");
+                JSONObject current=findProviderById(providers,id);
+                if(current!=null && !CustomProvider.isCustom(current)) return errorResponse(403,"不可修改内置供应商");
+                if(current!=null && (!(req.opt("expectedStateToken") instanceof String) || !providerStateMatches(req,current))) return errorResponse(409,"供应商已变化，请刷新后重新编辑");
+                if(current==null && req.has("expectedStateToken")) return errorResponse(409,"供应商已删除，请刷新");
+                if("remove".equals(action)) {
+                    if(current==null) return errorResponse(404,"供应商不存在");
+                    for(int i=providers.length()-1;i>=0;i--) if(id.equals(providers.getJSONObject(i).optString("id"))) providers.remove(i);
+                } else {
+                    Set<String> allowed=new HashSet<>(Arrays.asList("id","name","baseUrl","protocol","authMode","headers","keys","models","catalogModels","enabled"));
+                    for(String f:draft.keySet()) if(!allowed.contains(f)) return errorResponse(400,"未知供应商字段");
+                    JSONObject incoming=new JSONObject().put("providers",new JSONArray().put(draft));
+                    JSONObject restored=ConfigurationView.restore(incoming,configJson,GatewayManagementCredential.get()).getJSONArray("providers").getJSONObject(0);
+                    JSONObject clean=CustomProvider.validate(restored);
+                    if(current==null) providers.put(clean);
+                    else for(String f:clean.keySet()) current.put(f,clean.get(f));
+                    JSONObject target=findProviderById(providers,id); target.remove("accessCatalogPool"); target.remove("modelMeta");
+                }
+                new CustomModelNames(staged).persist(staged);
+                validateCustomProviders(staged);
+                if(!saveConfig(staged)) return errorResponse(500,"配置未保存，原状态保持");
+                advanceProviderStateRevision(id);
+                JSONObject result=new JSONObject().put("ok",true).put("providerId",id).put("action",action);
+                JSONObject target=getProviderById(id); if(target!=null) result.put("stateToken",providerStateToken(target));
+                return jsonResponse(result);
+            }
+        } catch(IllegalArgumentException e) { return errorResponse(400,e.getMessage()); }
+        catch(Exception e) { return errorResponse(400,"自定义供应商格式无效或凭据引用已失效，请重新读取"); }
+    }
+    private boolean customRedirect(Attempt out,RouteTarget target,int code) {
+        if(target.customProvider==null || code<300 || code>=400) return false;
+        out.status=502;out.stopFallback=true;out.redirected=true;out.body="自定义 API 上游返回重定向（HTTP "+code+"），未跟随或转发凭据；请填写可直连 API 根地址";
+        out.response=errorResponse(502,out.body);return true;
+    }
+    private JSONObject fetchCustomCandidates(JSONObject provider) {
+        JSONObject checked=CustomProvider.validate(provider);
+        if(!CustomProvider.ready(checked) || CustomProvider.self(checked,customListeningPort())) throw new IllegalArgumentException("请先填好 API 地址与认证，不可指向本机网关");
+        List<CommercialKeyPool.Credential> credentials=CommercialKeyPool.list(CustomProvider.routeKeys(checked));
+        String key=credentials.isEmpty()?"":credentials.get(0).secret();
+        List<String> models=StandardModelCatalog.fetchCustom(checked,key,new JSONObject(),this::openVendorConnection);
+        if(models.isEmpty()) throw new IllegalStateException("云端模型获取失败或为空，原候选与勾选保留；也可手动添加模型");
+        JSONArray list=new JSONArray();for(String model:models)list.put(model);
+        JSONObject shape=new JSONObject(checked.toString());shape.remove("catalogModels");shape.remove("modelAliases");shape.put("models",list);
+        JSONArray valid=CustomProvider.validate(shape).getJSONArray("models");
+        return new JSONObject().put("ok",true).put("providerId",checked.getString("id")).put("models",valid).put("count",valid.length()).put("saved",false);
+    }
+    private Response previewCustomCatalog(String body) {
+        try {
+            JSONObject req=new JSONObject(body),draft=req.getJSONObject("provider");
+            if(req.length()!=(req.has("expectedStateToken")?2:1)||!validExpectedStateToken(req))return errorResponse(400,"目录查询字段无效");
+            JSONObject checked;String id=CustomProvider.text(draft,"id");
+            synchronized(this) {
+                JSONObject current=getProviderById(id);
+                if(current!=null && !CustomProvider.isCustom(current))return errorResponse(403,"不可使用内置供应商凭据查询自定义地址");
+                if(current!=null && (!(req.opt("expectedStateToken") instanceof String)||!providerStateMatches(req,current)))return errorResponse(409,"供应商已变化，请重新打开编辑器");
+                if(current==null && req.has("expectedStateToken"))return errorResponse(409,"供应商已删除，请重新打开");
+                Set<String> fields=new HashSet<>(Arrays.asList("id","name","baseUrl","protocol","authMode","headers","keys","models","catalogModels","enabled"));
+                for(String field:draft.keySet())if(!fields.contains(field))return errorResponse(400,"未知目录查询字段");
+                // Existing secret references are bound to the original provider and field. Never
+                // send a stored secret to a different address unless the user explicitly supplied it.
+                JSONObject incoming=new JSONObject().put("providers",new JSONArray().put(draft));
+                checked=ConfigurationView.restore(incoming,configJson,GatewayManagementCredential.get()).getJSONArray("providers").getJSONObject(0);
+                if(current!=null && !CustomProvider.base(current.optString("baseUrl")).equals(CustomProvider.base(checked.optString("baseUrl")))
+                        && draft.toString().contains("allin-secret-ref:"))return errorResponse(400,"更改 API 地址后请重新填写凭据，旧地址凭据不会自动发送到新地址");
+            }
+            JSONObject result=fetchCustomCandidates(checked);
+            synchronized(this) {
+                JSONObject current=getProviderById(id);
+                if(req.has("expectedStateToken") && (current==null||!providerStateMatches(req,current)))return errorResponse(409,"查询期间供应商已变化，请重新读取");
+            }
+            return jsonResponse(result);
+        }catch(IllegalArgumentException invalid){return errorResponse(400,invalid.getMessage());}
+        catch(IllegalStateException unavailable){return errorResponse(502,unavailable.getMessage());}
+        catch(Exception invalid){return errorResponse(400,"目录查询或凭据引用无效，请重新打开编辑器");}
+    }
+
+    private Response syncCustomProvider(JSONObject expected) {
+        try {
+            JSONObject fetched=fetchCustomCandidates(expected);JSONArray candidates=fetched.getJSONArray("models");
+            synchronized(this) {
+                JSONObject current=getProviderById(expected.getString("id"));
+                if(current==null || !jsonEquivalent(expected,current))return errorResponse(409,"供应商已变化，原候选和入池模型保留");
+                JSONObject staged=new JSONObject(configJson.toString()),target=findProviderById(staged.getJSONArray("providers"),expected.getString("id"));
+                target.put("catalogModels",candidates);
+                // Fetching only refreshes the candidate catalog; only explicit checked models are routed.
+                new CustomModelNames(staged).persist(staged);validateCustomProviders(staged);
+                if(!saveConfig(staged))return errorResponse(500,"候选目录未保存，原状态保持");
+                advanceProviderStateRevision(expected.getString("id"));
+                return jsonResponse(new JSONObject().put("ok",true).put("provider",expected.getString("id")).put("models",candidates)
+                        .put("count",candidates.length()).put("selectedCount",target.getJSONArray("models").length())
+                        .put("message","已读取 "+candidates.length()+" 个云端候选；入池选项未改变，请在编辑菜单勾选"));
+            }
+        }catch(IllegalArgumentException invalid){return errorResponse(400,invalid.getMessage());}
+        catch(IllegalStateException unavailable){return errorResponse(502,unavailable.getMessage());}
+        catch(Exception failure){return errorResponse(409,"目录查询、供应商状态或保存失败，原选项保留");}
+    }
+
     private JSONObject buildProvidersBoard() {
         JSONObject out = new JSONObject();
         try {
@@ -18152,6 +18529,10 @@ public class GatewayServer extends NanoHTTPD {
 
     private static String scrubUpstreamSecrets(String text, RouteTarget target) {
         if (text == null) return "";
+        if(target.customProvider!=null) {
+            JSONObject headers=target.customProvider.optJSONObject("headers");
+            for(String name:headers.keySet()) { String value=headers.optString(name); if(!value.isEmpty()) text=text.replace(value,"[REDACTED]"); }
+        }
         if (target.apiKey != null && !target.apiKey.isEmpty()) text = text.replace(target.apiKey, "[REDACTED]");
         if (target.commercialCandidates != null) for (CommercialKeyPool.Credential credential : target.commercialCandidates) {
             String secret = credential.secret();
@@ -18381,8 +18762,9 @@ public class GatewayServer extends NanoHTTPD {
             conn=openInferenceConnection(target.baseUrl.replaceAll("/+$","")+"/responses", false);
             if(target.commercialCandidates!=null) conn.setInstanceFollowRedirects(false);
             conn.setRequestMethod("POST"); conn.setDoOutput(true); conn.setConnectTimeout(cfg.connectTimeoutSeconds*1000); conn.setReadTimeout(cfg.requestTimeoutSeconds*1000);
-            conn.setRequestProperty("Authorization","Bearer "+target.apiKey); conn.setRequestProperty("Content-Type","application/json");
+            if(target.customProvider==null) conn.setRequestProperty("Authorization","Bearer "+target.apiKey); conn.setRequestProperty("Content-Type","application/json");
             conn.setRequestProperty("Accept",stream?"text/event-stream":"application/json"); addResponsesProviderHeaders(conn,target,request);
+            CustomProvider.apply(conn,target.customProvider,target.apiKey,stream);
             byte[] requestBytes=request.toString().getBytes("UTF-8");
             if(target.commercialCandidates!=null) conn.setFixedLengthStreamingMode(requestBytes.length);
             if (target.commercialCandidates != null) ticket = admitOutbound(target, requestContext);
@@ -18399,6 +18781,7 @@ public class GatewayServer extends NanoHTTPD {
             }
             if (requestContext != null) requestContext.check();
             int code = conn.getResponseCode();
+            if(customRedirect(out,target,code)) return out;
             if (requestContext != null) requestContext.check();
             out.status = code;
             if (code < 200 || code >= 300) {
@@ -18467,8 +18850,9 @@ public class GatewayServer extends NanoHTTPD {
             conn=openInferenceConnection(target.baseUrl.replaceAll("/+$","")+"/responses", false);
             if(target.commercialCandidates!=null) conn.setInstanceFollowRedirects(false);
             conn.setRequestMethod("POST"); conn.setDoOutput(true); conn.setConnectTimeout(guardCfg.connectTimeoutSeconds*1000); conn.setReadTimeout(guardCfg.requestTimeoutSeconds*1000);
-            conn.setRequestProperty("Authorization","Bearer "+target.apiKey); conn.setRequestProperty("Content-Type","application/json");
+            if(target.customProvider==null) conn.setRequestProperty("Authorization","Bearer "+target.apiKey); conn.setRequestProperty("Content-Type","application/json");
             addResponsesProviderHeaders(conn,target,request);
+            CustomProvider.apply(conn,target.customProvider,target.apiKey,stream);
             byte[] requestBytes=request.toString().getBytes("UTF-8");
             if(target.commercialCandidates!=null) conn.setFixedLengthStreamingMode(requestBytes.length);
             if (target.commercialCandidates != null) ticket = admitOutbound(target, requestContext);
@@ -18485,6 +18869,7 @@ public class GatewayServer extends NanoHTTPD {
             }
             if (requestContext != null) requestContext.check();
             int code = conn.getResponseCode();
+            if(customRedirect(out,target,code)) return out;
             if (requestContext != null) requestContext.check();
             out.status = code;
             if (code < 200 || code >= 300) {
@@ -18545,8 +18930,9 @@ public class GatewayServer extends NanoHTTPD {
         try {
             JSONObject acc = target.account;
             CodexAuth.SignInInfo info = new CodexAuth.SignInInfo();
-            if (acc != null) {
-                info.accessToken = acc.optString("access", acc.optString("token", target.apiKey));
+            if (acc != null && !"legacy-key".equals(acc.optString("source"))) {
+                String access = storedAccess(acc);
+                info.accessToken = access.isEmpty() ? target.apiKey : access;
                 info.refreshToken = acc.optString("refresh", "");
                 info.idToken = acc.optString("idToken", "");
                 info.accountId = acc.optString("accountId", "");
@@ -18847,7 +19233,7 @@ public class GatewayServer extends NanoHTTPD {
         };
     }
     private static boolean codexCandidateMatches(JSONObject account, CodexAuth.SignInInfo candidate) {
-        return account.optString("access", account.optString("token", "")).equals(candidate.accessToken)
+        return storedAccess(account).equals(candidate.accessToken)
                 && account.optString("refresh", "").equals(candidate.refreshToken)
                 && account.optString("idToken", "").equals(candidate.idToken)
                 && account.optLong("expires", 0) == candidate.expiresAt;
@@ -18868,6 +19254,69 @@ public class GatewayServer extends NanoHTTPD {
             return found;
         }
         return null;
+    }
+
+    private volatile CodexAuth.CatalogConnectionFactory codexCatalogForTests;
+    void setCodexCatalogForTests(CodexAuth.CatalogConnectionFactory factory) { codexCatalogForTests = factory; }
+
+    private List<String> fetchCodexCatalog(CodexAuth.SignInInfo info) {
+        CodexAuth.CatalogConnectionFactory factory = codexCatalogForTests;
+        return factory == null ? CodexAuth.syncModelsStrict(info) : CodexAuth.syncModelsStrict(info, factory);
+    }
+
+    private Response syncCodexProviderCatalog(JSONObject expected) throws Exception {
+        JSONArray accounts = expected.optJSONArray("accounts");
+        boolean attempted = false;
+        long start = System.nanoTime();
+        for (int i = 0; accounts != null && i < accounts.length(); i++) {
+            JSONObject account = accounts.optJSONObject(i);
+            if (!CodexAuth.catalogAccount(account, System.currentTimeMillis())) continue;
+            if (attempted && System.nanoTime() - start >= 8_000_000_000L) break;
+            attempted = true;
+            CodexAuth.SignInInfo info = new CodexAuth.SignInInfo();
+            info.accessToken = storedAccess(account);
+            info.refreshToken = account.optString("refresh", "");
+            info.idToken = account.optString("idToken", "");
+            info.accountId = account.optString("accountId", "");
+            info.expiresAt = account.optLong("expires", 0);
+            String identity = storedTokenIdentity(account);
+            long incarnation;
+            synchronized (this) {
+                JSONObject current = findCodexAccount(configJson, account);
+                if (!CodexAuth.catalogAccount(current, System.currentTimeMillis()) || !jsonEquivalent(current, account))
+                    return errorResponse(409, "Codex 账号已变化，请重新同步");
+                incarnation = accountIncarnation("codex", identity);
+                if (incarnation == 0) return errorResponse(409, "Codex 账号标识不明确，原目录保留");
+                bindCodexPersistence(current, info);
+            }
+            List<String> models;
+            try { models = fetchCodexCatalog(info); }
+            catch (CodexAuth.RefreshCommitFailure failure) {
+                return errorResponse(409, "Codex 凭据更新未保存，原目录保留，请核对账号状态后重试");
+            }
+            if (models.isEmpty()) continue;
+            try { return commitCodexCatalog(expected, account, identity, incarnation, info, models); }
+            catch (Exception changed) { return errorResponse(409, "Codex 账号配置已变化或目录未保存，请重新同步"); }
+        }
+        return attempted ? errorResponse(502, "Codex 云端目录暂未确认，原目录保留；连通性测试与目录查询分别验证")
+                : errorResponse(401, "请先启用或重新登录 Codex ChatGPT 订阅账号再同步云端目录");
+    }
+
+    private synchronized Response commitCodexCatalog(JSONObject expected, JSONObject account, String identity,
+                                                      long incarnation, CodexAuth.SignInInfo info,
+                                                      List<String> models) throws Exception {
+        JSONObject current = getProviderById("codex");
+        JSONObject currentAccount = findCodexAccount(configJson, account);
+        if (stopping || current == null || !CodexAuth.catalogAccount(currentAccount, System.currentTimeMillis())
+                || accountIncarnation("codex", identity) != incarnation
+                || !account.optString("accountId", "").equals(currentAccount.optString("accountId", ""))
+                || !codexCandidateMatches(currentAccount, info)
+                || !GatewayAccessCatalog.poolFingerprint(expected).equals(GatewayAccessCatalog.poolFingerprint(current)))
+            throw new IOException("Codex account pool changed");
+        JSONArray array = new JSONArray(models);
+        persistProviderCatalog("codex", expected, array, new JSONObject());
+        return jsonResponse(new JSONObject().put("ok", true).put("provider", "codex").put("count", array.length())
+                .put("models", array).put("message", "已从 Codex 云端同步 " + array.length() + " 个可用模型"));
     }
 
     private synchronized String addCodexAccount(CodexAuth.SignInInfo info, String accName) {
@@ -18948,19 +19397,7 @@ public class GatewayServer extends NanoHTTPD {
             targetAcc.put("lastRefresh", info.lastRefresh > 0 ? info.lastRefresh : System.currentTimeMillis());
             targetAcc.put("enabled", true);
 
-            JSONArray keys = cp.optJSONArray("keys");
-            if (keys == null) {
-                keys = new JSONArray();
-                cp.put("keys", keys);
-            }
-            boolean keyExists = false;
-            for (int i = 0; i < keys.length(); i++) {
-                if (info.accessToken.equals(keys.optString(i))) {
-                    keyExists = true;
-                    break;
-                }
-            }
-            if (!keyExists) keys.put(info.accessToken);
+            synchronizeAccountKeyMirrors(staged, "codex");
 
             if ("apikey".equals(info.authMode)) {
                 // A static key has not consumed an OAuth exchange. Failed admission must leave
@@ -18968,20 +19405,29 @@ public class GatewayServer extends NanoHTTPD {
                 GatewayAccessCatalog.preserveAccountScope(configJson, staged);
                 persistConfigStrict(staged);
             } else if (!saveConfig(staged)) throw new IOException("Codex account save failed");
-            bindCodexPersistence(targetAcc, info);
-            List<String> liveModels = CodexAuth.syncModels(info);
-            staged = new JSONObject(configJson.toString());
-            cp = findProviderById(staged.optJSONArray("providers"), "codex");
-            if (cp == null) throw new IOException("Codex provider unavailable");
-            JSONArray modelsArr = cp.optJSONArray("models");
-            if (modelsArr == null || modelsArr.length() == 0) {
-                modelsArr = new JSONArray();
-                for (String m : liveModels) modelsArr.put(m);
-                cp.put("models", modelsArr);
-            }
-
-            if (!saveConfig(staged)) {
-                try { android.util.Log.w("Magpie", "Codex 模型目录未落盘（账号凭据已保存）"); }
+            // Catalog failure must leave the already saved login and prior directory intact.
+            try {
+                JSONObject current = getProviderById("codex");
+                JSONArray existing = current.optJSONArray("models");
+                boolean empty = existing == null || existing.length() == 0;
+                boolean samePool = GatewayAccessCatalog.poolFingerprint(current)
+                        .equals(current.optString("accessCatalogPool", ""));
+                if (CodexAuth.catalogAccount(targetAcc, System.currentTimeMillis()) && (empty || !samePool)) {
+                    bindCodexPersistence(targetAcc, info);
+                    List<String> models = fetchCodexCatalog(info);
+                    if (!models.isEmpty()) {
+                        persistProviderCatalog("codex", current, new JSONArray(models), new JSONObject());
+                        return accId;
+                    }
+                }
+                if (empty) {
+                    staged = new JSONObject(configJson.toString());
+                    cp = findProviderById(staged.optJSONArray("providers"), "codex");
+                    cp.put("models", new JSONArray(java.util.Arrays.asList(CodexAuth.DEFAULT_MODELS)));
+                    saveConfig(staged);
+                }
+            } catch (Exception lookupFailure) {
+                try { android.util.Log.w("Magpie", "Codex 模型目录未更新（账号凭据已保存）"); }
                 catch (Throwable ignored) { }
             }
             return accId;
@@ -19183,6 +19629,7 @@ public class GatewayServer extends NanoHTTPD {
             } finally {
                 resp.close();
             }
+            out.affinitySemanticComplete=affinitySemanticComplete(sim.toString(),"openai");
             JSONArray choices = sim.optJSONArray("choices");
             if (choices != null && choices.length() > 0) {
                 JSONObject c0 = choices.optJSONObject(0);

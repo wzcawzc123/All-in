@@ -14,6 +14,14 @@ public final class RequestContext implements OutboundLimiter.Cancellation, AutoC
     public final long deadlineNanos;
     final ProviderQuirks.Snapshot quirks;
     final String explicitSession, authScope;
+    // Opaque conversation state, acquired before account selection and owned by this request.
+    String conversationSession = "", conversationModel = "";
+    SessionAffinity.Key conversationKey;
+    SessionAffinity.Lease conversationLease;
+    boolean accountConversation;
+    final Map<String,long[]> conversationRotations=new HashMap<>();
+    final Map<String,List<String>> conversationRotationSlots=new HashMap<>();
+    ConversationHistory.Context conversationHistory;
     final long affinityEpoch;
     boolean heldResponse;
     volatile AtomicBoolean affinitySemantic = new AtomicBoolean();

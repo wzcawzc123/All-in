@@ -684,6 +684,10 @@ public class CodexAuth {
      */
     interface CatalogConnectionFactory { HttpURLConnection open(String url) throws Exception; }
 
+    static boolean catalogAccount(JSONObject account, long now) {
+        return AccountGenerations.enabled(account) && CodexImages.usable(account, now);
+    }
+
     /** Compatibility entry point for callers that explicitly accept the bundled snapshot. */
     public static List<String> syncModels(SignInInfo info) {
         List<String> list = syncModelsStrict(info);
@@ -700,16 +704,19 @@ public class CodexAuth {
         List<String> list = new ArrayList<>();
         if (info == null || "apikey".equals(info.authMode)) return list;
 
+        HttpURLConnection conn = null;
         try {
-            if (info.expiresAt > 0 && (info.expiresAt - System.currentTimeMillis() < 5 * 60 * 1000L) && !info.refreshToken.isEmpty()) {
+            if (!info.refreshToken.isEmpty() && (info.accessToken.isEmpty()
+                    || (info.expiresAt > 0 && info.expiresAt - System.currentTimeMillis() < 5 * 60 * 1000L))) {
                 try {
                     refreshToken(info, "proactive_expiry");
                 } catch (RefreshCommitFailure failure) { throw failure; }
                 catch (Throwable ignored) {}
             }
 
+            if (info.accessToken.isEmpty()) return list;
             String urlStr = CODEX_MODELS + "?client_version=" + URLEncoder.encode(CATALOG_VERSION, "UTF-8");
-            HttpURLConnection conn = factory.open(urlStr);
+            conn = factory.open(urlStr);
             conn.setInstanceFollowRedirects(false);
             conn.setRequestMethod("GET");
             conn.setConnectTimeout(10000);
@@ -724,13 +731,7 @@ public class CodexAuth {
 
             int code = conn.getResponseCode();
             if (code == 200) {
-                InputStream is = conn.getInputStream();
-                ByteArrayOutputStream bos = new ByteArrayOutputStream();
-                byte[] buf = new byte[2048];
-                int n;
-                while ((n = is.read(buf)) != -1) bos.write(buf, 0, n);
-                is.close();
-                JSONObject root = new JSONObject(bos.toString("UTF-8"));
+                JSONObject root = new JSONObject(BoundedResponse.readUtf8(conn.getInputStream(), BoundedResponse.MAX_BYTES, 10000));
                 JSONArray arr = root.optJSONArray("models");
                 if (arr != null) {
                     for (int i = 0; i < arr.length(); i++) {
@@ -749,6 +750,8 @@ public class CodexAuth {
         } catch (RefreshCommitFailure failure) { throw failure; }
         catch (Throwable ignored) {
             return new ArrayList<String>();
+        } finally {
+            if (conn != null) conn.disconnect();
         }
 
         return list;

@@ -36,3 +36,7 @@ Windows 测试使用 JNA 5.17.0 调用系统耐久重命名 API，仅属于 offl
 - `nanohttpd-2.3.1-BSD.txt`: `3825e0f8f684b3b89ecd56ea6b2faa2dda2b7a9c4127b2baf302d6d2b0cea765`
 - `primer-octicons-MIT.txt`: `da259c8bd0de62713ccdcf88910aebca810644f98c2c912bad814fc79ea778df`
 - `qoder-CLIProxyAPI-MIT.txt`: `879792e89cf1bdd6a8d446033ec87e30496f97dcafc4656dc53f641509b346a6`
+
+## 自定义 API 与请求头预设（1.2.105-test 本地开发）
+
+参考固定 Magpie 提交 `c8e9c6410c671677ce2208ca2dc00c0727ea41e5` 的供应商配置、认证后应用用户请求头和 GUI 预设合并逻辑。Android 端管理、验证、持久化及流式生命周期按本项目结构重新适配。Magpie 作者版权与 MIT 原文继续由 `magpie-MIT.txt` 随包保留；实现范围与限制见 [自定义 API 说明](CUSTOM_API_PROVIDERS.md)。未更新本机 Magpie 或插件快照。

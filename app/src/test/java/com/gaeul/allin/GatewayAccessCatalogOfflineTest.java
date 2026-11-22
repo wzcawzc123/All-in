@@ -53,7 +53,7 @@ public final class GatewayAccessCatalogOfflineTest {
   JSONObject ar=GatewayAccessCatalog.build(new JSONObject().put("providers",new JSONArray().put(accountOnly)),200,null);
   check(has(ar,"minimax-code/account-model")&&!has(ar,"minimax-code/m"),"account subscription catalog");
   JSONObject codex=p("codex","codex").put("accounts",new JSONArray().put(new JSONObject().put("access","x").put("refresh","r")));
-  check(!has(GatewayAccessCatalog.build(new JSONObject().put("providers",new JSONArray().put(codex)),200,null),"codex/m"),"account without routable key");
+  check(has(GatewayAccessCatalog.build(new JSONObject().put("providers",new JSONArray().put(codex)),200,null),"codex/m"),"routable subscription account without a mirrored key");
   codex.put("keys",new JSONArray().put("x")); check(has(GatewayAccessCatalog.build(new JSONObject().put("providers",new JSONArray().put(codex)),200,null),"codex/m"),"codex access key routed");
   JSONObject manual=new JSONObject().put("id","manual").put("strategy","manual").put("pick","test/missing").put("targets",new JSONArray().put("test/missing").put("test/m"));
   JSONObject mc=new JSONObject().put("providers",new JSONArray().put(commercial)).put("routing",new JSONObject().put("groupsEnabled",true)).put("groups",new JSONArray().put(manual));

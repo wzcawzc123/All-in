@@ -16,6 +16,7 @@ final class BackupConfigSchema {
             Object raw=providers.opt(i); if (!(raw instanceof JSONObject)) bad(); JSONObject p=(JSONObject)raw;
             Object id=p.opt("id"); if (!(id instanceof String) || ((String)id).trim().isEmpty() || !ids.add((String)id)) bad();
             if (p.has("protocol")) { Object proto=p.opt("protocol"); if (!(proto instanceof String) || !PROTOCOLS.contains(proto)) bad(); }
+            if(CustomProvider.isCustom(p)) CustomProvider.validate(p);
             JSONArray models=array(p,"models",false), keys=array(p,"keys",false), accounts=array(p,"accounts",false);
             if (models!=null) for(int j=0;j<models.length();j++) if (!(models.opt(j) instanceof String)) bad();
             if (accounts!=null) for(int j=0;j<accounts.length();j++) if (!(accounts.opt(j) instanceof JSONObject)) bad();

@@ -75,7 +75,7 @@ public final class AntigravityCompatibilityGatewayTest {
                 NanoHTTPD.Response reply = Audit53RegressionTest.request(g, "/v1/messages", "POST", request.toString());
                 int status = reply.getStatus().getRequestStatus();
                 String text = Audit53RegressionTest.body(reply);
-                check(status == (stream ? 200 : 502), "late upstream failure preserves protocol status");
+                check(status == (stream ? 200 : 502), "late upstream failure preserves protocol status: actual="+status+" stream="+stream);
                 check(text.contains("code=400 status=INVALID_ARGUMENT") && !text.contains(ACCESS) && !text.contains(REFRESH), "late error facts preserved and account secret echoes redacted");
                 check(wire.opens == 1 && wire.request.contains("functionResponse"), "tool result transmitted once");
                 if (stream) check(text.contains("partial") && text.indexOf("event: error") >= 0

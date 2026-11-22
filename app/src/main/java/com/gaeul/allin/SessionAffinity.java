@@ -39,10 +39,10 @@ public final class SessionAffinity {
     }
     private static final class Entry {
         final CountDownLatch done = new CountDownLatch(1);
-        final long started;
+        final long started, pendingUntil;
         long boundAt;
         Target target;
-        Entry(long now) { started = now; }
+        Entry(long now,long pendingMillis) { started=now; pendingUntil=now+pendingMillis; }
     }
     public final class Lease implements AutoCloseable {
         public final State state;
@@ -68,6 +68,17 @@ public final class SessionAffinity {
                 entry.target=target; entry.boundAt=now; entry.done.countDown(); return true;
             }
         }
+        /** Refresh a successful existing binding without letting a stale reply replace it. */
+        public boolean renew(Target target) {
+            if (state == State.OWNER) return bind(target);
+            if (state != State.BOUND || target == null) return false;
+            synchronized (SessionAffinity.this) {
+                long now=clock.nowMillis();
+                if(entries.get(key)!=entry || expired(entry,now) || !target.equals(entry.target)) return false;
+                entry.boundAt=now;
+                return true;
+            }
+        }
         /** Releasing an owner is idempotent and cannot erase its successful binding. */
         @Override public void close() {
             if (state != State.OWNER) return;
@@ -81,7 +92,7 @@ public final class SessionAffinity {
     private final long ttlMillis, reservationMillis;
     private final byte[] secret = new byte[32];
     private final LinkedHashMap<Key,Entry> entries = new LinkedHashMap<Key,Entry>(16,0.75f,true);
-    public SessionAffinity() { this(() -> System.nanoTime()/1000000L, 1024, 30*60*1000L, 60000L); }
+    public SessionAffinity() { this(() -> System.nanoTime()/1000000L, 1024, 30L*24*60*60*1000L, 60000L); }
     public SessionAffinity(Clock clock, int capacity, long ttlMillis, long reservationMillis) {
         this.clock=Objects.requireNonNull(clock);
         if (capacity<1 || ttlMillis<1 || reservationMillis<1) throw new IllegalArgumentException();
@@ -118,8 +129,8 @@ public final class SessionAffinity {
         } catch (Exception e) { throw new IllegalStateException(e); }
     }
     private boolean expired(Entry e,long now) {
-        long age=now-(e.target==null ? e.started : e.boundAt);
-        return age<0 || age >= (e.target==null ? reservationMillis : ttlMillis);
+        if(e.target==null)return now<e.started || now>=e.pendingUntil;
+        long age=now-e.boundAt;return age<0 || age>=ttlMillis;
     }
     private void remove(Key key,Entry entry) { entries.remove(key); entry.done.countDown(); }
     private void purge(long now) {
@@ -127,7 +138,9 @@ public final class SessionAffinity {
         while (it.hasNext()) { Entry e=it.next().getValue(); if (expired(e,now)) { it.remove(); e.done.countDown(); } }
     }
     /** Nonblocking; WAIT caller may wait bounded by its own request deadline, or bypass. */
-    public synchronized Lease acquire(Key key) {
+    public synchronized Lease acquire(Key key) {return acquire(key,reservationMillis);}
+    /** A slow first answer may reserve until its bounded request deadline, never forever. */
+    public synchronized Lease acquire(Key key,long pendingMillis) {
         if (key==null) return new Lease(State.BYPASS,null,null,null);
         long now=clock.nowMillis(); purge(now);
         Entry e=entries.get(key);
@@ -137,7 +150,7 @@ public final class SessionAffinity {
             while (it.hasNext()) { Entry old=it.next().getValue(); if (old.target!=null) { it.remove(); old.done.countDown(); evicted=true; break; } }
             if (!evicted) return new Lease(State.BYPASS,null,null,null);
         }
-        e=new Entry(now); entries.put(key,e); return new Lease(State.OWNER,key,e,null);
+        e=new Entry(now,Math.max(reservationMillis,Math.min(RequestTiming.MAX_REQUEST_MS+1000L,Math.max(1,pendingMillis)))); entries.put(key,e); return new Lease(State.OWNER,key,e,null);
     }
     /** Remove a stale preferred target only if it still matches; then reacquire normally. */
     public synchronized void invalidate(Key key, Target target) {

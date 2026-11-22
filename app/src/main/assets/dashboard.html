@@ -637,6 +637,18 @@
     [style*="color: #34d399"], [style*="color:#34d399"] { color: var(--primary) !important; }
     [style*="color: #f87171"], [style*="color:#f87171"] { color: var(--danger) !important; }
 
+    :root {
+      --stream-success-text: #075c39;
+      --stream-error-text: #a52725;
+      --stream-warning-text: #795000;
+    }
+    html[data-theme="dark"] {
+      --stream-success-text: #86efac;
+      --stream-error-text: #fca5a5;
+      --stream-warning-text: #fcd34d;
+    }
+    #codex-status:empty, #codex-usage-status:empty { display: none; }
+
     /* 告警条：柔和的琥珀色，不再抢视觉 */
     .warn-bar, #auth-warn, #key-warn {
       background: var(--warn-weak) !important;
@@ -1240,7 +1252,39 @@
     .checkin-operation{padding:16px 18px;background:var(--primary-weak);border:1px solid var(--card-border);border-radius:18px;margin:14px 0;font-size:12px}.checkin-operation strong{color:var(--text)}.checkin-operation p{color:var(--text-muted);line-height:1.8;margin:7px 0 0}.checkin-action{margin-top:7px;font-size:10px;color:var(--primary);line-height:1.7}.checkin-quota{margin-top:6px;font-size:12px;color:var(--text-muted)}
     @media(prefers-reduced-motion:reduce){.checkin-spinner{animation:none}.checkin-progress i,.checkin-switch span,.checkin-switch span:before{transition:none}}
 
-  </style>
+  
+.custom-api-overlay {position:fixed;inset:0;z-index:3000;background:rgba(0,0,0,.65);display:flex;justify-content:center;align-items:flex-start;overflow:auto;padding:16px;overscroll-behavior:contain;}
+.custom-api-editor {width:100%;max-width:560px;max-height:calc(100dvh - 32px);overflow:auto;padding:20px;margin:0;box-sizing:border-box;background:var(--card-bg,#161b29);}
+.custom-api-field {display:flex;flex-direction:column;gap:6px;margin:12px 0;font-size:.82rem;}
+.custom-api-field input,.custom-api-field textarea,.custom-api-field select,.custom-api-headers input {width:100%;min-width:0;box-sizing:border-box;}
+.custom-api-help {font-size:.76rem;line-height:1.65;color:var(--text-muted);overflow-wrap:anywhere;}
+.custom-api-header-row {display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.2fr) auto;gap:6px;margin:8px 0;}
+.custom-api-header-row button {padding:6px;font-size:.72rem;}
+.custom-api-actions {display:flex;gap:8px;flex-wrap:wrap;margin-top:16px;}
+.custom-api-add {margin-bottom:16px;}
+@media(max-width:390px){.custom-api-overlay{padding:8px}.custom-api-editor{padding:14px;max-height:calc(100dvh - 16px)}.custom-api-header-row{grid-template-columns:minmax(0,1fr) auto}.custom-api-header-row input:nth-child(2){grid-column:1;grid-row:2}.custom-api-header-row button{grid-column:2;grid-row:1 / 3}}
+
+.custom-model-picker {margin-top:16px;min-width:0;}
+.custom-model-picker > input {width:100%;min-width:0;box-sizing:border-box;}
+.custom-model-chips {display:flex;flex-wrap:wrap;gap:8px;margin:12px 0;min-width:0;}
+.custom-model-chip {display:inline-flex;align-items:center;gap:6px;max-width:100%;box-sizing:border-box;padding:8px 12px;border:1px solid var(--card-border);border-radius:24px;cursor:pointer;font-size:.8rem;background:var(--card-bg);}
+.custom-model-chip.selected {border-color:#a78bfa;color:var(--text-main);background:rgba(139,92,246,.14);}
+.custom-model-chip input {width:16px;height:16px;flex-shrink:0;accent-color:#8b5cf6;margin:0;}
+.custom-model-chip span {min-width:0;overflow-wrap:anywhere;word-break:break-word;}
+.custom-model-picker details {margin-top:12px;font-size:.8rem;}
+.custom-model-picker textarea {width:100%;box-sizing:border-box;margin:10px 0;}
+
+.custom-api-overlay {background:transparent}
+.custom-api-backdrop {position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:0}
+.custom-api-editor {position:relative;z-index:1}
+.custom-api-transition-surface {position:fixed;left:0;top:0;z-index:2;transform-origin:0 0;pointer-events:none;will-change:transform,opacity}
+.custom-api-heading {display:flex;align-items:center;gap:12px;margin-bottom:12px}
+.custom-api-heading h3 {margin:0;flex:1;min-width:0;outline:none}
+.custom-api-heading button {flex:none;min-height:40px}
+.custom-model-chip {transition:background-color 180ms cubic-bezier(.35,0,.26,1),border-color 180ms cubic-bezier(.35,0,.26,1),transform 220ms cubic-bezier(.2,.68,.25,1)}
+.custom-model-chip:active {transform:scale(.975);transition-duration:90ms}
+@media(prefers-reduced-motion:reduce){.custom-model-chip{transition:none}.custom-model-chip:active{transform:none}}
+</style>
   <script>
     /* 主题要在首帧前就定下来，否则会先闪一下白天再切夜间 */
     (function () {
@@ -2261,12 +2305,12 @@ html[data-theme="dark"] .glass-switch-shell {
         <button type="button" class="card-title advanced-card-trigger" id="advanced-affinity-trigger" aria-controls="advanced-affinity-body" aria-expanded="false"><span>🔗 同一会话优先沿用账号</span><span class="advanced-card-arrow" aria-hidden="true">›</span></button>
         <div class="advanced-card-body fold-container" id="advanced-affinity-body" hidden>
         <p><b>有什么用：</b>同一段对话后续调用时，尽量沿用上一次成功使用的供应商和账号/API Key，减少在多个账号之间来回切换。它不会替你保存聊天记录，也不会把对话同步给其它客户端。</p>
-        <p><b>什么时候需要：</b>商业 API 配置了多个账号或 Key，客户端又会发送固定的会话标识，并且希望同一对话尽量走同一路径时。只有一个账号、使用订阅/gift 通道或客户端不传会话标识时，通常没有必要开启。默认关闭，正常路由仍会自动运行。</p>
+        <p><b>什么时候需要：</b>这个开关控制普通商业 API Key 的会话保持，默认关闭。订阅账号池在收到可靠会话或线程标识时，已自动保持成功账号，不需要开启这里。gift 等独立通道不承诺沿用；无会话标识时仍按请求分配。</p>
         <p><b>会有什么影响：</b>请求可能更集中到同一个账号；遇到冷却、禁用或限额时仍优先保障可用性，不会强行绑定。不能保证缓存命中或减少费用。支持的会话请求头包括 x-magpie-session、x-claude-code-session-id、x-session-id、session_id、x-conversation-id；网关不会从聊天内容猜测会话。</p>
 
         <p style="font-size:0.78rem;color:var(--text-muted);line-height:1.6">默认关闭。客户端提供明确会话标识时，成功交付后尽量沿用商业供应商与凭据。冷却、禁用、移除或出站限制优先，手动路由优先；不同会话仍按原策略分流。进程重启和配置变化会清空绑定，不保证厂商缓存命中。</p>
         <label style="display:flex;gap:10px;align-items:center"><input id="affinity-enabled" type="checkbox" onchange="affinityEdited()">尽量让同一对话沿用账号（会话软亲和）</label>
-        <p style="font-size:0.75rem;color:var(--text-muted);line-height:1.6">只使用显式会话请求头，不从提示词推断。绑定保存在有界进程内存中，默认30分钟有效，首次请求预约最长60秒；容量不足时保可用性。订阅、gift及未覆盖特殊通道不承诺绑定。</p>
+        <p style="font-size:0.75rem;color:var(--text-muted);line-height:1.6">会话识别支持明确请求头、线程标识及 metadata 中明确的 session_id，不从首句、IP或用户身份推断。绑定保存在有界进程内存中，成功交付会续期，最多记忆30天，首次请求预约最长60秒；重启、配置失效或容量不足时可能重新分配。gift及独立媒体通道不承诺绑定。</p>
         <button id="affinity-save" class="btn" onclick="saveAffinity()">保存</button> <button class="btn btn-outline" onclick="loadAffinity()">读取当前设置</button>
         <div id="affinity-status" role="status" style="font-size:0.75rem;color:var(--text-muted);margin-top:8px"></div>
         </div>
@@ -2381,6 +2425,7 @@ html[data-theme="dark"] .glass-switch-shell {
       <div id="provider-catalog-route" hidden>
       <div id="provider-subview" hidden><button id="provider-back-button" type="button" class="btn btn-outline" onclick="showProviderView('list')">← 返回已接入</button><h2 id="provider-add-heading" tabindex="-1" hidden>添加供应商</h2><div id="provider-detail-info"></div></div>
       <div id="provider-catalog" hidden>
+      <div id="custom-api-add" class="card custom-api-add"><h3>第三方自定义 API</h3><p>连接自己的中转服务或本地模型，设置模型 ID、认证和请求头。</p><button type="button" class="btn btn-primary" onclick="openCustomEditor()">添加自定义 API</button></div>
       <div id="provider-catalog-heading" style="margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
         <div>
           <b style="font-size: 1.05rem; color: #fff;">⚡ 全平台免 Key 网页账号池</b>
@@ -2737,9 +2782,9 @@ html[data-theme="dark"] .glass-switch-shell {
           </div>
           <div id="models-tags-codex" style="display: flex; gap: 6px; flex-wrap: wrap; max-height: 128px; overflow-y: auto; padding: 2px;">
           </div>
-          <div id="codex-status" style="font-size: 0.72rem; color: var(--text-muted); line-height: 1.7; margin-top: 10px;">
-            支持 ChatGPT Plus / Team / Pro 订阅的 Codex 原生端点直通（<code>/backend-api/codex/responses</code>）与标准 OpenAI <code>/v1/chat/completions</code> 自动双向转译。
-          </div>
+          <div id="codex-current-accounts" role="status" style="font-size:0.72rem; color:var(--text-muted); line-height:1.7; margin-top:10px; overflow-wrap:anywhere;"></div>
+          <div id="codex-status" style="font-size:0.72rem; color:var(--text-muted); line-height:1.7; margin-top:10px;"></div>
+          <div id="codex-usage-status" role="status" style="font-size:0.72rem; color:var(--text-muted); line-height:1.7; margin-top:10px;"></div>
         </div>
 
 
@@ -3123,7 +3168,7 @@ html[data-theme="dark"] .glass-switch-shell {
           </div>
           <div>
             <div style="font-size:0.75rem;color:var(--text-muted);margin-bottom:4px;">请求体上限 (MB，0=不限)</div>
-            <input type="number" id="guard-max-body" min="0" step="0.1" placeholder="1.9">
+            <input type="number" id="guard-max-body" min="0" step="0.1" placeholder="0">
           </div>
           <div>
             <div style="font-size:0.75rem;color:var(--text-muted);margin-bottom:4px;">始终保留最近 (条消息)</div>
@@ -3647,7 +3692,7 @@ html[data-theme="dark"] .glass-switch-shell {
         enabled: cb ? cb.checked : true,
         maxContextTokens: Math.max(0, Math.round(num('guard-max-context', 0))),
         maxOutputTokens: Math.max(0, Math.round(num('guard-max-output', 0))),
-        maxBodyBytes: Math.max(0, Math.round(num('guard-max-body', 1.9) * 1048576)),
+        maxBodyBytes: Math.max(0, Math.round(num('guard-max-body', 0) * 1048576)),
         keepRecent: Math.max(0, Math.round(num('guard-keep-recent', 12))),
         reserveTokens: Math.max(0, Math.round(num('guard-reserve', 4096))),
         requestTimeoutSeconds: Math.max(15, Math.round(num('guard-read-timeout', 120)))
@@ -3662,7 +3707,7 @@ html[data-theme="dark"] .glass-switch-shell {
       const out = g.maxOutputTokens > 0 ? (g.maxOutputTokens >= 1000 ? (g.maxOutputTokens / 1000) + 'K tokens' : g.maxOutputTokens + ' tokens') : '不限制';
       let html = '<div>当前生效：最大上下文 <b style="color:#38bdf8;">' + ctx + '</b>'
         + ' · 最大输出 <b style="color:#38bdf8;">' + out + '</b>'
-        + ' · 请求体 <b style="color:#38bdf8;">' + mb + ' MB</b>'
+        + ' · 请求体 <b style="color:#38bdf8;">' + (g.maxBodyBytes > 0 ? mb + ' MB' : '不限制') + '</b>'
         + ' · 保留最近 <b style="color:#38bdf8;">' + (g.keepRecent || 0) + '</b> 条'
         + ' · 读超时 <b style="color:#38bdf8;">' + (g.requestTimeoutSeconds || 120) + 's</b></div>';
       const ls = g.lastStats;
@@ -3984,10 +4029,7 @@ html[data-theme="dark"] .glass-switch-shell {
           const d = await r.json();
           if (d.ok && d.status === 'done') {
             clearInterval(timer);
-            showToast('🎉 Codex 订阅已成功接入：' + d.account);
-            const box = document.getElementById('codex-status');
-            if (box) box.innerHTML = '<span style="color:#10a37f;">✅ 已成功接入账号 <b>' + esc(d.account) + '</b> (' + esc(d.plan || 'chatgpt') + ')</span>';
-            loadStatus();
+            await finishCodexLogin();
           }
         } catch (ignored) {}
       }, 3000);
@@ -4004,10 +4046,7 @@ html[data-theme="dark"] .glass-switch-shell {
         });
         const d = await res.json();
         if (d.ok) {
-          showToast('🎉 Codex 账号导入成功：' + d.account);
-          const box = document.getElementById('codex-status');
-          if (box) box.innerHTML = '<span style="color:#10a37f;">✅ 已成功接入账号 <b>' + esc(d.account) + '</b> (' + esc(d.plan || 'chatgpt') + ')</span>';
-          loadStatus();
+          await finishCodexLogin();
         } else {
           alert('提交失败: ' + (d.error || '未知原因'));
         }
@@ -4027,8 +4066,7 @@ html[data-theme="dark"] .glass-switch-shell {
         });
         const d = await res.json();
         if (d.ok) {
-          showToast('🎉 Codex 凭据解析导入成功：' + d.account);
-          loadStatus();
+          await finishCodexLogin();
         } else {
           alert('导入失败: ' + (d.error || '格式不符'));
         }
@@ -4037,12 +4075,22 @@ html[data-theme="dark"] .glass-switch-shell {
       }
     }
 
-    async function checkCodexUsage() {
+    async function finishCodexLogin() {
       const box = document.getElementById('codex-status');
+      if (box) box.textContent = '';
+      showToast('Codex 账号已接入');
+      await loadConfig();
+    }
+
+    async function checkCodexUsage() {
+      const box = document.getElementById('codex-usage-status');
+      const request = {};
+      if (box) box.codexUsageRequest = request;
       if (box) box.innerHTML = '<span style="color:#38bdf8;">⏳ 正在读取 ChatGPT / Codex 官方额度…</span>';
       try {
         const res = await fetch(API_BASE + '/api/codex/usage');
         const d = await res.json();
+        if (!box || box.codexUsageRequest !== request) return;
         if (!res.ok) {
           if (box) box.innerHTML = '<span style="color:#f87171;">读取用量失败: ' + esc(d.error || res.statusText) + '</span>';
           return;
@@ -4063,7 +4111,7 @@ html[data-theme="dark"] .glass-switch-shell {
         }
         if (box) box.innerHTML = txt;
       } catch (e) {
-        if (box) box.innerHTML = '<span style="color:#f87171;">请求用量异常: ' + esc(e.message) + '</span>';
+        if (box && box.codexUsageRequest === request) box.innerHTML = '<span style="color:#f87171;">请求用量异常: ' + esc(e.message) + '</span>';
       }
     }
 
@@ -6524,6 +6572,7 @@ html[data-theme="dark"] .glass-switch-shell {
     })();
 
     function switchTab(tabId, el, preserveScroll) {
+      if(typeof customEditor!=='undefined'&&customEditor&&!customEditor.busy)closeCustomEditor(true);
       if (typeof cancelStreamPing === 'function') cancelStreamPing('已切换操作，旧流式测试已取消');
       if (typeof cardMorph !== 'undefined') cardMorph.cancel();
       if (typeof providerRouteMotion !== 'undefined') providerRouteMotion.cancel();
@@ -6693,7 +6742,10 @@ html[data-theme="dark"] .glass-switch-shell {
           if (!cfg || !Array.isArray(cfg.providers)) throw Error('invalid configuration');
           const synced = new Set(['workbuddy','raccoon','zcode','qoder_cn','trae-cn','catpaw','codex','antigravity','github-copilot','minimax-code','cline']);
           const credential = p => p && p.enabled !== false && String(p.status || '').toLowerCase() !== 'placeholder' && ((Array.isArray(p.accounts) && p.accounts.some(a => a && a.enabled !== false && ['token','access','refresh','jwt'].some(k => typeof a[k] === 'string' && a[k].trim()))) || (Array.isArray(p.keys) && p.keys.some(k => typeof k === 'string' ? !!k.trim() : k && k.enabled !== false && !k.off && typeof k.key === 'string' && k.key.trim())));
-          const tasks = cfg.providers.filter(p => credential(p) && synced.has(p.id)).map(p => async () => {
+          const codexSubscription = p => Array.isArray(p.accounts) && p.accounts.some(a => a && a.enabled !== false && !a.off
+            && String(a.status || '').toLowerCase() !== 'off' && String(a.authMode || 'chatgpt').toLowerCase() === 'chatgpt'
+            && ['token', 'access', 'refresh'].some(k => typeof a[k] === 'string' && a[k].trim()));
+          const tasks = cfg.providers.filter(p => credential(p) && synced.has(p.id) && (p.id !== 'codex' || codexSubscription(p))).map(p => async () => {
             try {
               await gatewayAccessRead('/api/auth/' + encodeURIComponent(p.id) + '/sync-models', p.id === 'trae-cn' ? {method:'POST',headers:{'Content-Type':'application/json'},body:'{}'} : undefined);
             } catch (_) { failures++; }
@@ -6707,7 +6759,8 @@ html[data-theme="dark"] .glass-switch-shell {
         }
         const data = await gatewayAccessRead('/api/gateway-access');
         if (revision !== gatewayAccessRevision || policy !== gatewayAccessPolicyVersion) return;
-        if (!Array.isArray(data.models) || !data.models.every(m => m && typeof m.id === 'string' && m.id.includes('/') && typeof m.provider === 'string' && typeof m.providerName === 'string' && typeof m.name === 'string' && ['model','group'].includes(m.kind))) throw Error('invalid inventory');
+        // Public IDs are opaque. Custom API models can use the upstream model name without a slash.
+        if (!Array.isArray(data.models) || !data.models.every(m => m && typeof m.id === 'string' && m.id.trim() && typeof m.provider === 'string' && typeof m.providerName === 'string' && typeof m.name === 'string' && ['model','group'].includes(m.kind))) throw Error('invalid inventory');
         const seen = new Set(); gatewayAccessRows = data.models.filter(m => !seen.has(m.id) && seen.add(m.id));
         gatewayAccessReady = true; gatewayAccessLast = Date.now();
         const filter = document.getElementById('access-provider-filter'), previous = filter ? filter.value : '';
@@ -7474,15 +7527,190 @@ html[data-theme="dark"] .glass-switch-shell {
     let providerKeysSaving = false;
     let providerRefreshNeeded = false, providerExpandDisabled = false, commercialRenderDeferred = false, providerConfigError = false;
     let providerView = 'list', providerDetail = '', providerListSig = '', providerListScroll = 0;
+// Header templates adapted from the pinned Magpie headerpresets.js (2026-11-11).
+// They are editable examples, not current-version claims or an auth bypass.
+const CUSTOM_HEADER_PRESETS = [
+  {name:'All In（默认）',headers:[['User-Agent','AllIn-CustomAPI/1.0 (Android)']]},
+  {name:'Codex CLI',headers:[['originator','codex_cli_rs'],['User-Agent','codex_cli_rs/0.167.0 (Mac OS 26.6.0; arm64) Apple_Terminal/455'],['version','0.167.0']]},
+  {name:'Gemini CLI',headers:[['User-Agent','GeminiCLI/0.67.0/gemini-2.5-pro (darwin; arm64; terminal)']]},
+  {name:'OpenCode',headers:[['User-Agent','opencode/latest/2.2.7/cli']]},
+  {name:'Kilo Code',headers:[['HTTP-Referer','https://kilocode.ai'],['X-Title','Kilo Code'],['User-Agent','Kilo-Code/7.8.27'],['X-KILOCODE-EDITORNAME','Kilo CLI 7.8.27']]},
+  {name:'Cline',headers:[['HTTP-Referer','https://cline.bot'],['X-Title','Cline'],['X-CLIENT-TYPE','cline-desktop'],['X-CLIENT-VERSION','3.5.54'],['User-Agent','Cline/3.5.54']]},
+  {name:'Roo Code',headers:[['HTTP-Referer','https://github.com/RooVetGit/Roo-Cline'],['X-Title','Roo Code'],['User-Agent','RooCode/3.53.0']]},
+  {name:'Cherry Studio',headers:[['HTTP-Referer','https://cherry-ai.com'],['X-Title','Cherry Studio']]}
+];
+function customApplyPreset(rows,preset) {
+  for(let i=rows.length-1;i>=0;i--) if(!rows[i][0].trim()&&!rows[i][1].trim()) rows.splice(i,1);
+  for(const [name,value] of preset.headers) {
+    const found=rows.find(row=>row[0].trim().toLowerCase()===name.toLowerCase());
+    if(!found) rows.push([name,value]); else if(!found[1].trim()) found[1]=value;
+  }
+}
+function customHeadersOf(rows) {
+  const out=Object.create(null),seen=new Set();
+  for(const [rawName,rawValue] of rows) {
+    if(!rawName.trim()&&!rawValue.trim()) continue;
+    const name=rawName.trim(),key=name.toLowerCase();
+    if(!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name)||seen.has(key)) throw new Error('请求头名称无效或大小写重复');
+    if(/[^\x20-\x7e]/.test(rawValue)) throw new Error('请求头必须是单行 ASCII，JSON 请压成一行');
+    seen.add(key);out[name]=rawValue.trim();
+  }
+  return out;
+}
+const customEditorMotion = (() => {
+  const ease='cubic-bezier(.35,0,.26,1)',duration=440;
+  let active=null;const reveals=new WeakMap();
+  const reduced=()=>typeof window==='undefined'||!!window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches;
+  function capture(node){if(!node?.isConnected)return null;const rect=node.getBoundingClientRect();return rect.width&&rect.height&&rect.bottom>0&&rect.top<innerHeight?rect:null;}
+  function origin(trigger){return trigger?.closest?.('.custom-api-add,.provider-detail-heading')||(trigger?.matches?.('button,[role="button"]')?trigger:null);}
+  function stop(){if(!active)return;const state=active;active=null;state.animations.forEach(a=>a.cancel());state.surface?.remove();state.editor.box.removeAttribute('data-custom-editor-motion');state.resolve();}
+  function finish(editor){if(!editor||active?.editor===editor)stop();}
+  function play(editor,closing){
+    const prior=active?.editor===editor?active:null;
+    const current=prior?.surface?.getBoundingClientRect();const opacity=getComputedStyle(editor.box).opacity;const backdropOpacity=getComputedStyle(editor.backdrop).opacity;
+    stop();const box=editor.box,target=capture(box);
+    if(!target||reduced()||typeof box.animate!=='function')return Promise.resolve();
+    const anchor=capture(editor.origin)||editor.originRect;
+    const small={left:target.left+target.width*.03,top:target.top+18,width:target.width*.94,height:target.height*.94};
+    const from=closing?(current||target):(anchor||small),to=closing?(anchor||small):target;
+    const surface=document.createElement('div');surface.className='custom-api-transition-surface';surface.setAttribute('aria-hidden','true');
+    surface.style.background=getComputedStyle(box).background;surface.style.borderRadius=getComputedStyle(box).borderTopLeftRadius;
+    const width=Math.max(from.width,to.width),height=Math.max(from.height,to.height);surface.style.width=width+'px';surface.style.height=height+'px';
+    const transform=r=>`translate3d(${r.left}px,${r.top}px,0) scale(${r.width/width},${r.height/height})`;
+    editor.overlay.appendChild(surface);box.setAttribute('data-custom-editor-motion',closing?'closing':'opening');
+    const geometry=surface.animate([{transform:transform(from),opacity:1},{transform:transform(to),opacity:1,offset:.84},{transform:transform(to),opacity:0}],{duration,easing:ease,fill:'both'});
+    const content=box.animate(closing?[{opacity},{opacity:0,offset:.32},{opacity:0}]:[{opacity:0},{opacity:0,offset:.38},{opacity:1}],{duration,easing:ease,fill:'both'});
+    const backdrop=editor.backdrop.animate(closing?[{opacity:backdropOpacity},{opacity:0}]:[{opacity:0},{opacity:1}],{duration:closing?360:300,easing:ease,fill:'both'});
+    let resolve;const done=new Promise(r=>resolve=r);const state=active={editor,surface,animations:[geometry,content,backdrop],resolve};
+    geometry.finished.then(()=>{if(active===state)stop();},()=>{if(active===state)stop();});return done;
+  }
+  function reveal(node){reveals.get(node)?.cancel();if(reduced()||!node?.animate)return;const animation=node.animate([{opacity:.62,transform:'translateY(4px)'},{opacity:1,transform:'translateY(0)'}],{duration:220,easing:'cubic-bezier(.2,.68,.25,1)'});reveals.set(node,animation);animation.finished.then(()=>{if(reveals.get(node)===animation){reveals.delete(node);animation.cancel();}},()=>{});}
+  function settleOtherMotion(){if(typeof cardMorph!=='undefined')cardMorph.cancel();if(typeof tabMotion!=='undefined')tabMotion.finish();if(typeof providerRouteMotion!=='undefined')providerRouteMotion.cancel();if(typeof glassMenu!=='undefined')glassMenu.dismiss(false,false);}
+  function begin(editor){settleOtherMotion();editor.origin=origin(editor.trigger);editor.originRect=capture(editor.origin);return play(editor,false);}
+  let installed=false;
+  function listen(){if(installed||typeof window==='undefined')return;installed=true;window.matchMedia?.('(prefers-reduced-motion: reduce)')?.addEventListener?.('change',()=>finish());let width=document.documentElement.clientWidth;window.addEventListener('resize',()=>{const next=document.documentElement.clientWidth;if(next!==width){width=next;finish();}});document.addEventListener('visibilitychange',()=>{if(document.hidden)finish();});}
+  return {open(editor){listen();return begin(editor);},close(editor){return play(editor,true);},finish,reveal};
+})();
+let customEditor=null;
+function closeCustomEditor(skipMotion=false) {
+  const editor=customEditor;if(!editor||editor.busy)return Promise.resolve(false);
+  if(editor.closing)return editor.closePromise;
+  editor.closing=true;editor.cancelPreview?.();editor.box.inert=true;
+  if(typeof glassMenu!=='undefined')glassMenu.dismiss(false,false);
+  const done=skipMotion?(customEditorMotion.finish(editor),Promise.resolve()):customEditorMotion.close(editor);
+  editor.closePromise=done.then(()=>{if(customEditor!==editor)return false;editor.overlay.remove();customEditor=null;
+    if(editor.trigger?.isConnected)editor.trigger.focus({preventScroll:true});return true;});
+  return editor.closePromise;
+}
+function openCustomEditor(id='') {
+  if(customEditor) {if(customEditor.closing)customEditor.closePromise.then(()=>openCustomEditor(id));else customEditor.heading?.focus({preventScroll:true});return;}
+  const saved=id?(appConfig?.providers||[]).find(p=>p.id===id&&p.type==='custom-api'):null;
+  if(id&&!saved) return;
+  const p=saved||{id:'custom-'+(window.crypto?.randomUUID?.()||Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,10)).slice(0,36),name:'',baseUrl:'',protocol:'openai',authMode:'auto',keys:[],models:[],headers:{},enabled:true};
+  const rows=Object.entries(p.headers||{}).map(([k,v])=>[k,String(v)]);
+  const trigger=document.activeElement;
+  const overlay=document.createElement('div');overlay.className='custom-api-overlay';
+  const backdrop=document.createElement('div');backdrop.className='custom-api-backdrop';backdrop.setAttribute('aria-hidden','true');overlay.appendChild(backdrop);
+  const box=document.createElement('form');box.className='custom-api-editor card';box.setAttribute('role','dialog');box.setAttribute('aria-modal','true');box.setAttribute('aria-labelledby','custom-api-title');
+  const headingRow=document.createElement('div');headingRow.className='custom-api-heading';
+  const back=document.createElement('button');back.type='button';back.className='btn btn-outline';back.textContent='返回';back.setAttribute('data-custom-editor-back','');back.onclick=()=>closeCustomEditor();
+  const heading=document.createElement('h3');heading.id='custom-api-title';heading.tabIndex=-1;heading.textContent=saved?'编辑自定义供应商':'添加自定义 API 供应商';headingRow.append(back,heading);box.appendChild(headingRow);
+  function field(label,value,kind='text') {const wrap=document.createElement('label');wrap.className='custom-api-field';const caption=document.createElement('span');caption.textContent=label;const input=document.createElement('input');input.type=kind;input.value=value;input.autocomplete='off';wrap.append(caption,input);box.appendChild(wrap);return input;}
+  const name=field('名称',p.name);name.maxLength=80;name.required=true;
+  // Provider identity stays internal; users only name their supplier.
+  const base=field('API 根地址',p.baseUrl,'url');base.placeholder='https://api.example.com/v1';base.required=true;
+  const note=document.createElement('p');note.className='custom-api-help';note.textContent='根域名会补 /v1；已有路径保持原样。可粘贴完整 /chat/completions、/responses 或 /messages 地址，保存时去掉末尾接口路径。HTTP 不加密，只在可信网络使用。';box.appendChild(note);
+  function select(label,options,value) {const wrap=document.createElement('label');wrap.className='custom-api-field';const text=document.createElement('span');text.textContent=label;const input=document.createElement('select');for(const [v,n]of options){const option=document.createElement('option');option.value=v;option.textContent=n;input.appendChild(option);}input.value=value;wrap.append(text,input);box.appendChild(wrap);return input;}
+  const protocol=select('上游协议',[['openai','OpenAI Chat Completions'],['responses','OpenAI Responses'],['anthropic','Anthropic Messages']],p.protocol);
+  const auth=select('认证方式',[['auto','标准认证（OpenAI Bearer / Anthropic x-api-key）'],['headers','仅自定义请求头'],['none','无认证（本地模型等）']],p.authMode);
+  const key=field('API Key（每行一个，留空保留已存 Key）','','password');key.autocomplete='new-password';
+  // API keys commonly contain punctuation; newline-separated multi-key input is an explicit textarea.
+  const keysText=document.createElement('textarea');keysText.rows=2;keysText.placeholder='多个新 Key 每行一个；留空不改已有 Key';keysText.autocomplete='off';keysText.setAttribute('aria-label','API Key 列表');keysText.hidden=true;
+  const many=document.createElement('button');many.type='button';many.className='btn btn-outline';many.textContent='填写多个 Key';many.onclick=()=>{keysText.hidden=!keysText.hidden;key.hidden=!keysText.hidden;many.textContent=keysText.hidden?'填写多个 Key':'填写单个 Key';};box.append(many,keysText);
+  const clearWrap=document.createElement('label'),clear=document.createElement('input');clear.type='checkbox';clearWrap.append(clear,document.createTextNode('清空已保存的 Key'));box.appendChild(clearWrap);
+  const modelArea=document.createElement('section');modelArea.className='custom-model-picker';modelArea.setAttribute('aria-label','选择入池模型');
+  const modelTitle=document.createElement('h4');modelTitle.textContent='选择入池模型';modelArea.appendChild(modelTitle);
+  let candidateIds=Array.from(new Set([...(p.catalogModels||[]),...(p.models||[])]));
+  const selectedModels=new Set(p.models||[]);let modelPage=0;
+  const toolbar=document.createElement('div');toolbar.className='custom-api-actions';
+  const fetchModels=document.createElement('button');fetchModels.type='button';fetchModels.className='btn btn-primary';fetchModels.textContent='拉取云端模型';fetchModels.setAttribute('data-custom-fetch-models','');toolbar.appendChild(fetchModels);
+  const selectAll=document.createElement('button');selectAll.type='button';selectAll.className='btn btn-outline';selectAll.textContent='全选';
+  const selectNone=document.createElement('button');selectNone.type='button';selectNone.className='btn btn-outline';selectNone.textContent='全不选';toolbar.append(selectAll,selectNone);modelArea.appendChild(toolbar);
+  const modelHelp=document.createElement('p');modelHelp.className='custom-api-help';modelHelp.textContent='先填好 API 地址、Key 和需要的请求头，再拉取。新候选默认不勾选，只把勾选的模型入池；已有选择保留。此操作只读取目录，不发送推理请求。';modelArea.appendChild(modelHelp);
+  const search=document.createElement('input');search.type='search';search.placeholder='搜索模型';search.setAttribute('aria-label','搜索云端模型');modelArea.appendChild(search);
+  const modelStatus=document.createElement('p');modelStatus.className='custom-api-help';modelStatus.setAttribute('role','status');modelStatus.setAttribute('data-custom-model-count','');modelArea.appendChild(modelStatus);
+  const chips=document.createElement('div');chips.className='custom-model-chips';chips.setAttribute('data-custom-model-chips','');modelArea.appendChild(chips);
+  const pager=document.createElement('div');pager.className='custom-api-actions';modelArea.appendChild(pager);
+  const manual=document.createElement('details');const manualTitle=document.createElement('summary');manualTitle.textContent='手动补充模型（云端不提供目录时）';manual.appendChild(manualTitle);
+  const manualModels=document.createElement('textarea');manualModels.rows=2;manualModels.placeholder='模型 ID 每行一个，不加内部供应商前缀';manualModels.setAttribute('aria-label','手动补充候选模型');manual.appendChild(manualModels);
+  const addManual=document.createElement('button');addManual.type='button';addManual.className='btn btn-outline';addManual.textContent='添加到候选列表';manual.appendChild(addManual);modelArea.appendChild(manual);box.appendChild(modelArea);
+  function countModels(){modelStatus.textContent='已选 '+selectedModels.size+' / '+candidateIds.length+' 个模型；未选模型不入池。';}
+  function drawModels(){const filtered=candidateIds.filter(m=>m.toLowerCase().includes(search.value.trim().toLowerCase()));const pages=Math.max(1,Math.ceil(filtered.length/100));modelPage=Math.min(modelPage,pages-1);chips.replaceChildren();
+    for(const model of filtered.slice(modelPage*100,(modelPage+1)*100)){const chip=document.createElement('label');chip.className='custom-model-chip'+(selectedModels.has(model)?' selected':'');const check=document.createElement('input');check.type='checkbox';check.checked=selectedModels.has(model);check.setAttribute('aria-label',model);check.dataset.modelId=model;const text=document.createElement('span');text.textContent=model;check.onchange=()=>{if(check.checked)selectedModels.add(model);else selectedModels.delete(model);chip.classList.toggle('selected',check.checked);countModels();};chip.append(check,text);chips.appendChild(chip);}
+    if(!filtered.length){const empty=document.createElement('p');empty.className='custom-api-help';empty.textContent=candidateIds.length?'没有匹配的模型':'尚未读取模型，也可手动添加候选。';chips.appendChild(empty);}pager.replaceChildren();
+    if(pages>1){const previous=document.createElement('button');previous.type='button';previous.textContent='上一页';previous.className='btn btn-outline';previous.disabled=modelPage===0;previous.onclick=()=>{modelPage--;drawModels();};const next=document.createElement('button');next.type='button';next.textContent='下一页';next.className='btn btn-outline';next.disabled=modelPage===pages-1;next.onclick=()=>{modelPage++;drawModels();};const at=document.createElement('span');at.textContent=(modelPage+1)+' / '+pages;pager.append(previous,at,next);}countModels();}
+  search.oninput=()=>{modelPage=0;drawModels();};selectAll.onclick=()=>{for(const m of candidateIds)selectedModels.add(m);drawModels();customEditorMotion.reveal(chips);};selectNone.onclick=()=>{selectedModels.clear();drawModels();customEditorMotion.reveal(chips);};
+  addManual.onclick=()=>{const additions=manualModels.value.split(/\r?\n/).map(m=>m.trim()).filter(Boolean);if(additions.some(m=>m.length>256||/\s/.test(m))){showToast('模型 ID 不可含空白且最长 256 字符');return;}const merged=Array.from(new Set([...candidateIds,...additions]));if(merged.length>2000){showToast('最多 2000 个候选模型');return;}candidateIds=merged;manualModels.value='';modelPage=0;drawModels();};drawModels();
+  let previewSerial=0,previewAbort;
+  function connectionDraft(){const entered=(keysText.hidden?key.value:keysText.value).split(/\r?\n/).map(v=>v.trim()).filter(Boolean);return {id:p.id,name:name.value.trim()||'自定义 API',baseUrl:base.value.trim(),protocol:protocol.value,authMode:auth.value,keys:clear.checked?[]:entered.length?entered:p.keys,headers:customHeadersOf(rows),enabled:enabled.checked,models:[],catalogModels:[]};}
+  fetchModels.onclick=async()=>{const editor=customEditor;const serial=++previewSerial;try{const draft=connectionDraft();if(!draft.baseUrl)throw new Error('先填写 API 根地址');if(draft.authMode==='auto'&&!draft.keys.some(k=>k.trim()))throw new Error('先填写 API Key，或选择正确的认证方式');
+    previewAbort?.abort();previewAbort=typeof AbortController==='function'?new AbortController():null;fetchModels.disabled=true;modelStatus.textContent='正在拉取云端模型…';
+    const signature=JSON.stringify(draft);const response=await fetch(API_BASE+'/api/providers/custom/catalog',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(withProviderToken({provider:draft},saved?providerTokenAtOpen:undefined)),...(previewAbort?{signal:previewAbort.signal}:{})});const result=await response.json();
+    if(customEditor!==editor||serial!==previewSerial)return;
+    if(signature!==JSON.stringify(connectionDraft()))throw new Error('地址或认证已经改变，旧查询结果已丢弃，请重新拉取');
+    if(!response.ok||result.ok!==true)throw new Error(errText(result.error,'模型目录读取失败'));
+    if(result.providerId!==p.id||result.saved!==false||!Array.isArray(result.models)||result.models.some(m=>typeof m!=='string'||!m.trim())||result.models.length>2000)throw new Error('模型目录回执格式无效，原勾选保留');
+    const merged=Array.from(new Set([...result.models,...selectedModels]));if(merged.length>2000)throw new Error('云端候选与保留选项超过 2000 个，请先减少选项');candidateIds=merged;modelPage=0;drawModels();customEditorMotion.reveal(chips);
+  }catch(error){if(customEditor===editor&&serial===previewSerial)modelStatus.textContent=error.name==='AbortError'?'查询已取消，原勾选保留':error.message;}
+  finally{if(customEditor===editor&&serial===previewSerial)fetchModels.disabled=false;}};
+  const hTitle=document.createElement('h4');hTitle.textContent='请求头';box.appendChild(hTitle);
+  const help=document.createElement('p');help.className='custom-api-help';help.textContent='预设仅作可编辑模板，不覆盖已填写的同名值，也不保证供应商放行。已保存的请求头值不回显；留空或未编辑保持原值，删除行才移除。认证请求头须选「仅自定义请求头」，危险传输头会被拒绝。';box.appendChild(help);
+  const presets=select('请求头预设',[['','选择预设…'],...CUSTOM_HEADER_PRESETS.map((x,i)=>[String(i),x.name])],'');
+  const headers=document.createElement('div');headers.className='custom-api-headers';box.appendChild(headers);
+  function drawHeaders() {headers.replaceChildren();for(const row of rows){const line=document.createElement('div');line.className='custom-api-header-row';const h=document.createElement('input');h.value=row[0];h.placeholder='Header-Name';h.setAttribute('aria-label','请求头名称');h.oninput=()=>{row[0]=h.value;};const value=document.createElement('input');const secret=/^allin-secret-ref:[0-9a-f]{64}$/i.test(row[1]);value.type='password';value.value=secret?'':row[1];value.placeholder=secret?'已保存，留空保持':'Value';value.setAttribute('aria-label','请求头值');value.autocomplete='new-password';value.oninput=()=>{row[1]=value.value|| (secret?p.headers[row[0]]:'');};const del=document.createElement('button');del.type='button';del.textContent='移除';del.className='btn btn-outline';del.onclick=()=>{rows.splice(rows.indexOf(row),1);drawHeaders();};line.append(h,value,del);headers.appendChild(line);}}
+  presets.onchange=()=>{const selected=CUSTOM_HEADER_PRESETS[Number(presets.value)];if(presets.value!==''&&selected){customApplyPreset(rows,selected);drawHeaders();}presets.value='';};drawHeaders();
+  const add=document.createElement('button');add.type='button';add.className='btn btn-outline';add.textContent='添加请求头';add.onclick=()=>{if(rows.length>=32){showToast('最多 32 个请求头');return;}rows.push(['','']);drawHeaders();headers.lastChild?.querySelector('input')?.focus();};box.appendChild(add);
+  const enabledWrap=document.createElement('label'),enabled=document.createElement('input');enabled.type='checkbox';enabled.checked=p.enabled!==false;enabledWrap.append(enabled,document.createTextNode('启用此供应商'));box.appendChild(enabledWrap);
+  const status=document.createElement('p');status.setAttribute('role','status');status.className='custom-api-help';box.appendChild(status);
+  const actions=document.createElement('div');actions.className='custom-api-actions';const cancel=document.createElement('button');cancel.type='button';cancel.className='btn btn-outline';cancel.textContent='取消';cancel.onclick=()=>closeCustomEditor();const save=document.createElement('button');save.type='submit';save.className='btn btn-primary';save.textContent='保存供应商';actions.append(cancel,save);box.appendChild(actions);
+  overlay.appendChild(box);document.body.appendChild(overlay);customEditor={overlay,box,backdrop,heading,trigger,busy:false,closing:false,cancelPreview:()=>{previewSerial++;previewAbort?.abort();}};
+  const editorAtOpen=customEditor;let backdropDown=false;
+  overlay.addEventListener('pointerdown',e=>{backdropDown=e.target===overlay||e.target===backdrop;});
+  overlay.onclick=e=>{if(backdropDown&&(e.target===overlay||e.target===backdrop))closeCustomEditor();backdropDown=false;};
+  heading.focus({preventScroll:true});editorAtOpen.openPromise=customEditorMotion.open(editorAtOpen);
+  box.onkeydown=e=>{if(e.key==='Escape'&&!e.defaultPrevented){e.preventDefault();if(typeof glassMenu==='undefined'||!glassMenu.dismiss())closeCustomEditor();}if(e.key==='Tab'){const controls=[...box.querySelectorAll('input,select,textarea,button')].filter(x=>!x.disabled&&!x.hidden&&x.getClientRects().length);const first=controls[0],last=controls[controls.length-1];if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus();}else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus();}}};
+  box.onsubmit=async e=>{e.preventDefault();if(customEditor.busy)return;try{
+    const draft=connectionDraft();draft.name=name.value.trim();draft.models=candidateIds.filter(m=>selectedModels.has(m));draft.catalogModels=candidateIds;
+    customEditor.busy=true;save.disabled=true;cancel.disabled=true;back.disabled=true;status.textContent='正在保存…';
+    await customProviderWrite(withProviderToken({action:'save',provider:draft},saved?providerTokenAtOpen:undefined),draft.id);
+    customEditor.busy=false;await closeCustomEditor();showProviderView('detail',draft.id);showToast('自定义供应商已保存');
+  }catch(error){if(customEditor){customEditor.busy=false;save.disabled=false;cancel.disabled=false;back.disabled=false;status.textContent=error.message;}}};
+  const providerTokenAtOpen=saved?providerToken(id):undefined;
+}
+async function customProviderWrite(body,id) {
+  if(providerWrites.has(id)) throw new Error('此供应商正在保存，请稍后');
+  providerWrites.add(id);providerWriteRevision++;
+  try {const response=await fetch(API_BASE+'/api/providers/custom',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await response.json();
+    if(!response.ok||data.ok!==true)throw new Error(errText(data.error,'保存失败'));
+    if(data.providerId!==id||data.action!==body.action)throw new Error('回执不完整，保存结果未确认；请刷新后核对');
+  }catch(error){throw new Error(error.message||'保存结果未确认；请刷新后核对，不要重复提交');}
+  finally{providerWrites.delete(id);providerWriteRevision++;await loadConfig();}
+}
+async function removeCustomProvider(id) {
+  const p=(appConfig?.providers||[]).find(x=>x.id===id&&x.type==='custom-api');if(!p||!confirm('删除「'+p.name+'」及其自定义 Key、请求头和模型？已有路由组引用不会自动改指向其他供应商。'))return;
+  try{await customProviderWrite(withProviderToken({action:'remove',providerId:id},providerToken(id)),id);showProviderView('list');showToast('已删除自定义供应商');}catch(error){showToast(error.message);}
+}
+
     function providerCounts(p) {
       const accountRequired = ['antigravity','qoder_cn','catpaw','github-copilot','minimax-code','trae-cn','deepseek_web','loomy'].includes(p.id);
       const keys = new Set((Array.isArray(p.keys) ? p.keys : []).map(k => typeof k === 'string' ? k.trim() : (k && typeof k === 'object' && typeof k.key === 'string' ? k.key.trim() : '')).filter(Boolean));
       const accounts = (Array.isArray(p.accounts) ? p.accounts : []).filter(a => a && typeof a === 'object' && !Array.isArray(a) && ['token','access','accessToken','refresh','refreshToken','jwt','apiKey'].some(k => typeof a[k] === 'string' && a[k].trim()));
       // Saved disabled accounts remain manageable; expired login mirrors alone are not accounts.
       const models = ['minimax-code', 'codex'].includes(p.id) ? providerModelCardCatalog(p, mediaModelsFor(p.id)).models : p.models;
-      return {keys:accountRequired ? 0 : keys.size, accounts:accounts.length, models:Array.isArray(models) ? models.length : 0};
+      const codexKeys = p.id === 'codex' ? appConfig?.codexIndependentKeyCount : undefined;
+      return {keys:accountRequired ? 0 : (codexKeys ?? keys.size), accounts:accounts.length, models:Array.isArray(models) ? models.length : 0};
     }
-    function providerConfigured(p) { const c = providerCounts(p); return c.keys > 0 || c.accounts > 0; }
+    function providerConfigured(p) { const c = providerCounts(p); return p.type === 'custom-api' || c.keys > 0 || c.accounts > 0; }
     function providerEnabled(p) { return p.enabled !== false; }
     const providerRouteMotion = (() => {
       const preference = window.matchMedia?.('(prefers-reduced-motion: reduce)');
@@ -7607,6 +7835,7 @@ html[data-theme="dark"] .glass-switch-shell {
     }
     // Android system back must unwind in-page navigation before leaving the activity.
     window.allInHandleBack = function () {
+      if(typeof customEditor !== 'undefined' && customEditor) { if(typeof glassMenu!=='undefined'&&glassMenu.dismiss())return true;closeCustomEditor(); return true; }
       const visible = id => {
         const node = document.getElementById(id);
         return !!(node && !node.hidden && node.style.display && node.style.display !== 'none');
@@ -7644,6 +7873,7 @@ html[data-theme="dark"] .glass-switch-shell {
       if (atList && catalogRoute?.hasAttribute?.('data-provider-departing')) return;
       sub.hidden = atList;
       catalog.hidden = atList;
+      const customAdd = document.getElementById('custom-api-add'); if(customAdd) customAdd.hidden = providerView !== 'add';
       const headingEl = document.getElementById('provider-catalog-heading'); if (headingEl) headingEl.hidden = providerView !== 'add';
       const addHeading = document.getElementById('provider-add-heading'); if (addHeading) addHeading.hidden = providerView !== 'add';
       const cards = document.getElementById('all-providers-cards-container');
@@ -7674,6 +7904,13 @@ html[data-theme="dark"] .glass-switch-shell {
       hero.appendChild(icon);
       hero.appendChild(heading);
       info.appendChild(hero);
+      if(p.type==='custom-api') {
+        const detail=document.createElement('p');detail.textContent=p.baseUrl+' · '+({openai:'Chat Completions',responses:'Responses',anthropic:'Messages'}[p.protocol]||p.protocol);detail.style.overflowWrap='anywhere';info.appendChild(detail);
+        const actions=document.createElement('div');actions.className='custom-api-actions';
+        for(const [label,fn]of [['编辑配置',()=>openCustomEditor(p.id)],['选择模型',()=>openCustomEditor(p.id)],['删除供应商',()=>removeCustomProvider(p.id)]]){const button=document.createElement('button');button.type='button';button.className='btn btn-outline';button.textContent=label;button.onclick=fn;button.disabled=providerWrites.has(p.id);actions.appendChild(button);}info.appendChild(actions);
+        const modelList=document.createElement('p');modelList.textContent='模型（'+(p.models||[]).length+'）：'+(p.models||[]).slice(0,60).join('、')+((p.models||[]).length>60?' …':'');modelList.style.overflowWrap='anywhere';info.appendChild(modelList);
+        const help=document.createElement('p');help.textContent='客户端显示真实模型名；重名时附简短供应商区分。编辑菜单可拉取并勾选模型，只有勾选项入池。旧调用地址继续兼容选中模型。';info.appendChild(help);return;
+      }
       const c = providerCounts(p), desc = document.createElement('p'); desc.textContent = '账号 ' + c.accounts + ' · Key ' + c.keys + ' · 模型 ' + c.models + '（配置） · ' + (providerConfigured(p) ? '已配置' : '待接入'); info.appendChild(desc);
       if (c.accounts) { const b = document.createElement('button'); b.className = 'btn btn-outline'; b.textContent = '管理账号'; b.onclick = () => manageProviderAccounts(p.id); info.appendChild(b); }
       if (p.id === 'loomy') { const login = document.createElement('button'); login.className = 'btn btn-outline'; login.textContent = '短信登录'; login.onclick = showLoomyLogin; info.appendChild(login); }
@@ -7703,7 +7940,7 @@ html[data-theme="dark"] .glass-switch-shell {
         button.onclick = () => saveAccountRouting(provider.id,value); options.appendChild(button);
       }); area.appendChild(options);
       const help = document.createElement('p'); help.style.cssText = 'font-size:.76rem;line-height:1.7;color:var(--text-muted);margin:0;';
-      help.textContent = '轮流按请求分配。均衡优先使用额度比例较充足的账号；数据不全时按近期可信 Token 和在途负载分配。到期优先按将作废的额度与剩余时间排序，缺少到期数据时回退均衡。每笔请求用量不同，不能保证积分严格等额。设置只作用于本供应商，单账号仍可保存。'; area.appendChild(help);
+      help.textContent = '订阅账号池：新对话按所选策略分配，找到成功账号后，续聊及工具回传保持该账号；确认限流、额度不足或账号失效后才安全接替。优先识别明确会话或线程标识；无标识时，可用已成功回复的完整历史衔接续聊。同首句不合并，歧义、历史丢失或超限时重新分配。均衡优先比较可信额度，数据不全时比较近期 Token 和在途负载；到期数据缺失时回退均衡。每笔请求用量不同，不能保证积分严格等额。设置只作用于本供应商。普通 API Key 的会话保持由高级设置控制。'; area.appendChild(help);
       const status = document.createElement('p'); status.setAttribute('role','status'); status.style.cssText = 'font-size:.74rem;color:var(--text-muted);overflow-wrap:anywhere;'; status.textContent = '展开后可查看当前分配依据。'; area.appendChild(status);
       area.ontoggle = async () => { if (!area.open) { accountRoutingExpanded.delete(provider.id); return; } accountRoutingExpanded.add(provider.id); status.textContent = '正在读取分配依据…';
         try { const response = await fetch(API_BASE + '/api/providers/account-routing?provider=' + encodeURIComponent(provider.id)); const data = await response.json();
@@ -8404,8 +8641,10 @@ html[data-theme="dark"] .glass-switch-shell {
     /** 供应商是否已有可用凭据（账号或 key）；没有就等于没登录，模型列表不该显示 */
     function providerHasCredential(prov) {
       if (!prov || prov.enabled === false || String(prov.status || '').toLowerCase() === 'placeholder') return false;
+      if(prov.type==='custom-api' && ['headers','none'].includes(prov.authMode)) return true;
       const accs = Array.isArray(prov.accounts) ? prov.accounts : [];
       if (accs.some(a => a && a.enabled !== false && ['token','access','refresh','jwt'].some(k => typeof a[k] === 'string' && a[k].trim()))) return true;
+      if (prov.id === 'codex' && Number.isInteger(appConfig?.codexIndependentKeyCount)) return appConfig.codexIndependentKeyCount > 0;
       const keys = Array.isArray(prov.keys) ? prov.keys : [];
       return keys.some(k => typeof k === 'string' ? !!k.trim() : k && k.enabled !== false && !k.off && typeof k.key === 'string' && !!k.key.trim());
     }
@@ -10626,15 +10865,16 @@ html[data-theme="dark"] .glass-switch-shell {
         if (!out) return;
         const el = Math.round(performance.now() - t0);
         out.style.display = 'block';
-        out.style.background = streamError || (note && note.color === '#f87171') ? 'rgba(239,68,68,0.08)' : 'rgba(16,185,129,0.08)';
-        out.style.border = streamError || (note && note.color === '#f87171') ? '1px solid rgba(239,68,68,0.3)' : '1px solid rgba(16,185,129,0.3)';
-        out.style.color = streamError || (note && note.color === '#f87171') ? '#fecaca' : '#d1fae5';
+        const failed = streamError || note?.tone === 'error';
+        out.style.background = failed ? 'rgba(239,68,68,0.08)' : 'rgba(16,185,129,0.08)';
+        out.style.border = failed ? '1px solid rgba(239,68,68,0.3)' : '1px solid rgba(16,185,129,0.3)';
+        out.style.color = failed ? 'var(--stream-error-text)' : 'var(--stream-success-text)';
         out.innerHTML = '<b>🌊 ' + escapeHtml(model) + '</b>'
-          + '<span style="font-size:0.7rem;color:#6b7280;"> · 首字 ' + Math.round(firstAt || 0)
+          + '<span style="font-size:0.7rem;"> · 首字 ' + Math.round(firstAt || 0)
           + 'ms · ' + chunks + ' chunk · ' + el + 'ms</span>'
           + '<div style="margin-top:8px;white-space:pre-wrap;line-height:1.7;">'
-          + escapeHtml(text) + (final ? '' : '<span style="color:#34d399;">▌</span>') + '</div>'
-          + (note ? '<div style="margin-top:8px;font-size:0.7rem;color:' + note.color + ';">' + note.text + '</div>' : '');
+          + escapeHtml(text) + (final ? '' : '▌') + '</div>'
+          + (note ? '<div style="margin-top:8px;font-size:0.7rem;color:var(--stream-' + note.tone + '-text);">' + note.text + '</div>' : '');
       };
 
       paint(false, null);
@@ -10685,7 +10925,7 @@ html[data-theme="dark"] .glass-switch-shell {
         const span = firstAt === null || lastAt === null ? 0 : Math.max(0, Math.round(lastAt - firstAt));
         const spaced = !err && chunks > 1 && span >= 15;
         paint(true, {
-          color: err ? '#f87171' : (spaced ? '#34d399' : '#fbbf24'),
+          tone: err ? 'error' : (spaced ? 'success' : 'warning'),
           text: err ? ('流式失败：' + escapeHtml(err))
                     : spaced ? '✅ SSE 完整：收到 ' + chunks + ' 个内容增量帧，首末跨度 ' + span + 'ms'
                     : chunks > 1 ? 'SSE 完整，但多帧集中到达；单凭帧数无法确认是否缓冲（跨度 ' + span + 'ms）'
@@ -10693,8 +10933,8 @@ html[data-theme="dark"] .glass-switch-shell {
         });
         if (status) {
           status.innerHTML = err
-            ? '<span style="color:#f87171;">流式失败：' + escapeHtml(err) + '</span>'
-            : '<span style="color:#34d399;">🌊 ' + escapeHtml(model) + ' · ' + chunks + ' chunk · ' + total + 'ms</span>';
+            ? '<span style="color:var(--stream-error-text);">流式失败：' + escapeHtml(err) + '</span>'
+            : '<span style="color:var(--stream-success-text);">🌊 ' + escapeHtml(model) + ' · ' + chunks + ' chunk · ' + total + 'ms</span>';
         }
       };
 
@@ -11149,7 +11389,7 @@ html[data-theme="dark"] .glass-switch-shell {
       const subscriptions = ['workbuddy','workbuddy-ai','raccoon','loomy','zcode','cline','codex','github-copilot','minimax-code','antigravity','qoder_cn','catpaw','deepseek-web','deepseek_web','trae-cn'];
       const rows = appConfig.providers
         .map((p, idx) => [p, idx])
-        .filter(([p]) => p && !subscriptions.includes(String(p.id || '').toLowerCase()) && ['openai','anthropic','responses'].includes(String(p.protocol || 'openai').toLowerCase()) && !(Array.isArray(p.accounts) && p.accounts.length) && !/subscription|gift/i.test(String(p.type || '')) && String(p.status || '').toLowerCase() !== 'placeholder');
+        .filter(([p]) => p && p.type !== 'custom-api' && !subscriptions.includes(String(p.id || '').toLowerCase()) && ['openai','anthropic','responses'].includes(String(p.protocol || 'openai').toLowerCase()) && !(Array.isArray(p.accounts) && p.accounts.length) && !/subscription|gift/i.test(String(p.type || '')) && String(p.status || '').toLowerCase() !== 'placeholder');
 
       if (rows.length === 0) {
         c.innerHTML = '<div style="font-size:0.8rem;color:var(--text-muted);">没有可配置的商业 Key 供应商</div>';
@@ -11643,7 +11883,7 @@ html[data-theme="dark"] .glass-switch-shell {
       function open(source, content, actions = false) {
         if (current?.source === source && !current.closing) return dismiss();
         dismiss(false, false);
-        const root = source.closest('#account-manage-modal') || document.body;
+        const root = source.closest('#account-manage-modal') || source.closest('.custom-api-overlay') || document.body;
         const overlay = document.createElement('div');
         overlay.className = 'glass-menu-overlay';
         const frame = document.createElement('div');
@@ -12086,6 +12326,13 @@ html[data-theme="dark"] .glass-switch-shell {
         for (const account of homeQuotaAccounts()) if (account.provider === providerId) homeQuotaCache.delete(account.key);
         homeQuotaAttempt = '';
         if (typeof billingRequests !== 'undefined') billingRequests[providerId] = (billingRequests[providerId] || 0) + 1;
+        if (providerId === 'codex' && action === 'remove') {
+          const provider = appConfig.providers.find(p => p.id === providerId);
+          if (provider && Array.isArray(provider.accounts)) {
+            provider.accounts = provider.accounts.filter(a => payload.id !== 'all' && a?.id !== payload.id);
+            refreshProviderBadges();
+          }
+        }
         showToast(action === 'remove' && !data.removed ? (payload.id === 'all' ? '当前没有可清空的账号，列表已刷新' : '该账号已不在池中，列表已刷新') : successText);
         succeeded = true; return true;
       } catch (_) { showToast('请求结果未确认，正在重新读取账号；请核对后再操作'); return false; }
@@ -12141,6 +12388,21 @@ html[data-theme="dark"] .glass-switch-shell {
           badge.style.color = 'var(--text-muted)';
         }
       });
+      const codexStatus = document.getElementById('codex-current-accounts');
+      if (codexStatus) {
+        const provider = appConfig.providers.find(p => p.id === 'codex');
+        const accounts = (Array.isArray(provider?.accounts) ? provider.accounts : []).filter(Boolean);
+        const pool = JSON.stringify(accounts.map(a => [a.id, a.accountId, a.enabled, a.off, a.authMode]));
+        const usage = document.getElementById('codex-usage-status');
+        if (usage && usage.codexAccountPool !== pool) {
+          usage.codexAccountPool = pool;
+          usage.codexUsageRequest = null;
+          usage.textContent = '';
+        }
+        const names = accounts.map(a => accountDisplayInfo(a).primary + (a.enabled === false || a.off ? '（已停用）' : ''));
+        const summary = names.length ? '当前账号：' + names.join('、') : '尚未接入 Codex 账号';
+        if (codexStatus.textContent !== summary) codexStatus.textContent = summary;
+      }
     }
 </script>
 
