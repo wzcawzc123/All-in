@@ -37,6 +37,15 @@ Windows 测试使用 JNA 5.17.0 调用系统耐久重命名 API，仅属于 offl
 - `primer-octicons-MIT.txt`: `da259c8bd0de62713ccdcf88910aebca810644f98c2c912bad814fc79ea778df`
 - `qoder-CLIProxyAPI-MIT.txt`: `879792e89cf1bdd6a8d446033ec87e30496f97dcafc4656dc53f641509b346a6`
 
+## zstd-jni / Zstandard 请求体压缩（1.2.125-test，构建 133）
+
+本次使用 `com.github.luben:zstd-jni:1.5.7-28@aar`，保留已验证原签 APK 的字节，不为许可页面变更重新打包。该安装包新增依赖的完整版权、许可条件和免责声明，作为本次发行的配套材料随源码 ZIP 提供：
+
+- [zstd-jni BSD-2-Clause 原文](licenses/zstd-jni-1.5.7-28-BSD-2-Clause.txt)，版权属于 Luben Karavelov。原文来源：`https://raw.githubusercontent.com/luben/zstd-jni/v1.5.7-28/LICENSE`。
+- [随该版本捆绑的原生 Zstandard BSD 原文](licenses/zstandard-native-1.5.7-28-BSD.txt)，版权属于 Facebook, Inc.。原文来源：`https://raw.githubusercontent.com/luben/zstd-jni/v1.5.7-28/src/main/native/LICENSE`。
+
+两份原文均取自所用版本标签，未重写原作者声明。它们是发行配套许可材料，不能据此声称此次 APK 内的离线许可页已经更新；后续版本可将同一材料纳入离线页面。
+
 ## 自定义 API 与请求头预设（1.2.105-test 本地开发）
 
 参考固定 Magpie 提交 `c8e9c6410c671677ce2208ca2dc00c0727ea41e5` 的供应商配置、认证后应用用户请求头和 GUI 预设合并逻辑。Android 端管理、验证、持久化及流式生命周期按本项目结构重新适配。Magpie 作者版权与 MIT 原文继续由 `magpie-MIT.txt` 随包保留；实现范围与限制见 [自定义 API 说明](CUSTOM_API_PROVIDERS.md)。未更新本机 Magpie 或插件快照。

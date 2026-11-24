@@ -1,16 +1,11 @@
 package com.gaeul.allin;
 
-import android.annotation.TargetApi;
-
 import java.io.*;
-import java.nio.file.Files;
-import java.nio.file.StandardCopyOption;
 import java.security.*;
 import java.security.interfaces.RSAPublicKey;
 import java.util.Arrays;
 
 /** Offline signed rules and last-known-good store. No configured key means disabled. */
-@TargetApi(26)
 final class SignedQuirksStore {
     static final class OlderRulesException extends IllegalArgumentException {
         OlderRulesException() { super("verified rules are older than current rules"); }
@@ -89,7 +84,7 @@ final class SignedQuirksStore {
         File tmp=File.createTempFile(".q2-", ".tmp",dir);
         try {
             try(FileOutputStream out=new FileOutputStream(tmp)) { out.write(bytes); out.flush(); out.getFD().sync(); }
-            Files.move(tmp.toPath(), cache.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            AtomicConfigFile.replace(tmp, cache);
         } finally { if(tmp.exists()) tmp.delete(); }
     }
     static int maxEnvelope() { return 4+4+ProviderQuirks.MAX_BYTES+2+MAX_SIGNATURE; }

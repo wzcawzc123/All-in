@@ -479,7 +479,10 @@ public final class CatPawToolBridge {
                 ? CatPawAuth.chatWithCatalogMetadata(token, model, prepared, modelType)
                 : CatPawAuth.chatWithCatalogMetadata(token, model, prepared, modelType, transport);
         requireCompleteToolTurn(response, tools, selected);
-        JSONArray calls = parse(response.optString("text", ""), tools, toolChoice);
+        String answer = response.optString("text", "");
+        // Reasoning-only turns have no client result and must not trigger a second paid turn.
+        if (answer.trim().isEmpty()) throw new CatPawAuth.Failure(502, null, true);
+        JSONArray calls = parse(answer, tools, toolChoice);
         if (calls.length() == 0 && ("required".equals(selected.mode) || "named".equals(selected.mode))) {
             // Retry only after the first chat call returned normally. A transport failure is ambiguous and is never replayed.
             JSONArray retryMessages = new JSONArray(prepared.toString());

@@ -128,14 +128,36 @@ final class CustomProvider {
         JSONObject h=valid.getJSONObject("headers");
         for(Iterator<String> it=h.keys();it.hasNext();) { String name=it.next(); conn.setRequestProperty(name,h.getString(name)); }
     }
+    private static boolean isNumericIpLiteral(String host) {
+        if (host == null || host.isEmpty()) return false;
+        if (host.indexOf(':') >= 0) return true;
+        // IPv4 decimal / hex / octal / shorthand forms (e.g., 127.1, 2130706433, 0x7f000001, 0)
+        for (int i = 0; i < host.length(); i++) {
+            char c = host.charAt(i);
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+                    || c == '.' || c == 'x' || c == 'X')) return false;
+        }
+        return true;
+    }
+
     static boolean self(JSONObject p, int port) {
         try {
             URI u=new URI(base(p.optString("baseUrl"))); int target=u.getPort()<0?("https".equals(u.getScheme())?443:80):u.getPort();
             if(target!=port) return false; String host=u.getHost().replace("[","").replace("]","");
             if("localhost".equalsIgnoreCase(host) || host.startsWith("127.") || "::1".equals(host) || "0.0.0.0".equals(host) || "::".equals(host)) return true;
+            byte[] literalBytes = null;
+            if (isNumericIpLiteral(host)) {
+                InetAddress resolved = InetAddress.getByName(host);
+                if (resolved.isLoopbackAddress() || resolved.isAnyLocalAddress()) return true;
+                literalBytes = resolved.getAddress();
+            }
             Enumeration<NetworkInterface> interfaces=NetworkInterface.getNetworkInterfaces();
             while(interfaces!=null && interfaces.hasMoreElements()) { Enumeration<InetAddress> addresses=interfaces.nextElement().getInetAddresses();
-                while(addresses.hasMoreElements()) if(host.equalsIgnoreCase(addresses.nextElement().getHostAddress())) return true; }
+                while(addresses.hasMoreElements()) {
+                    InetAddress local = addresses.nextElement();
+                    if(host.equalsIgnoreCase(local.getHostAddress())) return true;
+                    if(literalBytes != null && Arrays.equals(literalBytes, local.getAddress())) return true;
+                } }
         } catch(Exception e) { return true; }
         return false;
     }

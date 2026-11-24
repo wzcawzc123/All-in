@@ -3360,23 +3360,43 @@ html[data-theme="dark"] .glass-switch-shell {
       }
     };
 
-    function bridgeCall(method, path, body) {
+    function bridgeCall(method, path, body, signal) {
       return new Promise((resolve, reject) => {
+        const makeAbortError = () => { const err = new Error('The operation was aborted.'); err.name = 'AbortError'; return err; };
+        if (signal && signal.aborted) { reject(makeAbortError()); return; }
         const id = 'r' + (++__bridgeSeq) + '_' + Date.now();
+        let onAbort = null;
+        const cleanup = () => {
+          clearTimeout(timer);
+          if (signal && onAbort) { try { signal.removeEventListener('abort', onAbort); } catch (ignored) {} }
+        };
         const timer = setTimeout(() => {
           if (__bridgePending[id]) {
             delete __bridgePending[id];
+            cleanup();
+            try { window.AllInNative?.cancelRequest?.(id); } catch (ignored) {}
             reject(new TypeError('网关请求超时'));
           }
         }, 95000);
         __bridgePending[id] = {
-          resolve: (v) => { clearTimeout(timer); resolve(v); },
-          reject: (e) => { clearTimeout(timer); reject(e); }
+          resolve: (v) => { cleanup(); resolve(v); },
+          reject: (e) => { cleanup(); reject(e); }
         };
+        if (signal && typeof signal.addEventListener === 'function') {
+          onAbort = () => {
+            if (__bridgePending[id]) {
+              delete __bridgePending[id];
+              cleanup();
+              try { window.AllInNative?.cancelRequest?.(id); } catch (ignored) {}
+              reject(makeAbortError());
+            }
+          };
+          signal.addEventListener('abort', onAbort, { once: true });
+        }
         try {
           window.AllInNative.requestAsync(id, method, path, body || '');
         } catch (e) {
-          clearTimeout(timer);
+          cleanup();
           delete __bridgePending[id];
           reject(e);
         }
@@ -3423,7 +3443,7 @@ html[data-theme="dark"] .glass-switch-shell {
           if (canAsync) {
             // 异步桥：不阻塞 JS 线程，慢接口（同步官方模型等）也不会把页面卡死
             return new Promise((resolve, reject) => {
-              bridgeCall(method, path, body).then(raw => {
+              bridgeCall(method, path, body, init && init.signal).then(raw => {
                 try { resolve(toResponse(raw)); } catch (e) { reject(e); }
               }, reject);
             });
@@ -4378,7 +4398,13 @@ html[data-theme="dark"] .glass-switch-shell {
      * 浏览器先解 HTML 实体、再当 JS 解析，所以最终 JS 看到的仍是合法的 \'。
      */
     function jsAttr(v) {
-      return esc(String(v == null ? '' : v).replace(/\\/g, '\\\\').replace(/'/g, "\\'"));
+      return esc(String(v == null ? '' : v)
+        .replace(/\\/g, '\\\\')
+        .replace(/'/g, "\\'")
+        .replace(/\r/g, '\\r')
+        .replace(/\n/g, '\\n')
+        .replace(/\u2028/g, '\\u2028')
+        .replace(/\u2029/g, '\\u2029'));
     }
 
     /** 供应商卡片的统一清单：两处 render 循环共用，避免新增供应商时漏改一处 */
@@ -4835,6 +4861,8 @@ html[data-theme="dark"] .glass-switch-shell {
     async function configureExposedProvider(id) {
       // Wait for the tab's configuration load before looking for dynamic rows.
       await switchTab('providers', null, true);
+      const custom = (typeof appConfig !== 'undefined' && appConfig && Array.isArray(appConfig.providers) ? appConfig.providers : []).find(x => x && x.id === id && x.type === 'custom-api');
+      if (custom && typeof showProviderView === 'function') { showProviderView('detail', id); return; }
       const badge = document.getElementById('badge-count-' + id);
       const commercial = document.getElementById('commercial-keys-container');
       const row = commercial && Array.from(commercial.children).find(el => el.dataset.providerId === id);
@@ -7655,7 +7683,7 @@ function openCustomEditor(id='') {
   function connectionDraft(){const entered=(keysText.hidden?key.value:keysText.value).split(/\r?\n/).map(v=>v.trim()).filter(Boolean);return {id:p.id,name:name.value.trim()||'自定义 API',baseUrl:base.value.trim(),protocol:protocol.value,authMode:auth.value,keys:clear.checked?[]:entered.length?entered:p.keys,headers:customHeadersOf(rows),enabled:enabled.checked,models:[],catalogModels:[]};}
   fetchModels.onclick=async()=>{const editor=customEditor;const serial=++previewSerial;try{const draft=connectionDraft();if(!draft.baseUrl)throw new Error('先填写 API 根地址');if(draft.authMode==='auto'&&!draft.keys.some(k=>k.trim()))throw new Error('先填写 API Key，或选择正确的认证方式');
     previewAbort?.abort();previewAbort=typeof AbortController==='function'?new AbortController():null;fetchModels.disabled=true;modelStatus.textContent='正在拉取云端模型…';
-    const signature=JSON.stringify(draft);const response=await fetch(API_BASE+'/api/providers/custom/catalog',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(withProviderToken({provider:draft},saved?providerTokenAtOpen:undefined)),...(previewAbort?{signal:previewAbort.signal}:{})});const result=await response.json();
+    const signature=JSON.stringify(draft);const response=await fetch(API_BASE+'/api/providers/custom/catalog',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(withProviderToken({provider:draft},saved?providerTokenAtOpen:undefined)),...(previewAbort?{signal:previewAbort.signal}:{})});let result={};try{result=typeof response.text==='function'?JSON.parse((await response.text())||'{}'):await response.json();}catch(ignored){result={error:'网关返回非 JSON 响应（HTTP '+response.status+'）'};}
     if(customEditor!==editor||serial!==previewSerial)return;
     if(signature!==JSON.stringify(connectionDraft()))throw new Error('地址或认证已经改变，旧查询结果已丢弃，请重新拉取');
     if(!response.ok||result.ok!==true)throw new Error(errText(result.error,'模型目录读取失败'));
@@ -7667,7 +7695,7 @@ function openCustomEditor(id='') {
   const help=document.createElement('p');help.className='custom-api-help';help.textContent='预设仅作可编辑模板，不覆盖已填写的同名值，也不保证供应商放行。已保存的请求头值不回显；留空或未编辑保持原值，删除行才移除。认证请求头须选「仅自定义请求头」，危险传输头会被拒绝。';box.appendChild(help);
   const presets=select('请求头预设',[['','选择预设…'],...CUSTOM_HEADER_PRESETS.map((x,i)=>[String(i),x.name])],'');
   const headers=document.createElement('div');headers.className='custom-api-headers';box.appendChild(headers);
-  function drawHeaders() {headers.replaceChildren();for(const row of rows){const line=document.createElement('div');line.className='custom-api-header-row';const h=document.createElement('input');h.value=row[0];h.placeholder='Header-Name';h.setAttribute('aria-label','请求头名称');h.oninput=()=>{row[0]=h.value;};const value=document.createElement('input');const secret=/^allin-secret-ref:[0-9a-f]{64}$/i.test(row[1]);value.type='password';value.value=secret?'':row[1];value.placeholder=secret?'已保存，留空保持':'Value';value.setAttribute('aria-label','请求头值');value.autocomplete='new-password';value.oninput=()=>{row[1]=value.value|| (secret?p.headers[row[0]]:'');};const del=document.createElement('button');del.type='button';del.textContent='移除';del.className='btn btn-outline';del.onclick=()=>{rows.splice(rows.indexOf(row),1);drawHeaders();};line.append(h,value,del);headers.appendChild(line);}}
+  function drawHeaders() {headers.replaceChildren();for(const row of rows){const line=document.createElement('div');line.className='custom-api-header-row';const origName=row[0];const secret=/^allin-secret-ref:[0-9a-f]{64}$/i.test(row[1]);const origRef=secret?row[1]:'';const h=document.createElement('input');h.value=row[0];h.placeholder='Header-Name';h.setAttribute('aria-label','请求头名称');h.oninput=()=>{row[0]=h.value;if(secret&&row[0]!==origName&&row[1]===origRef)row[1]=value.value||'';};const value=document.createElement('input');value.type='password';value.value=secret?'':row[1];value.placeholder=secret?'已保存，留空保持':'Value';value.setAttribute('aria-label','请求头值');value.autocomplete='new-password';value.oninput=()=>{row[1]=value.value||(secret&&row[0]===origName?origRef:'');};const del=document.createElement('button');del.type='button';del.textContent='移除';del.className='btn btn-outline';del.onclick=()=>{rows.splice(rows.indexOf(row),1);drawHeaders();};line.append(h,value,del);headers.appendChild(line);}}
   presets.onchange=()=>{const selected=CUSTOM_HEADER_PRESETS[Number(presets.value)];if(presets.value!==''&&selected){customApplyPreset(rows,selected);drawHeaders();}presets.value='';};drawHeaders();
   const add=document.createElement('button');add.type='button';add.className='btn btn-outline';add.textContent='添加请求头';add.onclick=()=>{if(rows.length>=32){showToast('最多 32 个请求头');return;}rows.push(['','']);drawHeaders();headers.lastChild?.querySelector('input')?.focus();};box.appendChild(add);
   const enabledWrap=document.createElement('label'),enabled=document.createElement('input');enabled.type='checkbox';enabled.checked=p.enabled!==false;enabledWrap.append(enabled,document.createTextNode('启用此供应商'));box.appendChild(enabledWrap);
@@ -8777,6 +8805,8 @@ async function removeCustomProvider(id) {
             const div = document.createElement('div');
             div.style = 'background:rgba(255,255,255,0.03); border:1px solid var(--card-border); border-radius:8px; padding:10px 14px; display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;';
             const dateStr = acc.addedAt ? new Date(acc.addedAt).toLocaleDateString() : '刚刚';
+            const firstModel = Array.isArray(p.models) && p.models.length ? String(p.models[0]) : '';
+            const pingTarget = firstModel ? (firstModel.startsWith(p.id + '/') ? firstModel : p.id + '/' + firstModel) : '';
             div.innerHTML = [
               '<div>',
               '  <div style="display:flex; align-items:center; gap:6px;">',
@@ -8788,7 +8818,7 @@ async function removeCustomProvider(id) {
               '  <div style="font-size:0.75rem; color:var(--text-muted); margin-top:3px;">入池时间: ' + dateStr + '</div>',
               '</div>',
               '<div style="display:flex; gap:6px;">' +
-              '  <button class="btn btn-outline" style="color:#10b981; border-color:rgba(16,185,129,0.3); padding:4px 8px; font-size:0.75rem;" onclick="executeModelPingTest(\'workbuddy/hy3\')">⚡ 测试</button>' +
+              (pingTarget ? '  <button class="btn btn-outline" style="color:#10b981; border-color:rgba(16,185,129,0.3); padding:4px 8px; font-size:0.75rem;" onclick="executeModelPingTest(\'' + jsAttr(pingTarget) + '\')">⚡ 测试</button>' : '') +
               '  <button class="btn btn-outline" style="color:#ef4444; border-color:rgba(239,68,68,0.3); padding:4px 8px; font-size:0.75rem;" onclick="removeProviderAccount(\'' + jsAttr(p.id) + '\', \'' + jsAttr(acc.id) + '\')">移除</button>' +
               '</div>'
             ].join('');

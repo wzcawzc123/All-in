@@ -103,8 +103,18 @@ public final class LoomyAuth {
         try {
             c.setInstanceFollowRedirects(false); c.setConnectTimeout(20000); c.setReadTimeout(20000); c.setRequestMethod(method);
             for(Map.Entry<String,String> h:headers.entrySet()) c.setRequestProperty(h.getKey(),h.getValue());
-            if(body!=null) { c.setDoOutput(true); c.setRequestProperty("Content-Type","application/json"); byte[] bytes=body.getBytes(StandardCharsets.UTF_8); c.setFixedLengthStreamingMode(bytes.length); try(OutputStream out=c.getOutputStream()){out.write(bytes);} }
-            int status=c.getResponseCode(); CheckinEvidence.reply(status,""); if(sessionRequest && (status==401 || status==403)) throw new Failure("登录态已失效",true);
+            if(body!=null) { c.setDoOutput(true); c.setRequestProperty("Content-Type","application/json"); byte[] bytes=body.getBytes(StandardCharsets.UTF_8); try(OutputStream out=c.getOutputStream()){out.write(bytes);} }
+            int status=c.getResponseCode();
+            if(sessionRequest && (status==401 || status==403)) {
+                String code="";
+                try(InputStream err=c.getErrorStream()) {
+                    if(err!=null) code=LoomyChatRefusal.businessCode(LoomyChatRefusal.readPrefix(err),c.getContentLengthLong());
+                } catch(IOException ignored) {}
+                CheckinEvidence.reply(status,code);
+                if(LoomyChatRefusal.expired(code)) throw new Failure("登录态已失效",true);
+                throw new Failure("上游 HTTP "+status,false);
+            }
+            CheckinEvidence.reply(status,"");
             if(status<200 || status>=300) throw new Failure("上游 HTTP "+status,false);
             ByteArrayOutputStream out=new ByteArrayOutputStream(); try(InputStream in=c.getInputStream()) { byte[] buf=new byte[4096]; int n; while((n=in.read(buf))!=-1){ if(out.size()+n>1048576) throw new Failure("上游响应过大",false); out.write(buf,0,n); } }
             try { return new JSONObject(new String(out.toByteArray(),StandardCharsets.UTF_8)); } catch(Exception e) { throw new Failure("上游响应格式无效",false); }

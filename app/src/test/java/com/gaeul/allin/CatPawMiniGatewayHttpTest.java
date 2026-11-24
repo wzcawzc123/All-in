@@ -41,6 +41,9 @@ public final class CatPawMiniGatewayHttpTest {
     if(fault[0]==3) frame="data: {\"heartbeat\":true}\n\ndata: [DONE]\n\n";
     if(fault[0]==4) frame=frame.replace("data: [DONE]\n\n", "data: [DONE]");
     if(fault[0]==5) frame=frame.replace("data: [DONE]\n\n", "data: {\"finished\":true}\n\n");
+    if(fault[0]==6) frame="data: " + new JSONObject().put("message",new JSONObject().put("type","assistant").put("finished",true)
+            .put("content",new JSONArray().put(new JSONObject().put("type","text").put("text","  ").put("reasoningContent","private thought"))))
+            +"\n\ndata: [DONE]\n\n";
     return new CatPawAuth.ChatResponse(200,frame.getBytes(StandardCharsets.UTF_8));
    });
    JSONArray tools=new JSONArray().put(new JSONObject().put("type","function").put("function",new JSONObject().put("name","Read").put("parameters",new JSONObject().put("type","object").put("required",new JSONArray().put("path")))));
@@ -85,6 +88,21 @@ public final class CatPawMiniGatewayHttpTest {
      check(upstream[0]==before+3,"unconfirmed turn must not replay");
      check(!r.body.contains("tool_calls") && !r.body.contains("tool_use") && !r.body.contains("[DONE]"),"no executable tool or success terminal on failure");
     }
+   fault[0]=6;
+   for (boolean stream : new boolean[]{false, true}) {
+    for (String path : new String[]{"/v1/chat/completions", "/v1/messages", "/v1/responses"}) {
+     JSONObject body=VendorPolicyGatewayHttpTest.body("catpaw/auto",stream);
+     if (path.endsWith("messages")) body.put("max_tokens",100);
+     if (path.endsWith("responses")) { body.remove("messages"); body.put("input","Give a visible answer"); }
+     int before=upstream[0];
+     VendorPolicyGatewayHttpTest.Result r=VendorPolicyGatewayHttpTest.post(g,path,body);
+     check(r.status==502 || (stream && r.status==200),"empty answer HTTP status "+path+" "+r.status+" "+r.body);
+     check(r.body.contains("error") || r.body.contains("response.failed"),"empty answer must fail "+path+" "+r.body);
+     check(!r.body.contains("response.completed") && !r.body.contains("message_stop") && !r.body.contains("end_turn")
+             && !r.body.contains("\"finish_reason\":\"stop\""),"empty answer must not emit a success terminal "+path+" "+r.body);
+     check(upstream[0]==before+3,"empty answer must not replay "+path);
+    }
+   }
    fault[0]=1;
    JSONObject textBody=VendorPolicyGatewayHttpTest.body("catpaw/auto",false).put("tools",tools).put("tool_choice","none");
    VendorPolicyGatewayHttpTest.Result fallback=VendorPolicyGatewayHttpTest.post(g,"/v1/chat/completions",textBody);

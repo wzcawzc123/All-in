@@ -26,6 +26,12 @@ for(const width of [360,390]){
   check([...form.querySelectorAll('input')].every(x=>!x.value.startsWith('allin-secret-ref:')),'opaque secret reference shown');
   check(form.querySelector('[aria-modal="true"]')===null && form.getAttribute('aria-modal')==='true','dialog semantics');
   const header=form.querySelector('.custom-api-header-row');check(header.querySelectorAll('input')[1].value==='','secret value empty');
+  // Renaming a saved header and clearing its value must never emit undefined or carry stale ref.
+  header.querySelectorAll('input')[0].value='X-Renamed';header.querySelectorAll('input')[0].dispatchEvent(new Event('input'));
+  header.querySelectorAll('input')[1].value='temp';header.querySelectorAll('input')[1].dispatchEvent(new Event('input'));
+  header.querySelectorAll('input')[1].value='';header.querySelectorAll('input')[1].dispatchEvent(new Event('input'));
+  header.querySelectorAll('input')[0].value='User-Agent';header.querySelectorAll('input')[0].dispatchEvent(new Event('input'));
+  header.querySelectorAll('input')[1].value='';header.querySelectorAll('input')[1].dispatchEvent(new Event('input'));
   const preset=form.querySelectorAll('select')[2];preset.value='3';preset.dispatchEvent(new Event('change'));
   check(form.querySelectorAll('.custom-api-header-row').length===1,'preset duplicated case-insensitive header');
   check(document.documentElement.scrollWidth<=innerWidth,'document overflows mobile viewport');

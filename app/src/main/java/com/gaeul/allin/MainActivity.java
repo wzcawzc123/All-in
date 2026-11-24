@@ -32,25 +32,38 @@ public class MainActivity extends Activity {
     private final Handler panelRefreshHandler = new Handler(Looper.getMainLooper());
     private int statusBarInsetPx;
     private final BridgeStreamOwner bridgeStreams = new BridgeStreamOwner();
-    private java.util.Set<LocalBridge.Call> bridgeCalls;
-    private volatile boolean bridgeDestroyed;
+    private final java.util.concurrent.ThreadPoolExecutor bridgeExecutor = new java.util.concurrent.ThreadPoolExecutor(
+            0, 16, 30L, java.util.concurrent.TimeUnit.SECONDS,
+            new java.util.concurrent.SynchronousQueue<Runnable>(),
+            r -> {
+                Thread t = new Thread(r, "AllIn-BridgeRequest");
+                t.setDaemon(true);
+                return t;
+            },
+            new java.util.concurrent.ThreadPoolExecutor.AbortPolicy());
+    private BridgeRequestRegistry bridgeRegistry;
     private volatile long bridgePageGeneration;
-    private synchronized boolean ownBridgeCall(LocalBridge.Call call, long expectedGeneration) {
-        if (bridgeDestroyed || bridgePageGeneration != expectedGeneration) { call.cancel(); return false; }
-        if (bridgeCalls == null) bridgeCalls = new java.util.HashSet<>();
-        bridgeCalls.add(call); return true;
+    private volatile boolean bridgeDestroyed;
+    private synchronized BridgeRequestRegistry bridgeRegistry() {
+        if (bridgeRegistry == null) bridgeRegistry = new BridgeRequestRegistry();
+        return bridgeRegistry;
     }
-    private synchronized void releaseBridgeCall(LocalBridge.Call call) {
-        if (bridgeCalls != null) bridgeCalls.remove(call);
-    }
+    private long bridgePageGeneration() { return bridgePageGeneration; }
     private void cancelBridgeCalls() {
-        java.util.List<LocalBridge.Call> calls;
         synchronized (this) {
             bridgePageGeneration++;
-            calls = bridgeCalls == null ? new java.util.ArrayList<>() : new java.util.ArrayList<>(bridgeCalls);
-            if (bridgeCalls != null) bridgeCalls.clear();
+            bridgeRegistry().cancelAll(bridgeDestroyed);
         }
-        for (LocalBridge.Call call : calls) call.cancel();
+    }
+    private boolean registerBridgeCall(String reqId, LocalBridge.Call call, long expectedGeneration) {
+        synchronized (this) {
+            if (bridgeDestroyed || bridgePageGeneration != expectedGeneration) {
+                call.cancel();
+                return false;
+            }
+            BridgeRequestRegistry registry = bridgeRegistry();
+            return registry.register(reqId, call, registry.generation());
+        }
     }
 
     private BackupActivityController backupController;
@@ -139,7 +152,7 @@ public class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= 21) {
             try {
                 Method m = WebSettings.class.getMethod("setMixedContentMode", int.class);
-                m.invoke(settings, 0); // 0 = MIXED_CONTENT_ALWAYS_ALLOW
+                m.invoke(settings, 1); // 1 = MIXED_CONTENT_NEVER_ALLOW
             } catch (Exception ignored) {}
         }
 
@@ -516,17 +529,17 @@ public class MainActivity extends Activity {
     private class NativeBridge {
         private void updateResult(final android.webkit.WebView view, final long generation, final com.gaeul.allin.json.JSONObject result) {
             if(view==null)return;
-            view.post(()->{if(bridgeAllowed()&&view==webView&&generation==bridgePageGeneration)try{view.evaluateJavascript("window.onAppUpdateState&&window.onAppUpdateState("+result.toString()+")",null);}catch(RuntimeException ignored){}});
+            view.post(()->{if(bridgeAllowed()&&view==webView&&generation==bridgePageGeneration())try{view.evaluateJavascript("window.onAppUpdateState&&window.onAppUpdateState("+result.toString()+")",null);}catch(RuntimeException ignored){}});
         }
         @android.webkit.JavascriptInterface
         public void checkAppUpdate(boolean manual) {
-            if(!bridgeAllowed())return;final long generation=bridgePageGeneration;final android.webkit.WebView view=webView;
+            if(!bridgeAllowed())return;final long generation=bridgePageGeneration();final android.webkit.WebView view=webView;
             AppUpdateManager.check(MainActivity.this,manual,result->updateResult(view,generation,result));
         }
         @android.webkit.JavascriptInterface
         public void dismissAppUpdate(String key) {
             if(!bridgeAllowed()||key==null||key.length()>256)return;
-            updateResult(webView,bridgePageGeneration,AppUpdateManager.core(MainActivity.this).dismiss(key));
+            updateResult(webView,bridgePageGeneration(),AppUpdateManager.core(MainActivity.this).dismiss(key));
         }
         @android.webkit.JavascriptInterface
         public boolean openAppUpdatePage() {
@@ -589,7 +602,7 @@ public class MainActivity extends Activity {
         /** 同步调用（保留兼容，短请求用；长请求请用 requestAsync 避免卡住 JS 线程） */
         @android.webkit.JavascriptInterface
         public String request(String method, String pathAndQuery, String body) {
-            final long generation = bridgePageGeneration;
+            final long generation = bridgePageGeneration();
             if (!bridgeAllowed()) {
                 return "{\"status\":403,\"body\":\"bridge blocked: 非面板页面\"}";
             }
@@ -621,18 +634,28 @@ public class MainActivity extends Activity {
             String key=GatewayManagementCredential.get();
             String ip=GatewayServer.getLocalIpAddress();
             if (key.isEmpty() || ip==null || ip.isEmpty() || "127.0.0.1".equals(ip)) return false;
-            return copyText("http://"+ip+":3425/#manage="+key);
+            return copyTextInternal("http://"+ip+":3425/#manage="+key, true);
         }
 
         /** 把文本放进剪贴板（面板「一键导入 ETA」用；WebView 里 navigator.clipboard 不稳） */
         @android.webkit.JavascriptInterface
         public boolean copyText(String text) {
+            return copyTextInternal(text, false);
+        }
+
+        private boolean copyTextInternal(String text, boolean sensitive) {
             if (!bridgeAllowed() || text == null) return false;
             try {
                 android.content.ClipboardManager cm = (android.content.ClipboardManager)
                         getSystemService(android.content.Context.CLIPBOARD_SERVICE);
                 if (cm == null) return false;
-                cm.setPrimaryClip(android.content.ClipData.newPlainText("All In", text));
+                android.content.ClipData clip = android.content.ClipData.newPlainText("All In", text);
+                if (sensitive && Build.VERSION.SDK_INT >= 33) {
+                    android.os.PersistableBundle extras = new android.os.PersistableBundle();
+                    extras.putBoolean("android.content.extra.IS_SENSITIVE", true);
+                    clip.getDescription().setExtras(extras);
+                }
+                cm.setPrimaryClip(clip);
                 return true;
             } catch (Throwable t) {
                 Log.w("Magpie", "copyText failed: " + t.getMessage());
@@ -766,10 +789,8 @@ public class MainActivity extends Activity {
                 @Override
                 public void run() {
                     try {
-                        java.lang.reflect.Method m = WebView.class
-                                .getMethod("evaluateJavascript", String.class,
-                                        Class.forName("android.webkit.ValueCallback"));
-                        if(bridgeAllowed() && (ticket == null || bridgeStreams.accepts(ticket))) m.invoke(view, script, null);
+                        if (bridgeAllowed() && view == webView && (ticket == null || bridgeStreams.accepts(ticket)))
+                            view.evaluateJavascript(script, null);
                     } catch (Throwable ignored) {
                     }
                 }
@@ -777,39 +798,61 @@ public class MainActivity extends Activity {
         }
 
         /**
-         * 异步调用：Java 侧开线程跑，完成后回调用 JS 的 __allInBridgeDone(id, result)。
+         * 异步调用：通过有界线程池执行，完成后回调用 JS 的 __allInBridgeDone(id, result)。
          * 同步版会把 WebView 的 JS 线程整个堵住，遇到「同步官方模型」这类要打外网、
          * 十几秒才返回的接口，页面就会完全点不动。异步后页面始终保持响应。
          */
         @android.webkit.JavascriptInterface
-        public void requestAsync(final String reqId, final String method, final String pathAndQuery, final String body) {
-            if (reqId == null || !bridgeAllowed()) return;
-            final long pageGeneration = bridgePageGeneration;
-            new Thread(new Runnable() {
+        public void cancelRequest(String reqId) {
+            if (!bridgeAllowed() || reqId == null || reqId.isEmpty()) return;
+            bridgeRegistry().cancelById(reqId);
+        }
+
+        private void postBridgeDone(final WebView target, final String reqId, final long pageGeneration, final String result) {
+            if (target == null) return;
+            final String script = "__allInBridgeDone("
+                    + com.gaeul.allin.json.JSONObject.quote(reqId) + ","
+                    + com.gaeul.allin.json.JSONObject.quote(result) + ")";
+            target.post(new Runnable() {
                 @Override
                 public void run() {
-                    String result = doRequest(method, pathAndQuery, body, pageGeneration);
-                    final String script = "__allInBridgeDone("
-                            + com.gaeul.allin.json.JSONObject.quote(reqId) + ","
-                            + com.gaeul.allin.json.JSONObject.quote(result) + ")";
-                    final WebView view = webView;
-                    if (view != null) {
-                        view.post(new Runnable() {
-                            @Override
-                            public void run() {
-                                try {
-                                    // evaluateJavascript 是 API19+；本工程编译用的 android.jar 很老，
-                                    // 走反射调用，运行时在真机上正常链接。
-                                    java.lang.reflect.Method m = WebView.class
-                                            .getMethod("evaluateJavascript", String.class, Class.forName("android.webkit.ValueCallback"));
-                                    if(bridgeAllowed() && pageGeneration == bridgePageGeneration && view == webView) m.invoke(view, script, null);
-                                } catch (Throwable ignored) {
-                                }
-                            }
-                        });
+                    try {
+                        if (bridgeAllowed() && pageGeneration == bridgePageGeneration() && target == webView)
+                            target.evaluateJavascript(script, null);
+                    } catch (Throwable ignored) {
                     }
                 }
-            }, "AllIn-BridgeRequest").start();
+            });
+        }
+
+        @android.webkit.JavascriptInterface
+        public void requestAsync(final String reqId, final String method, final String pathAndQuery, final String body) {
+            if (reqId == null || reqId.isEmpty() || !bridgeAllowed()) return;
+            final long pageGeneration = bridgePageGeneration();
+            final WebView view = webView;
+            final LocalBridge.Call call = new LocalBridge.Call(90000);
+            // 提交线程池前先登记可取消的 Call，消除「前端立即 cancelRequest 早于工作线程启动」的竞态窗口
+            if (!registerBridgeCall(reqId, call, pageGeneration)) return;
+            try {
+                bridgeExecutor.execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        String result;
+                        try {
+                            result = doRequestWithCall(method, pathAndQuery, body, call);
+                        } finally {
+                            bridgeRegistry().release(reqId, call);
+                        }
+                        postBridgeDone(webView, reqId, pageGeneration, result);
+                    }
+                });
+            } catch (java.util.concurrent.RejectedExecutionException rejected) {
+                bridgeRegistry().release(reqId, call);
+                postBridgeDone(view, reqId, pageGeneration, "{\"status\":503,\"body\":\"\",\"error\":\"bridge busy\"}");
+            } catch (RuntimeException | Error unexpected) {
+                bridgeRegistry().release(reqId, call);
+                throw unexpected;
+            }
         }
 
         /** 请求行被校验器拒绝时回给面板的固定结构；此时不会建立 socket，也不会碰网关。 */
@@ -826,10 +869,25 @@ public class MainActivity extends Activity {
         }
 
         private String doRequest(String method, String pathAndQuery, String body) {
-            return doRequest(method, pathAndQuery, body, bridgePageGeneration);
+            return doRequest(method, pathAndQuery, body, bridgePageGeneration());
         }
 
         private String doRequest(String method, String pathAndQuery, String body, long expectedGeneration) {
+            LocalBridge.Call call = new LocalBridge.Call(90000);
+            if (!registerBridgeCall(null, call, expectedGeneration)) {
+                return "{\"status\":0,\"body\":\"\",\"error\":\"cancelled\"}";
+            }
+            try {
+                return doRequestWithCall(method, pathAndQuery, body, call);
+            } finally {
+                bridgeRegistry().release(null, call);
+            }
+        }
+
+        private String doRequestWithCall(String method, String pathAndQuery, String body, LocalBridge.Call call) {
+            if (call.cancelled()) {
+                return "{\"status\":0,\"body\":\"\",\"error\":\"cancelled\"}";
+            }
             final BridgeRequestValidator.Request request;
             try {
                 // 面板可控的 method/path 在拼请求行之前必须过校验：拦住 CRLF、控制字符、
@@ -838,17 +896,17 @@ public class MainActivity extends Activity {
             } catch (IllegalArgumentException rejected) {
                 return bridgeRejected(rejected.getMessage());
             }
+            if (call.cancelled()) {
+                return "{\"status\":0,\"body\":\"\",\"error\":\"cancelled\"}";
+            }
             String m = request.method;
             String path = request.pathAndQuery;
-            LocalBridge.Call call = new LocalBridge.Call(90000);
-            try {
-                if (!ownBridgeCall(call, expectedGeneration)) return "{\"status\":0,\"body\":\"\",\"error\":\"cancelled\"}";
-                LocalBridge.Result result = LocalBridge.requestResult(m, path, body, call);
-                com.gaeul.allin.json.JSONObject ret = new com.gaeul.allin.json.JSONObject();
-                ret.put("status", result.status); ret.put("body", result.body);
-                if (!result.transportError.isEmpty()) ret.put("error", result.transportError);
-                return ret.toString();
-            } finally { call.close(); releaseBridgeCall(call); }
+            LocalBridge.Result result = LocalBridge.requestResult(m, path, body, call);
+            com.gaeul.allin.json.JSONObject ret = new com.gaeul.allin.json.JSONObject();
+            ret.put("status", result.status);
+            ret.put("body", result.body);
+            if (!result.transportError.isEmpty()) ret.put("error", result.transportError);
+            return ret.toString();
         }
     }
 
@@ -1041,17 +1099,20 @@ public class MainActivity extends Activity {
 
     // 把真实运行状态推送给前端
     private void pushGatewayStateToWeb() {
-        if (webView == null) return;
+        final WebView view = webView;
+        if (view == null || bridgeDestroyed) return;
         final boolean running = GatewayService.isRunning();
-        final String js = "javascript:(function(){"
+        final String js = "(function(){"
                 + "if(typeof window.__setGatewayState==='function'){"
                 + "window.__setGatewayState(" + running + "," + GATEWAY_PORT + ");"
                 + "}})();";
-        webView.post(new Runnable() {
+        view.post(new Runnable() {
             @Override
             public void run() {
                 try {
-                    webView.loadUrl(js);
+                    if (view == webView && !bridgeDestroyed && bridgeAllowed()) {
+                        view.evaluateJavascript(js, null);
+                    }
                 } catch (Throwable ignored) {}
             }
         });
@@ -1105,6 +1166,7 @@ public class MainActivity extends Activity {
         panelRefreshHandler.removeCallbacksAndMessages(null);
         bridgeStreams.close();
         cancelBridgeCalls();
+        bridgeExecutor.shutdownNow();
         if (accountTransferController != null) accountTransferController.destroy();
         if (backupController != null) backupController.destroy();
         WebView view = webView;

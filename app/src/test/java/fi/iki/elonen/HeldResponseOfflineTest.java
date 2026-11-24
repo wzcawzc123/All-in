@@ -193,6 +193,22 @@ public final class HeldResponseOfflineTest {
             ExecutorService rejected = Executors.newSingleThreadExecutor(); rejected.shutdown();
             try { held(() -> null, rejected, 1, new AtomicInteger(), new AtomicInteger(), "chat"); throw new AssertionError("rejection expected"); }
             catch (RejectedExecutionException expected) {}
+            // Combined header + fixed body in a single write() call must still count bodyBytes accurately.
+            Body mergedBody = new Body("12345");
+            AtomicInteger mergedCancel = new AtomicInteger();
+            AllInHeldResponse merged = held(() -> new NanoHTTPD.Response(NanoHTTPD.Response.Status.OK, "text/plain", mergedBody, 5) {
+                @Override protected void send(OutputStream out) {
+                    try {
+                        byte[] combined = ("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\n12345").getBytes("ISO-8859-1");
+                        out.write(combined, 0, combined.length);
+                        out.flush();
+                    } catch (IOException e) { throw new RuntimeException(e); }
+                }
+            }, executor, 1000, mergedCancel, new AtomicInteger(), "chat");
+            ByteArrayOutputStream mergedOut = new ByteArrayOutputStream();
+            merged.send(mergedOut);
+            check(mergedBody.finishes == 1 && mergedBody.success && mergedCancel.get() == 0,
+                    "combined header+body write must succeed");
             System.out.println("HeldResponseOfflineTest passed");
         } finally { executor.shutdownNow(); }
     }

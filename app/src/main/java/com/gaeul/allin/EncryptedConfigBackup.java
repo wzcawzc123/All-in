@@ -6,10 +6,12 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.charset.CodingErrorAction;
 import java.security.GeneralSecurityException;
+import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.util.Arrays;
 import java.util.Iterator;
 import javax.crypto.Cipher;
+import javax.crypto.Mac;
 import javax.crypto.SecretKeyFactory;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.PBEKeySpec;
@@ -74,8 +76,56 @@ final class EncryptedConfigBackup {
 
     private static byte[] derive(char[] password, byte[] salt, int iterations) throws GeneralSecurityException {
         PBEKeySpec spec = new PBEKeySpec(password, salt, iterations, 256);
-        try { return SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).getEncoded(); }
-        finally { spec.clearPassword(); }
+        try {
+            return SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).getEncoded();
+        } catch (NoSuchAlgorithmException fallback) {
+            return pbkdf2HmacSha256(password, salt, iterations, 32);
+        } finally {
+            spec.clearPassword();
+        }
+    }
+
+    /** RFC 2898 PBKDF2-HMAC-SHA256 fallback for Android 7.x (API 24-25 lacks SecretKeyFactory PBKDF2WithHmacSHA256). */
+    static byte[] pbkdf2HmacSha256(char[] password, byte[] salt, int iterations, int keyLengthBytes) throws GeneralSecurityException {
+        java.nio.ByteBuffer encoded = StandardCharsets.UTF_8.encode(java.nio.CharBuffer.wrap(password));
+        byte[] passBytes = new byte[encoded.remaining()];
+        encoded.get(passBytes);
+        if (encoded.hasArray()) Arrays.fill(encoded.array(), (byte) 0);
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(passBytes, "HmacSHA256"));
+            int hLen = mac.getMacLength();
+            int blocks = (keyLengthBytes + hLen - 1) / hLen;
+            byte[] dk = new byte[blocks * hLen];
+            byte[] u = new byte[hLen];
+            byte[] t = new byte[hLen];
+            byte[] blockIndex = new byte[4];
+            for (int i = 1; i <= blocks; i++) {
+                blockIndex[0] = (byte) (i >>> 24);
+                blockIndex[1] = (byte) (i >>> 16);
+                blockIndex[2] = (byte) (i >>> 8);
+                blockIndex[3] = (byte) i;
+                mac.reset();
+                mac.update(salt);
+                mac.update(blockIndex);
+                byte[] u1 = mac.doFinal();
+                System.arraycopy(u1, 0, u, 0, hLen);
+                System.arraycopy(u1, 0, t, 0, hLen);
+                for (int c = 2; c <= iterations; c++) {
+                    if ((c & 4095) == 0 && Thread.currentThread().isInterrupted()) {
+                        throw new GeneralSecurityException("PBKDF2 interrupted");
+                    }
+                    mac.reset();
+                    byte[] next = mac.doFinal(u);
+                    System.arraycopy(next, 0, u, 0, hLen);
+                    for (int k = 0; k < hLen; k++) t[k] ^= u[k];
+                }
+                System.arraycopy(t, 0, dk, (i - 1) * hLen, hLen);
+            }
+            return Arrays.copyOf(dk, keyLengthBytes);
+        } finally {
+            clear(passBytes);
+        }
     }
     private static void requirePassword(char[] p) {
         if (p == null || p.length == 0 || p.length > 1024) throw new IllegalArgumentException("password length");

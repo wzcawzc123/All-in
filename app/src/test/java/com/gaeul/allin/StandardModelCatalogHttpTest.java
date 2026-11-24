@@ -81,10 +81,59 @@ public class StandardModelCatalogHttpTest {
             assertTrue(target.requests.isEmpty());
         }
     }
+    public void customRelayCompatibilityAndDiagnostics() throws Exception {
+        JSONObject customBase = new JSONObject().put("id", "custom-relay").put("name", "Relay")
+                .put("type", "custom-api").put("protocol", "openai").put("authMode", "auto")
+                .put("keys", new com.gaeul.allin.json.JSONArray().put("k1"))
+                .put("models", new com.gaeul.allin.json.JSONArray())
+                .put("headers", new JSONObject()).put("enabled", true);
+        // 1. has_more: null (JSONObject.NULL) must succeed instead of dropping the catalog.
+        try (Server server = new Server(ok("{\"data\":[{\"id\":\"gpt-5\"},{\"id\":\"claude-4\"}],\"has_more\":null}"))) {
+            JSONObject custom = new JSONObject(customBase.toString()).put("baseUrl", "http://127.0.0.1:" + server.socket.getLocalPort() + "/v1");
+            StandardModelCatalog.Result res = StandardModelCatalog.fetchCustomDetailed(custom, "k1", new JSONObject(),
+                    url -> (HttpURLConnection) new URL(url).openConnection());
+            assertEquals(Arrays.asList("gpt-5", "claude-4"), res.models);
+            assertEquals("", res.error);
+        }
+        // 2. Both data and models present on custom relay: prefers data array.
+        try (Server server = new Server(ok("{\"data\":[{\"id\":\"m-a\"}],\"models\":[]}"))) {
+            JSONObject custom = new JSONObject(customBase.toString()).put("baseUrl", "http://127.0.0.1:" + server.socket.getLocalPort() + "/v1");
+            StandardModelCatalog.Result res = StandardModelCatalog.fetchCustomDetailed(custom, "k1", new JSONObject(),
+                    url -> (HttpURLConnection) new URL(url).openConnection());
+            assertEquals(Arrays.asList("m-a"), res.models);
+        }
+        // 3. Top-level array response on custom relay.
+        try (Server server = new Server(ok("[{\"id\":\"top-1\"},\"top-2\"]"))) {
+            JSONObject custom = new JSONObject(customBase.toString()).put("baseUrl", "http://127.0.0.1:" + server.socket.getLocalPort() + "/v1");
+            StandardModelCatalog.Result res = StandardModelCatalog.fetchCustomDetailed(custom, "k1", new JSONObject(),
+                    url -> (HttpURLConnection) new URL(url).openConnection());
+            assertEquals(Arrays.asList("top-1", "top-2"), res.models);
+        }
+        // 4. Clear non-secret diagnostic messages for 302 / 401 / 404.
+        try (Server server = new Server(response(302, "", "Location: https://other.invalid/v1/models\r\n"))) {
+            JSONObject custom = new JSONObject(customBase.toString()).put("baseUrl", "http://127.0.0.1:" + server.socket.getLocalPort() + "/v1");
+            StandardModelCatalog.Result res = StandardModelCatalog.fetchCustomDetailed(custom, "k1", new JSONObject(),
+                    url -> (HttpURLConnection) new URL(url).openConnection());
+            assertTrue(res.models.isEmpty() && res.error.contains("重定向") && res.error.contains("302") && !res.error.contains("other.invalid"));
+        }
+        try (Server server = new Server(response(401, "{\"error\":\"secret-k1\"}", ""))) {
+            JSONObject custom = new JSONObject(customBase.toString()).put("baseUrl", "http://127.0.0.1:" + server.socket.getLocalPort() + "/v1");
+            StandardModelCatalog.Result res = StandardModelCatalog.fetchCustomDetailed(custom, "k1", new JSONObject(),
+                    url -> (HttpURLConnection) new URL(url).openConnection());
+            assertTrue(res.models.isEmpty() && res.error.contains("401") && !res.error.contains("secret-k1"));
+        }
+        try (Server server = new Server(response(404, "", ""))) {
+            JSONObject custom = new JSONObject(customBase.toString()).put("baseUrl", "http://127.0.0.1:" + server.socket.getLocalPort() + "/v1");
+            StandardModelCatalog.Result res = StandardModelCatalog.fetchCustomDetailed(custom, "k1", new JSONObject(),
+                    url -> (HttpURLConnection) new URL(url).openConnection());
+            assertTrue(res.models.isEmpty() && res.error.contains("404"));
+        }
+    }
     public static void main(String[] args) throws Exception {
         StandardModelCatalogHttpTest t = new StandardModelCatalogHttpTest();
         t.twoPagesDedupeAndEncodeCursor(); t.secondPageFailureKeepsMeta();
         t.rejectsCursorLoopAndBadSchema(); t.doesNotFollowRedirect();
+        t.customRelayCompatibilityAndDiagnostics();
         System.out.println("StandardModelCatalogHttpTest PASS");
     }
 }

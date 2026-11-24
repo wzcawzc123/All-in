@@ -257,6 +257,10 @@ public class LoginActivity extends Activity {
         settings.setJavaScriptEnabled(true);
         settings.setDomStorageEnabled(true);
         settings.setDatabaseEnabled(true);
+        settings.setAllowFileAccess(false);
+        settings.setAllowContentAccess(false);
+        settings.setAllowFileAccessFromFileURLs(false);
+        settings.setAllowUniversalAccessFromFileURLs(false);
         settings.setJavaScriptCanOpenWindowsAutomatically(true);
         settings.setUseWideViewPort(true);
         settings.setLoadWithOverviewMode(true);
@@ -304,6 +308,15 @@ public class LoginActivity extends Activity {
              * 若不拦截，WebView 会直接显示 ERR_UNKNOWN_URL_SCHEME 错误页，
              * 用户看到的就是"登上去就断了"。
              */
+            @Override
+            public void onReceivedError(WebView view, WebResourceRequest request, android.webkit.WebResourceError error) {
+                super.onReceivedError(view, request, error);
+                if (request != null && request.isForMainFrame()) {
+                    final int code = error == null ? 0 : error.getErrorCode();
+                    postLoginUi(() -> subtitleView.setText("登录页加载失败（错误码 " + code + "），请检查手机联网权限/网络环境后重试"));
+                }
+            }
+
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, String url) {
                 if ("deepseek_web".equals(currentProvider)) return !isDeepSeekOrigin(url);
@@ -534,10 +547,28 @@ public class LoginActivity extends Activity {
         final int generation=++workBuddyGeneration;
         subtitleView.setText("正在申请官方授权；本次登录不会移除已入池账号…");
         startLoginTask(() -> {
+            String reason = "无法取得官方授权链接，请检查网关与网络后点完成入池重试";
             try {
                 LocalBridge.Result response=loginRequest("GET","/api/auth/workbuddy/init-login",null,20000);
+                if (!response.transportError.isEmpty()) {
+                    if ("ConnectException".equals(response.transportError))
+                        reason = "无法连接本机网关（请确认首页网关已运行），再点右上角「完成入池」重试";
+                    else if ("timeout".equals(response.transportError))
+                        reason = "等待官方授权响应超时（20秒），请检查手机联网权限或网络策略，再点「完成入池」重试";
+                    else
+                        reason = "与本机网关通信异常（" + response.transportError + "），请点右上角「完成入池」重试";
+                    throw new java.io.IOException(reason);
+                }
                 JSONObject data=new JSONObject(response.body);
-                if(response.status<200 || response.status>=300 || !data.optBoolean("ok",false))throw new java.io.IOException();
+                if(response.status<200 || response.status>=300 || !data.optBoolean("ok",false)) {
+                    String apiErr = "";
+                    Object rawErr = data.opt("error");
+                    if (rawErr instanceof JSONObject) apiErr = ((JSONObject) rawErr).optString("message", "").trim();
+                    else if (rawErr instanceof String) apiErr = ((String) rawErr).trim();
+                    if (!apiErr.isEmpty()) reason = apiErr + "（点右上角「完成入池」重试）";
+                    else reason = "网关返回 HTTP " + response.status + "，请检查网络或网关后点「完成入池」重试";
+                    throw new java.io.IOException(reason);
+                }
                 final String state=data.optString("state","");
                 final String authUrl=data.optString("authUrl","");
                 java.net.URI url=java.net.URI.create(authUrl);
@@ -551,8 +582,9 @@ public class LoginActivity extends Activity {
                     startWorkBuddyPolling(state,generation);
                 });
             } catch(Exception failed) {
+                final String display = reason;
                 postLoginUi(() -> {if(!isFinishing() && !isDestroyed() && generation==workBuddyGeneration)
-                    subtitleView.setText("无法取得官方授权链接，请检查网关后点完成入池重试");});
+                    subtitleView.setText(display);});
             }
         });
     }

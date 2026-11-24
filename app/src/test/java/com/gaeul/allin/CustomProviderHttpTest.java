@@ -160,5 +160,87 @@ public final class CustomProviderHttpTest {
         check(CustomProvider.base("https://example.invalid/api/v4/chat/completions/").equals("https://example.invalid/api/v4"),"custom path changed");
         check(CustomProvider.self(provider("openai","none","http://127.0.0.1:3425/v1"),3425),"self loop not rejected");
     }
-    public static void main(String[] args)throws Exception {headersAndRejections();management();matrix();System.out.println("CustomProviderHttpTest PASS "+checks+" assertions; 18 protocol/SSE/tool-result paths, 6 auth paths, management/CAS/catalog/security");}
+    static void relayIntegrationRegressions() throws Exception {
+        Path dir=Files.createTempDirectory("custom-relay-reg-");
+        try(Peer respPeer=new Peer("responses"); Peer openaiPeer=new Peer("openai"); Peer anthPeer=new Peer("anthropic")) {
+            JSONObject cfg=new JSONObject()
+                    .put("server",new JSONObject().put("authKey","fixture-inference").put("port",3425))
+                    .put("setup",new JSONObject().put("done",true))
+                    .put("routing",new JSONObject().put("groupsEnabled",true).put("bareModelFallback",true))
+                    .put("guard",new JSONObject().put("enabled",false))
+                    .put("privacy",new JSONObject().put("enabled",false))
+                    .put("middleware",new JSONObject().put("paramOverrideByProvider",new JSONObject()
+                            .put("custom-openai-mw",new JSONObject().put("set",new JSONObject().put("temperature",0.25)))))
+                    .put("groups",new JSONArray()
+                            .put(new JSONObject().put("id","live-alias-grp").put("enabled",true).put("strategy","order").put("targets",new JSONArray().put("m-openai")))
+                            .put(new JSONObject().put("id","dead-unselected-grp").put("enabled",true).put("strategy","order").put("targets",new JSONArray().put("custom-hdr-empty/m-unselected"))))
+                    .put("providers",new JSONArray()
+                            .put(provider("responses","auto",respPeer.base()).put("id","custom-resp-ping").put("name","RespPing").put("models",new JSONArray().put("m-resp")))
+                            .put(provider("openai","auto",openaiPeer.base()).put("id","custom-openai-mw").put("name","OpenAiMw").put("models",new JSONArray().put("m-openai")))
+                            .put(provider("openai","auto",openaiPeer.base()).put("id","custom-disabled").put("name","Disabled").put("enabled",false).put("models",new JSONArray().put("m-disabled")))
+                            .put(provider("openai","headers",openaiPeer.base()).put("id","custom-hdr-empty").put("name","HdrEmpty").put("keys",new JSONArray()).put("models",new JSONArray()).put("catalogModels",new JSONArray().put("m-unselected")).put("headers",new JSONObject().put("Authorization","Bearer fixture-hdr-tok")))
+                            .put(provider("anthropic","headers",anthPeer.base()).put("id","custom-anth-short").put("name","AnthShort").put("keys",new JSONArray()).put("models",new JSONArray().put("m-anth")).put("headers",new JSONObject().put("X-Flag","1").put("X-Kind","error").put("X-Allowlist","fixture-header-secret").put("Authorization","Bearer fixture-secret-tok")))
+                            .put(provider("responses","auto","http://127.0.0.1:1/v1").put("id","custom-resp-refused").put("name","RespRefused").put("models",new JSONArray().put("m-refused"))));
+            GatewayServer g=RoutingSetupOfflineTest.server(cfg);
+            RoutingAuditOfflineTest.file(g,dir.resolve("config.json").toFile());
+            Files.write(dir.resolve("config.json"),cfg.toString().getBytes(StandardCharsets.UTF_8));
+            g.setVendorConnectionsForTests(url->(HttpURLConnection)new URL(url).openConnection());
+
+            // 1. /api/test-model on custom Responses provider must return ok=true with real reply
+            JSONObject pingResp=new JSONObject(GatewayAccessBoundaryOfflineTest.body(call(g,"/api/test-model","POST",new JSONObject().put("model","m-resp"),true)));
+            check(pingResp.optBoolean("ok") && pingResp.optString("reply").contains("PASS9193"),"custom responses /api/test-model failed: "+pingResp);
+
+            // 2. noCandidateReason with readable custom aliases & headers authMode
+            JSONObject disResp=new JSONObject(GatewayAccessBoundaryOfflineTest.body(call(g,"/api/test-model","POST",new JSONObject().put("model","m-disabled"),true)));
+            check("provider_disabled".equals(disResp.optString("reason")),"disabled readable alias wrong reason: "+disResp);
+            JSONObject unselResp=new JSONObject(GatewayAccessBoundaryOfflineTest.body(call(g,"/api/test-model","POST",new JSONObject().put("model","m-unselected"),true)));
+            check("model_not_listed".equals(unselResp.optString("reason")),"headers unselected readable alias wrong reason: "+unselResp);
+
+            // 3. groupHasLiveTarget with readable alias & unselected custom target
+            JSONObject v1Models=new JSONObject(GatewayAccessBoundaryOfflineTest.body(call(g,"/v1/models","GET",null,false)));
+            String dataStr=v1Models.getJSONArray("data").toString();
+            check(dataStr.contains("group/live-alias-grp"),"readable alias group hidden from /v1/models data: "+v1Models);
+            check(!dataStr.contains("group/dead-unselected-grp"),"unselected custom group exposed in /v1/models data: "+v1Models);
+
+            // 4. /api/exposed accepts readable custom alias
+            JSONObject expOut=new JSONObject(GatewayAccessBoundaryOfflineTest.body(call(g,"/api/exposed","POST",new JSONObject().put("enabled",true).put("items",new JSONArray().put("m-openai")),true)));
+            check(expOut.optInt("count")==1 && expOut.getJSONArray("items").getString(0).equals("custom-openai-mw/m-openai"),"/api/exposed dropped readable alias: "+expOut);
+
+            // 5. Provider-scoped middleware applies when called via readable alias
+            NanoHTTPD.Response mwCall=call(g,"/v1/chat/completions","POST",ingress("openai",false,false).put("model","m-openai"),false);
+            check(code(mwCall)==200 && Math.abs(openaiPeer.received.optDouble("temperature",-1)-0.25)<0.001,"provider-scoped middleware missed readable alias: "+openaiPeer.received);
+
+            // 6. Short non-sensitive headers do not corrupt upstream JSON errors, while Bearer token is still scrubbed
+            anthPeer.status=403;
+            NanoHTTPD.Response anthErr=call(g,"/v1/chat/completions","POST",ingress("openai",false,false).put("model","m-anth"),false);
+            String anthErrBody=GatewayAccessBoundaryOfflineTest.body(anthErr);
+            check(code(anthErr)==403 && !anthErrBody.contains("Unstructured upstream error") && !anthErrBody.contains("fixture-header-secret") && !anthErrBody.contains("fixture-secret-tok"),
+                    "short header corrupted error or leaked secret: "+anthErrBody);
+
+            // 7. Multi-turn /v1/responses echo with phase & output_text.logprobs passes through to custom Responses provider intact
+            JSONObject phaseTurn=new JSONObject().put("model","m-resp").put("stream",false).put("input",new JSONArray()
+                    .put(new JSONObject().put("type","message").put("role","user").put("content","hi"))
+                    .put(new JSONObject().put("type","message").put("id","msg_prev").put("role","assistant").put("status","completed").put("phase","final_answer")
+                            .put("content",new JSONArray().put(new JSONObject().put("type","output_text").put("text","prev").put("annotations",new JSONArray()).put("logprobs",new JSONArray()))))
+                    .put(new JSONObject().put("type","message").put("role","user").put("content","next")));
+            NanoHTTPD.Response phaseRes=call(g,"/v1/responses","POST",phaseTurn,false);
+            check(code(phaseRes)==200 && "final_answer".equals(respPeer.received.getJSONArray("input").getJSONObject(1).optString("phase")),
+                    "custom responses multi-turn phase echo failed: "+code(phaseRes)+" "+GatewayAccessBoundaryOfflineTest.body(phaseRes));
+
+            // 8. ResponsesBridge.responsesResponseToChat reads reasoning.content as well as summary
+            JSONObject reasoningOnly=new JSONObject().put("id","resp_r").put("status","completed").put("output",new JSONArray()
+                    .put(new JSONObject().put("type","reasoning").put("content",new JSONArray().put(new JSONObject().put("type","reasoning_text").put("text","step-1"))))
+                    .put(new JSONObject().put("type","message").put("role","assistant").put("content",new JSONArray().put(new JSONObject().put("type","output_text").put("text","ans")))));
+            JSONObject chatFromResp=ResponsesBridge.responsesResponseToChat(reasoningOnly,"m-resp");
+            check("step-1".equals(chatFromResp.getJSONArray("choices").getJSONObject(0).getJSONObject("message").optString("reasoning_content")),
+                    "responsesResponseToChat dropped reasoning.content: "+chatFromResp);
+
+            // 9. Transport error classification on custom Responses provider
+            JSONObject refPing=new JSONObject(GatewayAccessBoundaryOfflineTest.body(call(g,"/api/test-model","POST",new JSONObject().put("model","m-refused"),true)));
+            check(!refPing.optBoolean("ok") && !refPing.optString("transportKind").isEmpty(),"custom responses transportKind missing: "+refPing);
+        } finally {
+            try(java.util.stream.Stream<Path> walk=Files.walk(dir)){walk.sorted(Comparator.reverseOrder()).forEach(p->{try{Files.deleteIfExists(p);}catch(IOException e){throw new UncheckedIOException(e);}});}
+        }
+    }
+    public static void main(String[] args)throws Exception {headersAndRejections();management();matrix();relayIntegrationRegressions();System.out.println("CustomProviderHttpTest PASS "+checks+" assertions; 18 protocol/SSE/tool-result paths, 6 auth paths, management/CAS/catalog/security, 9 relay integration regressions");}
 }

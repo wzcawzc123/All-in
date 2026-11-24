@@ -131,14 +131,16 @@ final class Middleware {
             else if (base != null && base.has("maxTokensCap")) cap = base.opt("maxTokensCap");
             if (cap != null) {
                 double c = Double.parseDouble(String.valueOf(cap));
-                String[] keys = {"max_tokens", "max_completion_tokens", "maxTokens"};
-                for (String k : keys) {
-                    Object cur = payload.opt(k);
-                    if (cur instanceof Number) {
-                        double v = ((Number) cur).doubleValue();
-                        if (v > c) {
-                            payload.put(k, (int) c);
-                            touched = true;
+                if (Double.isFinite(c) && c > 0) {
+                    String[] keys = {"max_tokens", "max_completion_tokens", "maxTokens"};
+                    for (String k : keys) {
+                        Object cur = payload.opt(k);
+                        if (cur instanceof Number) {
+                            double v = ((Number) cur).doubleValue();
+                            if (v > c) {
+                                payload.put(k, (int) Math.min(Integer.MAX_VALUE, c));
+                                touched = true;
+                            }
                         }
                     }
                 }
@@ -149,6 +151,12 @@ final class Middleware {
         }
     }
 
+    private static Object cloneJsonValue(Object value) {
+        if (value instanceof JSONObject) return new JSONObject(value.toString());
+        if (value instanceof JSONArray) return new JSONArray(value.toString());
+        return value;
+    }
+
     private static boolean applySet(JSONObject set, JSONObject payload) {
         if (set == null || payload == null) return false;
         boolean touched = false;
@@ -156,7 +164,7 @@ final class Middleware {
         while (it.hasNext()) {
             String k = it.next();
             try {
-                setPath(payload, k, set.opt(k));
+                setPath(payload, k, cloneJsonValue(set.opt(k)));
                 touched = true;
             } catch (Throwable ignored) {
             }
@@ -210,12 +218,28 @@ final class Middleware {
             if (sysIdx >= 0) {
                 JSONObject cur = msgs.optJSONObject(sysIdx);
                 Object c = cur.opt("content");
-                String curText = (c instanceof String) ? (String) c : "";
-                String next;
-                if ("replace".equals(mode)) next = prompt;
-                else if ("append".equals(mode)) next = curText.isEmpty() ? prompt : curText + "\n\n" + prompt;
-                else next = curText.isEmpty() ? prompt : prompt + "\n\n" + curText;
-                cur.put("content", next);
+                if (c instanceof JSONArray) {
+                    JSONArray origArr = (JSONArray) c;
+                    JSONObject block = new JSONObject().put("type", "text").put("text", prompt);
+                    JSONArray nextArr = new JSONArray();
+                    if ("replace".equals(mode)) {
+                        nextArr.put(block);
+                    } else if ("append".equals(mode)) {
+                        for (int i = 0; i < origArr.length(); i++) nextArr.put(cloneJsonValue(origArr.opt(i)));
+                        nextArr.put(block);
+                    } else {
+                        nextArr.put(block);
+                        for (int i = 0; i < origArr.length(); i++) nextArr.put(cloneJsonValue(origArr.opt(i)));
+                    }
+                    cur.put("content", nextArr);
+                } else {
+                    String curText = (c instanceof String) ? (String) c : "";
+                    String next;
+                    if ("replace".equals(mode)) next = prompt;
+                    else if ("append".equals(mode)) next = curText.isEmpty() ? prompt : curText + "\n\n" + prompt;
+                    else next = curText.isEmpty() ? prompt : prompt + "\n\n" + curText;
+                    cur.put("content", next);
+                }
             } else {
                 JSONObject sys = new JSONObject();
                 sys.put("role", "system");

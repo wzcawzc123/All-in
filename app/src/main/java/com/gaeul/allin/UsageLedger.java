@@ -156,6 +156,7 @@ public class UsageLedger {
         public transient RecentUsageScheduler.Lease accountRoutingLease;
         /** Bounded transport metadata, never prompt/header/credential material. */
         public long outboundAt, queuedMs;
+        WorkBuddyFailure workBuddyFailure;
         public String failureKind="", upstreamErrorCode="", upstreamRetryAfter="";
         public RequestDiagnostics.Snapshot diagnostics;
         public CallEvidence.Snapshot callEvidence;
@@ -599,6 +600,7 @@ public class UsageLedger {
         try {
             if(r.diagnostics!=null) o.put("diagnostics",r.diagnostics.json());
             if(r.callEvidence!=null)o.put("callEvidence",r.callEvidence.json());
+            if(r.workBuddyFailure!=null)o.put("workBuddyFailure",r.workBuddyFailure.json());
             if (!r.isLegacy()) {
                 o.put("requestId", r.requestId); o.put("attempt", r.attempt); o.put("terminal", r.terminal);
                 if (r.credentialId != null && !r.credentialId.isEmpty()) o.put("credentialId", r.credentialId);
@@ -645,6 +647,7 @@ public class UsageLedger {
             Row r = new Row();
             r.diagnostics=RequestDiagnostics.Snapshot.parse(o.optJSONObject("diagnostics"));
             r.callEvidence=CallEvidence.Snapshot.parse(o.optJSONObject("callEvidence"));
+            r.workBuddyFailure=WorkBuddyFailure.parse(o.optJSONObject("workBuddyFailure"));
             r.requestId = o.optString("requestId", "");
             r.credentialId = o.optString("credentialId", "");
             r.accountId = o.optString("accountId", "");
@@ -849,6 +852,7 @@ public class UsageLedger {
                 o.put("t", r.t);
                 o.put("diagnostics",RequestDiagnostics.json(r));
                 if(r.callEvidence!=null)o.put("callEvidence",r.callEvidence.json());
+                if(r.workBuddyFailure!=null)o.put("workBuddyFailure",r.workBuddyFailure.json());
                 o.put("prov", r.prov);
                 o.put("requestId", r.requestId); o.put("attempt", r.attempt); o.put("terminal", r.isTerminal());
                 o.put("credentialId", r.credentialId); o.put("usageSource", r.effectiveUsageSource());
@@ -1013,6 +1017,7 @@ public class UsageLedger {
             o.put("timestamp", r.t);
             o.put("diagnostics",RequestDiagnostics.json(r));
             if(r.callEvidence!=null)o.put("callEvidence",r.callEvidence.json());
+            if(r.workBuddyFailure!=null)o.put("workBuddyFailure",r.workBuddyFailure.json());
             o.put("statusCode", r.status);
             o.put("model", r.model == null || r.model.isEmpty() ? r.req : r.model);
             o.put("provider", r.prov);
@@ -1030,7 +1035,7 @@ public class UsageLedger {
     public static String csv(int days) {
         long from = System.currentTimeMillis() - (long) days * 86400000L;
         StringBuilder sb = new StringBuilder();
-        sb.append("time,provider,model,requested,input,output,cache_read,cache_write,reasoning,ttft_ms,decode_ms,ms,status,tries,error,request_id,credential_id,attempt,terminal,usage_source,cache_source,reasoning_source,counted_input,counted_output,request_count,attempt_count,attempt_failed\n");
+        sb.append("time,provider,model,requested,input,output,cache_read,cache_write,reasoning,ttft_ms,decode_ms,ms,status,tries,error,request_id,credential_id,attempt,terminal,usage_source,cache_source,reasoning_source,counted_input,counted_output,request_count,attempt_count,attempt_failed,failure_phase,failure_cause\n");
         SimpleDateFormat f = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US);
         List<Row> all = newest(from,Long.MAX_VALUE,1000);
         all.sort(Comparator.comparingLong(r->r.t));
@@ -1055,7 +1060,9 @@ public class UsageLedger {
                     .append(csvEsc(r.effectiveUsageSource())).append(',').append(csvEsc("unknown".equals(r.cacheSource)?"":r.cacheSource)).append(',').append(csvEsc("unknown".equals(r.reasoningSource)?"":r.reasoningSource)).append(',')
                     .append(!r.effectiveInputKnown() ? "" : String.valueOf(r.countedInput())).append(',')
                     .append(!r.effectiveOutputKnown() ? "" : String.valueOf(r.countedOutput())).append(',')
-                    .append(r.isTerminal() ? 1 : 0).append(',').append(r.isAttempt() ? 1 : 0).append(',').append(r.isAttempt() && r.failed() ? 1 : 0).append('\n');
+                    .append(r.isTerminal() ? 1 : 0).append(',').append(r.isAttempt() ? 1 : 0).append(',').append(r.isAttempt() && r.failed() ? 1 : 0).append(',')
+                    .append(r.workBuddyFailure == null ? "" : r.workBuddyFailure.phaseName()).append(',')
+                    .append(r.workBuddyFailure == null ? "" : r.workBuddyFailure.causeName()).append('\n');
         }
         if(all.size()==1000)sb.append("# Export limited to the latest 1000 rows; use paged history for older rows.").append((char)10);
         synchronized(LOCK){if(droppedPendingRows>0)sb.append("# Missing details after storage failure: ").append(droppedPendingRows).append("; aggregates retained within bounded coverage.").append((char)10);}

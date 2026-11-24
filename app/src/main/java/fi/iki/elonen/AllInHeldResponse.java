@@ -274,7 +274,9 @@ public final class AllInHeldResponse extends NanoHTTPD.Response {
         @Override public void write(byte[] b, int off, int len) throws IOException {
             try {
                 out.write(b, off, len);
+                int bodyOff = off, bodyLen = len;
                 if (!headersDone) {
+                    bodyLen = 0;
                     for (int i = off; i < off + len; i++) {
                         if (headers.size() < 65536) headers.write(b[i]);
                         int c = b[i] & 255;
@@ -292,30 +294,35 @@ public final class AllInHeldResponse extends NanoHTTPD.Response {
                                     try { expectedLength = Long.parseLong(value); } catch (NumberFormatException ignored) {}
                                 }
                             }
+                            bodyOff = i + 1;
+                            bodyLen = off + len - bodyOff;
                             break; }
                     }
-                } else if (chunked) {
-                    if (businessPending && b == businessBuffer) { businessPending = false; businessWrite.run(); }
-                    // Parse chunk bytes, independent of how writes are split. Flush after
-                    // the terminating CRLF of each chunk, including the final chunk.
-                    for (int i = off; i < off + len; i++) {
-                        int c = b[i] & 255;
-                        if (chunkState == 0) {
-                            if (c == '\r') chunkState = 1;
-                            else { int digit = Character.digit((char)c, 16); if (digit < 0) throw new IOException("invalid chunk size"); chunkSize = (chunkSize << 4) | digit; }
-                        } else if (chunkState == 1) {
-                            if (c != '\n') throw new IOException("invalid chunk header");
-                            chunkRemaining = chunkSize; chunkState = chunkSize == 0 ? 3 : 2;
-                        } else if (chunkState == 2) {
-                            if (--chunkRemaining == 0) chunkState = 3;
-                        } else if (chunkState == 3) {
-                            if (c != '\r') throw new IOException("invalid chunk terminator"); chunkState = 4;
-                        } else {
-                            if (c != '\n') throw new IOException("invalid chunk terminator");
-                            out.flush(); chunkState = 0; chunkSize = 0;
+                }
+                if (headersDone && bodyLen > 0) {
+                    if (chunked) {
+                        if (businessPending && b == businessBuffer) { businessPending = false; businessWrite.run(); }
+                        // Parse chunk bytes, independent of how writes are split. Flush after
+                        // the terminating CRLF of each chunk, including the final chunk.
+                        for (int i = bodyOff; i < bodyOff + bodyLen; i++) {
+                            int c = b[i] & 255;
+                            if (chunkState == 0) {
+                                if (c == '\r') chunkState = 1;
+                                else { int digit = Character.digit((char)c, 16); if (digit < 0) throw new IOException("invalid chunk size"); chunkSize = (chunkSize << 4) | digit; }
+                            } else if (chunkState == 1) {
+                                if (c != '\n') throw new IOException("invalid chunk header");
+                                chunkRemaining = chunkSize; chunkState = chunkSize == 0 ? 3 : 2;
+                            } else if (chunkState == 2) {
+                                if (--chunkRemaining == 0) chunkState = 3;
+                            } else if (chunkState == 3) {
+                                if (c != '\r') throw new IOException("invalid chunk terminator"); chunkState = 4;
+                            } else {
+                                if (c != '\n') throw new IOException("invalid chunk terminator");
+                                out.flush(); chunkState = 0; chunkSize = 0;
+                            }
                         }
-                    }
-                } else { bodyBytes += len; if (businessPending && b == businessBuffer) { businessPending = false; businessWrite.run(); } }
+                    } else { bodyBytes += bodyLen; if (businessPending && b == businessBuffer) { businessPending = false; businessWrite.run(); } }
+                }
             } catch (IOException e) { failed = true; throw e; }
         }
         @Override public void flush() throws IOException { try { out.flush(); } catch (IOException e) { failed = true; throw e; } }

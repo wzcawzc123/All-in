@@ -160,6 +160,21 @@ public class ContextGuard {
 
         if (!cfg.enabled) return r;
 
+        if (cfg.maxContextTokens == 0 && cfg.maxBodyBytes == 0 && cfg.maxOutputTokens == 0) {
+            JSONArray rawMsgs = payload.optJSONArray("messages");
+            if (payload.has("messages") && !(payload.opt("messages") instanceof JSONArray)) {
+                r.error = "invalid_messages";
+            } else if (rawMsgs != null && rawMsgs.length() > 0) {
+                for (int i = 0; i < rawMsgs.length(); i++) {
+                    if (rawMsgs.optJSONObject(i) == null) {
+                        r.error = "invalid_message";
+                        break;
+                    }
+                }
+            }
+            return r;
+        }
+
         JSONObject out = new JSONObject(payload.toString());
         applyOutputCap(out, r, cfg);
 

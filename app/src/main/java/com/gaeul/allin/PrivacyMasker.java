@@ -12,7 +12,7 @@ public class PrivacyMasker {
     // 汉字也算 word 字符，导致"我的手机号是13812345678"这类中文紧邻敏感信息时
     // \b 判定失败、整条规则静默失效。改用只针对 ASCII 的前后否定断言。
     private static final Pattern API_KEY_PATTERN = Pattern.compile(
-        "(?<![A-Za-z0-9])(sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9_]{30,}|xox[baprs]-[a-zA-Z0-9]{10,}|AIza[0-9A-Za-z-_]{35}|Bearer\\s+[a-zA-Z0-9\\-_\\.]{24,})(?![A-Za-z0-9])"
+        "(?<![A-Za-z0-9])(sk-[a-zA-Z0-9][a-zA-Z0-9_-]{19,}|ghp_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9_]{30,}|xox[baprs]-[a-zA-Z0-9]{10,}|AIza[0-9A-Za-z-_]{35}|Bearer\\s+[a-zA-Z0-9\\-_\\.]{24,})(?![A-Za-z0-9])"
     );
     private static final Pattern EMAIL_PATTERN = Pattern.compile(
         "(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,7}(?![A-Za-z0-9-])"
@@ -202,6 +202,15 @@ public class PrivacyMasker {
         patterns(cfg);
     }
 
+    private static final int MAX_CUSTOM_PATTERN_CACHE = 128;
+    private static final Map<String, Pattern> CUSTOM_PATTERN_CACHE = Collections.synchronizedMap(
+            new LinkedHashMap<String, Pattern>(16, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, Pattern> eldest) {
+                    return size() > MAX_CUSTOM_PATTERN_CACHE;
+                }
+            });
+
     private static List<Pattern> patterns(Config cfg) {
         List<Pattern> result = new ArrayList<Pattern>();
         if (cfg.maskApiKeys) result.add(API_KEY_PATTERN);
@@ -212,8 +221,13 @@ public class PrivacyMasker {
         if (cfg.maskLandlines) result.add(LANDLINE_PATTERN);
         for (String raw : cfg.customPatterns) {
             if (raw.isEmpty()) continue;
-            try { result.add(Pattern.compile(raw)); }
-            catch (PatternSyntaxException invalid) { throw new PrivacyException(); }
+            Pattern compiled = CUSTOM_PATTERN_CACHE.get(raw);
+            if (compiled == null) {
+                try { compiled = Pattern.compile(raw); }
+                catch (PatternSyntaxException invalid) { throw new PrivacyException(); }
+                CUSTOM_PATTERN_CACHE.put(raw, compiled);
+            }
+            result.add(compiled);
         }
         return result;
     }
@@ -289,19 +303,54 @@ public class PrivacyMasker {
         if (input == null || session == null) return input;
         synchronized (session) {
             if (session.placeholderToReal.isEmpty()) return input;
-            StringBuilder out = new StringBuilder();
-            int pos = 0;
-            List<String> keys = new ArrayList<String>(session.placeholderToReal.keySet());
-            keys.remove(null);
-            keys.remove("");
-            keys.sort((a, b) -> Integer.compare(b.length(), a.length()));
-            while (pos < input.length()) {
-                String found = null;
-                for (String key : keys) {
-                    if (input.startsWith(key, pos)) { found = key; break; }
+            boolean allStandardTokens = true;
+            for (String key : session.placeholderToReal.keySet()) {
+                if (key == null || key.isEmpty()) continue;
+                Matcher km = TOKEN.matcher(key);
+                if (!km.matches()) {
+                    allStandardTokens = false;
+                    break;
                 }
-                if (found == null) out.append(input.charAt(pos++));
-                else { out.append(session.placeholderToReal.get(found)); pos += found.length(); }
+            }
+            if (allStandardTokens) {
+                Matcher m = TOKEN.matcher(input);
+                if (!m.find()) return input;
+                StringBuffer sb = new StringBuffer(input.length());
+                do {
+                    String replacement = session.placeholderToReal.get(m.group());
+                    m.appendReplacement(sb, Matcher.quoteReplacement(replacement != null ? replacement : m.group()));
+                } while (m.find());
+                m.appendTail(sb);
+                return sb.toString();
+            }
+            Map<Character, List<String>> buckets = new HashMap<Character, List<String>>();
+            for (String key : session.placeholderToReal.keySet()) {
+                if (key == null || key.isEmpty()) continue;
+                char first = key.charAt(0);
+                List<String> bucket = buckets.get(first);
+                if (bucket == null) {
+                    bucket = new ArrayList<String>();
+                    buckets.put(first, bucket);
+                }
+                bucket.add(key);
+            }
+            for (List<String> bucket : buckets.values()) {
+                bucket.sort((a, b) -> Integer.compare(b.length(), a.length()));
+            }
+            StringBuilder out = new StringBuilder(input.length());
+            int pos = 0;
+            while (pos < input.length()) {
+                char ch = input.charAt(pos);
+                List<String> candidates = buckets.get(ch);
+                String found = null;
+                if (candidates != null) {
+                    for (String key : candidates) {
+                        if (input.startsWith(key, pos)) { found = key; break; }
+                    }
+                }
+                if (found == null) out.append(ch);
+                else { out.append(session.placeholderToReal.get(found)); pos += found.length() - 1; }
+                if (found == null) pos++; else pos++;
             }
             return out.toString();
         }

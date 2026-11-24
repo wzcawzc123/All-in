@@ -323,16 +323,34 @@ public final class ProviderParityWiringHttpTest {
                 check(up.requests.isEmpty(), "no upstream without a session");
             }
         }
-        // The upstream's own refusal: a dead session becomes 401, and a 5xx never leaks the token.
+        // The upstream's own refusal (0.1.12): bare 401/403 stays kept (502); only 020002/100002 expires (401); 5xx never leaks token.
         for (int status : new int[]{401,403}) {
             try (VendorPolicyGatewayHttpTest.Upstream up = new VendorPolicyGatewayHttpTest.Upstream(
                     (request,n) -> new VendorPolicyGatewayHttpTest.Reply(status,"application/json","{\"error\":\"dead\"}"))) {
                 JSONObject cfg = VendorPolicyGatewayHttpTest.config(loomyProvider("loomy-session"));
                 try (VendorPolicyGatewayHttpTest.Gateway g = new VendorPolicyGatewayHttpTest.Gateway(cfg, up, false)) {
                     Reply r = request(g, "POST", "/v1/images/generations", draw("draw-1"));
-                    check(r.status == 401, "expired sign-in maps to 401: " + r.status + " " + r.body);
-                    check(r.body.contains("sign in again"), "message asks for a new sign-in: " + r.body);
+                    check(r.status == 502, "bare " + status + " stays kept (502): " + r.status + " " + r.body);
+                    check("kept".equals(r.headers.get("x-magpie-sign-in")), "bare " + status + " marks kept: " + r.headers);
                 }
+            }
+            try (VendorPolicyGatewayHttpTest.Upstream up = new VendorPolicyGatewayHttpTest.Upstream(
+                    (request,n) -> new VendorPolicyGatewayHttpTest.Reply(status,"application/json","{\"code\":\"100002\",\"msg\":\"expired\"}"))) {
+                JSONObject cfg = VendorPolicyGatewayHttpTest.config(loomyProvider("loomy-session"));
+                try (VendorPolicyGatewayHttpTest.Gateway g = new VendorPolicyGatewayHttpTest.Gateway(cfg, up, false)) {
+                    Reply r = request(g, "POST", "/v1/images/generations", draw("draw-1"));
+                    check(r.status == 401, "confirmed 100002 on " + status + " maps to 401: " + r.status + " " + r.body);
+                    check("expired".equals(r.headers.get("x-magpie-sign-in")), "confirmed 100002 marks expired: " + r.headers);
+                }
+            }
+        }
+        try (VendorPolicyGatewayHttpTest.Upstream up = new VendorPolicyGatewayHttpTest.Upstream(
+                (request,n) -> new VendorPolicyGatewayHttpTest.Reply(200,"application/json","{\"code\":\"020002\",\"msg\":\"expired\"}"))) {
+            JSONObject cfg = VendorPolicyGatewayHttpTest.config(loomyProvider("loomy-session"));
+            try (VendorPolicyGatewayHttpTest.Gateway g = new VendorPolicyGatewayHttpTest.Gateway(cfg, up, false)) {
+                Reply r = request(g, "POST", "/v1/images/generations", draw("draw-1"));
+                check(r.status == 401, "200 + 020002 maps to 401: " + r.status + " " + r.body);
+                check("expired".equals(r.headers.get("x-magpie-sign-in")), "200 + 020002 marks expired: " + r.headers);
             }
         }
         try (VendorPolicyGatewayHttpTest.Upstream up = new VendorPolicyGatewayHttpTest.Upstream(

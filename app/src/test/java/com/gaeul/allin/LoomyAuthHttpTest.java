@@ -36,9 +36,15 @@ public class LoomyAuthHttpTest {
                     response=new JSONObject().put("code","000000").put("data",path.endsWith("sendMsgCode")?new JSONObject().put("msgid","fake-id"):new JSONObject().put("session","fake-session"));
                 } else {
                     require("fake-session".equals(x.getRequestHeaders().getFirst("token"))); require("Bearer fake-session".equals(x.getRequestHeaders().getFirst("Authorization")));
+                    if(mode.equals("bare401_empty")) { x.sendResponseHeaders(401,-1); return; }
+                    if(mode.equals("bare403_html")) { byte[] html="<html>Access Denied</html>".getBytes(StandardCharsets.UTF_8); x.getResponseHeaders().set("Content-Type","text/html"); x.sendResponseHeaders(403,html.length); x.getResponseBody().write(html); return; }
+                    if(mode.equals("bare401_nonauth_json")) { byte[] j="{\"code\":\"500001\",\"msg\":\"waf\"}".getBytes(StandardCharsets.UTF_8); x.getResponseHeaders().set("Content-Type","application/json"); x.sendResponseHeaders(401,j.length); x.getResponseBody().write(j); return; }
+                    if(mode.equals("auth401_100002")) { byte[] j="{\"code\":\"100002\",\"msg\":\"expired\"}".getBytes(StandardCharsets.UTF_8); x.getResponseHeaders().set("Content-Type","application/json"); x.sendResponseHeaders(401,j.length); x.getResponseBody().write(j); return; }
+                    if(mode.equals("auth403_020002")) { byte[] j="{\"code\":\"020002\",\"msg\":\"expired\"}".getBytes(StandardCharsets.UTF_8); x.getResponseHeaders().set("Content-Type","application/json"); x.sendResponseHeaders(403,j.length); x.getResponseBody().write(j); return; }
                     if(mode.equals("expired")) response=new JSONObject().put("code","100002");
                     else if(path.endsWith("first-login")) { require(body.equals("{}")); refresh++; response=new JSONObject().put("code","000000").put("data",new JSONObject().put("dailyBalance",5000)); }
                     else if(mode.equals("missing")) response=new JSONObject().put("code","000000").put("data",new JSONObject());
+                    else if(path.endsWith("/models")) response=new JSONObject().put("code","000000").put("data",new com.gaeul.allin.json.JSONArray().put(new JSONObject().put("id","m1")));
                     else response=new JSONObject().put("code","000000").put("data",new JSONObject().put("data",new JSONObject().put("balance",100).put("dailyBalance",refresh>0?5000:3000).put("dailyLimitPoints",5000).put("dailyRemainingPoints",refresh>0?5000:3000)));
                 }
                 byte[] out=response.toString().getBytes(StandardCharsets.UTF_8);x.sendResponseHeaders(200,out.length);x.getResponseBody().write(out);
@@ -57,6 +63,45 @@ public class LoomyAuthHttpTest {
             LoomyAuth.Refresh first=api.refreshDaily("fake-session");require(first.outcome.equals("available")&&first.before==3000&&first.after==5000); LoomyAuth.Refresh second=api.refreshDaily("fake-session");require(second.outcome.equals("available")&&second.before==5000&&second.after==5000);
             mode="missing"; try {api.refreshDaily("fake-session");throw new AssertionError();} catch(LoomyAuth.Failure e) {require(!e.expired);}
             require(refresh==2); mode="expired"; try {api.usage("fake-session");throw new AssertionError();} catch(LoomyAuth.Failure e) {require(e.expired);}
+            // Loomy 0.1.12 non-chat parity: bare HTTP 401/403 without 020002/100002 never marks expired or auth_required.
+            for (String bare : new String[]{"bare401_empty", "bare403_html", "bare401_nonauth_json"}) {
+                mode = bare;
+                try { api.usage("fake-session"); throw new AssertionError("expected failure for " + bare); }
+                catch (LoomyAuth.Failure e) { require(!e.expired); }
+                try { api.models("fake-session", new JSONObject()); throw new AssertionError("expected failure for " + bare); }
+                catch (LoomyAuth.Failure e) { require(!e.expired); }
+                CheckinEvidence.begin();
+                CheckinEvidence.prepare();
+                try { api.refreshDaily("fake-session"); throw new AssertionError("expected failure for " + bare); }
+                catch (LoomyAuth.Failure e) {
+                    require(!e.expired);
+                    JSONObject ev = CheckinEvidence.failure(e);
+                    require("failed".equals(ev.optString("outcome")) && ev.optBoolean("safeToRetry"));
+                } finally { CheckinEvidence.clear(); }
+            }
+            // Confirmed 100002/020002 on 401/403 must still mark expired and auth_required.
+            for (String confirmed : new String[]{"auth401_100002", "auth403_020002"}) {
+                mode = confirmed;
+                try { api.usage("fake-session"); throw new AssertionError("expected expired for " + confirmed); }
+                catch (LoomyAuth.Failure e) { require(e.expired); }
+                CheckinEvidence.begin();
+                CheckinEvidence.prepare();
+                try { api.refreshDaily("fake-session"); throw new AssertionError("expected expired for " + confirmed); }
+                catch (LoomyAuth.Failure e) {
+                    require(e.expired);
+                    JSONObject ev = CheckinEvidence.failure(e);
+                    require("auth_required".equals(ev.optString("outcome")) && !ev.optBoolean("safeToRetry"));
+                } finally { CheckinEvidence.clear(); }
+            }
+            // Control: non-Loomy 401 still maps to auth_required in CheckinEvidence.
+            CheckinEvidence.begin();
+            CheckinEvidence.prepare();
+            CheckinEvidence.reply(401, "");
+            try {
+                JSONObject ev = CheckinEvidence.failure(new java.io.IOException("other provider 401"));
+                require("auth_required".equals(ev.optString("outcome")));
+            } finally { CheckinEvidence.clear(); }
+            mode="ok";
             try {api.usage("fake-session\tinvalid");throw new AssertionError();} catch(LoomyAuth.Failure e) {require(!e.expired);}
             try {api.sendCode("bad");throw new AssertionError();} catch(LoomyAuth.Failure e) {require(!e.expired);}
             System.out.println("LoomyAuthHttpTest passed");

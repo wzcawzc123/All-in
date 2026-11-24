@@ -18,17 +18,17 @@ final class CheckinEvidence {
     static State get(){State s=CURRENT.get();if(s==null){s=new State();CURRENT.set(s);}return s;}
     static void clear(){CURRENT.remove();}
     static JSONObject failure(Throwable error){
-        State s=get();String kind="request_failed",type=error==null?"unclassified":error.getClass().getSimpleName();boolean auth=false;
+        State s=get();String kind="request_failed",type=error==null?"unclassified":error.getClass().getSimpleName();boolean auth=false,loomyUnconfirmedAuth=false;
         int depth=0;for(Throwable e=error; e!=null&&depth++<8; e=e.getCause()){
             if(e instanceof SSLException){kind="tls";break;}
             if(e instanceof UnknownHostException){kind="dns";break;}
             if(e instanceof SocketTimeoutException){kind="timeout";break;}
             if(e instanceof ConnectException){kind="connect";break;}
             if(e instanceof java.io.EOFException){kind="incomplete_response";break;}
-            if(e instanceof LoomyAuth.Failure&&((LoomyAuth.Failure)e).expired)auth=true;
+            if(e instanceof LoomyAuth.Failure){if(((LoomyAuth.Failure)e).expired)auth=true;else loomyUnconfirmedAuth=true;}
             if(e instanceof RaccoonAccountService.Failure&&((RaccoonAccountService.Failure)e).expired)auth=true;
         }
-        if(s.http==401||s.http==403)auth=true;
+        if(!loomyUnconfirmedAuth&&(s.http==401||s.http==403))auth=true;
         String why=auth?"登录状态已失效或没有该接口权限，请重新登录后查询"
                 :"tls".equals(kind)?"TLS 证书或握手校验失败"
                 :"dns".equals(kind)?"域名解析失败"

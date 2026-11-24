@@ -54,9 +54,49 @@ public final class WorkBuddyCompletionGatewayHttpTest {
    }
   }
  }
+ static void waitForCsv(String expected) throws Exception {
+  for (int i=0;i<100;i++) {
+   if (UsageLedger.csv(1).contains(expected)) return;
+   Thread.sleep(25);
+  }
+  throw new AssertionError("Missing " + expected + " in " + UsageLedger.csv(1));
+ }
+ static void failureEvidence() throws Exception {
+  String path="/v1/chat/completions";
+  try (VendorPolicyGatewayHttpTest.Upstream upstream = new VendorPolicyGatewayHttpTest.Upstream(
+          (req,n)->new VendorPolicyGatewayHttpTest.Reply(200,"text/event-stream",chunk(new JSONObject().put("content","partial"),null)));
+       VendorPolicyGatewayHttpTest.Gateway g = new VendorPolicyGatewayHttpTest.Gateway(WorkBuddyCompatibilityGatewayHttpTest.config(),upstream,false)) {
+   UsageLedger.init(g.dir.toFile());
+   try {
+   VendorPolicyGatewayHttpTest.Result result=VendorPolicyGatewayHttpTest.post(g,path,WorkBuddyCompatibilityGatewayHttpTest.request(path,true));
+   check(result.status==200 && !result.body.contains("[DONE]"),"upstream EOF must not manufacture completion");
+   check(upstream.requests.size()==1,"upstream EOF must not replay");
+   waitForCsv(",read_response_body,eof");
+   g.gateway.setVendorConnectionsForTests(url -> new java.net.HttpURLConnection(new java.net.URL(url)) {
+    public void connect() {}
+    public void disconnect() {}
+    public boolean usingProxy(){return false;}
+    public java.io.OutputStream getOutputStream(){return new java.io.ByteArrayOutputStream();}
+    public int getResponseCode() throws java.io.IOException {throw new java.net.SocketTimeoutException();}
+   });
+   result=VendorPolicyGatewayHttpTest.post(g,path,WorkBuddyCompatibilityGatewayHttpTest.request(path,true));
+   check(result.status==502 && upstream.requests.size()==1,"timeout returns 502 without another real send");
+   waitForCsv(",await_response_headers,timeout");
+   check(UsageLedger.recentRequests(20).toString().contains("await_response_headers"),"recent requests show diagnostic");
+   UsageLedger.init(g.dir.toFile());
+   check(UsageLedger.csv(1).contains(",await_response_headers,timeout"),"diagnostics survive ledger reopen");
+   check(WorkBuddyFailure.parse(new JSONObject().put("phase","await_response_headers").put("cause","untrusted text"))==null,"unknown cause rejected");
+   } finally {
+    java.lang.reflect.Method close=UsageLedger.class.getDeclaredMethod("closeWriter");
+    close.setAccessible(true);
+    close.invoke(null);
+   }
+  }
+ }
  public static void main(String[] args) throws Exception {
   for(String s : new String[]{"length","tool-length","missing","unknown","error"}) run(s);
   for(boolean stream : new boolean[]{false,true}) for(String s : new String[]{"split","missing","empty"}) terminalTools(stream,s);
+  failureEvidence();
   System.out.println("WorkBuddyCompletionGatewayHttpTest PASS");
  }
 }

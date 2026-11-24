@@ -105,7 +105,7 @@ final class CatPawStream extends InputStream {
     private String chunk(JSONObject delta,String finish){return "data: "+new JSONObject().put("id",id).put("object","chat.completion.chunk").put("created",created).put("model",model).put("choices",new JSONArray().put(new JSONObject().put("index",0).put("delta",delta).put("finish_reason",finish==null?JSONObject.NULL:finish)))+"\n\n";}
     private void emit(JSONObject delta){String s=role?"":chunk(new JSONObject().put("role","assistant"),null);role=true;pending=new ByteArrayInputStream((s+chunk(delta,null)).getBytes(StandardCharsets.UTF_8));}
     private void done() throws Exception {
-        if (text.isEmpty() && reasoning.isEmpty()) throw new IOException("CatPaw empty turn");
+        if (text.trim().isEmpty()) throw new IOException("CatPaw turn produced no answer or tool call");
         if (!text.isEmpty() && Character.isHighSurrogate(text.charAt(text.length() - 1)))
             throw new IOException("CatPaw incomplete Unicode");
         StringBuilder out = new StringBuilder();

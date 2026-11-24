@@ -15,8 +15,8 @@ android {
         applicationId 'com.gaeul.allin'
         minSdk 24
         targetSdk 34
-        versionCode 124
-        versionName '1.2.116'
+        versionCode 133
+        versionName '1.2.125-test'
         testInstrumentationRunner 'com.gaeul.allin.RepairInstrumentation'
     }
 
@@ -65,6 +65,7 @@ android {
 dependencies {
     implementation 'org.nanohttpd:nanohttpd:2.3.1'
     implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+    implementation 'com.github.luben:zstd-jni:1.5.7-28@aar'
 }
 
 // ===== 原有 main() 风格离线测试：不改测试代码，用 JavaExec 驱动 =====
@@ -73,6 +74,7 @@ configurations { offlineTest }
 dependencies {
     offlineTest 'org.nanohttpd:nanohttpd:2.3.1'
     offlineTest 'com.squareup.okhttp3:okhttp:4.12.0'
+    offlineTest 'com.github.luben:zstd-jni:1.5.7-28'
     // Windows-only durable rename for offline tests; not an Android implementation dependency.
     offlineTest 'net.java.dev.jna:jna:5.17.0'
 }
@@ -295,6 +297,7 @@ def offlineTestMains = [
         'com.gaeul.allin.MiniMaxIntegrationHttpTest',
         'com.gaeul.allin.MiniMaxMediaGatewayHttpTest',
         'com.gaeul.allin.CodexImagesGatewayHttpTest',
+        'com.gaeul.allin.CodexZstdAndVersionHttpTest',
         'com.gaeul.allin.MiniMaxUnknownHttpTest',
         'com.gaeul.allin.MiniMaxCompetitionTest',
         'com.gaeul.allin.SessionAffinityOfflineTest',
@@ -362,6 +365,7 @@ def offlineTestMains = [
         'com.gaeul.allin.QoderHistoryRepairTest',
         'com.gaeul.allin.ZCodeGiftModelsOfflineTest',
         'com.gaeul.allin.ZCodeGiftDecimalUnitsHttpTest',
+        'com.gaeul.allin.CodeReviewFixesOfflineTest',
 ]
 
 def mainClassesDir = provider { tasks.named('compileReleaseJavaWithJavac', JavaCompile).get().destinationDirectory.get() }

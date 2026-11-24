@@ -130,6 +130,7 @@ public final class CodexRequestPolicyOfflineTest {
                 while(state<4&&(c=in.read())!=-1){head.write(c);state=state==0&&c==13?1:state==1&&c==10?2:state==2&&c==13?3:state==3&&c==10?4:0;}
                 Map<String,String> h=new HashMap<>();for(String line:head.toString("UTF-8").split("\r\n")){int colon=line.indexOf(':');if(colon>0)h.put(line.substring(0,colon).toLowerCase(Locale.ROOT),line.substring(colon+1).trim());}
                 int len=Integer.parseInt(h.get("content-length"));byte[] b=new byte[len];int n=0;while(n<len){int r=in.read(b,n,len-n);if(r<0)throw new EOFException();n+=r;}
+                if("zstd".equalsIgnoreCase(h.get("content-encoding")))b=CodexZstd.decompress(b,32*1024*1024);
                 body=new JSONObject(new String(b,StandardCharsets.UTF_8));headers=h;count.incrementAndGet();if(drop)continue;
                 byte[] out=response.getBytes(StandardCharsets.UTF_8);s.getOutputStream().write(("HTTP/1.1 "+status+" Result\r\nContent-Type: "+(response.startsWith("data:")?"text/event-stream":"application/json")+"\r\nContent-Length: "+out.length+"\r\nConnection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));s.getOutputStream().write(out);s.getOutputStream().flush();
             }catch(Throwable e){if(!server.isClosed())error=e;}});thread.setDaemon(true);thread.start();
