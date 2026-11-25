@@ -89,6 +89,7 @@ def offlineTestMains = [
         'com.gaeul.allin.AccountRoutingGatewayTest',
         'com.gaeul.allin.RaccoonQuotaFailoverOfflineTest',
         'com.gaeul.allin.QuotaFailoverOfflineTest',
+        'com.gaeul.allin.QuotaGateOfflineTest',
         'com.gaeul.allin.AccountRoutingHttpTest',
         'com.gaeul.allin.WorkBuddyRoutingExpiryTest',
         'com.gaeul.allin.AntigravityRequestParityOfflineTest',
