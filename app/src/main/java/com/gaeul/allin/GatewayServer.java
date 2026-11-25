@@ -12070,7 +12070,9 @@ public class GatewayServer extends NanoHTTPD {
                             && quotaExhausted(last.status, last.body)) {
                         rest(target, last.status);
                         if (selectedLease != null) { selectedLease.cancel(); selectedLease = null; }
-                        continue;
+                        // XunE fix: 必须跳出内层重试循环（while(true)），让外层候选循环轮到下一个账号；
+                        // 原来的 continue 只是重试同一账号，额度耗尽时会打满 maxAttempts 后 503。
+                        break;
                     }
                     // XunE: 1.2.90 的 loomy 401 是登录态失效（expired 业务码映射），不是
                     // 可重试的临时故障——自动重试会每请求多打一次上游，直接返回让客户端重新登录。
