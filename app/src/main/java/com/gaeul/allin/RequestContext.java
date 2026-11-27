@@ -25,6 +25,8 @@ public final class RequestContext implements OutboundLimiter.Cancellation, AutoC
     final long affinityEpoch;
     boolean heldResponse;
     volatile AtomicBoolean affinitySemantic = new AtomicBoolean();
+    volatile transient GatewayServer ownerServer;
+    final AtomicBoolean entryCounted = new AtomicBoolean(false);
     private final AtomicBoolean cancelled = new AtomicBoolean();
     final Map<String,RecentUsageScheduler.Lease> accountRoutingLeases = new HashMap<>();
     private final Set<HttpURLConnection> connections = new HashSet<>();
@@ -64,7 +66,7 @@ public final class RequestContext implements OutboundLimiter.Cancellation, AutoC
     }
     public void check() throws IOException { if(isCancelled()) throw new IOException("Request cancelled or deadline exceeded"); }
     public void attach(HttpURLConnection connection) throws IOException {
-        synchronized(this) { check(); connections.add(connection); }
+        synchronized(this) { check(); if (!connections.contains(connection)) connections.add(connection); }
     }
     public synchronized void detach(HttpURLConnection connection) { connections.remove(connection); }
     public void onClose(Runnable action) {

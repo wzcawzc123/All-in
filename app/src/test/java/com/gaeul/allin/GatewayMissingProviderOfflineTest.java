@@ -62,7 +62,7 @@ public final class GatewayMissingProviderOfflineTest {
                         case "getMethod": return NanoHTTPD.Method.POST;
                         case "getHeaders": return headers;
                         case "getInputStream": return input;
-                        case "getRemoteIpAddress": return "192.0.2.1";
+                        case "getRemoteIpAddress": return "127.0.0.1";
                         case "getParameters":
                         case "getParms": return Collections.emptyMap();
                         default: return null;

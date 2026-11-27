@@ -99,6 +99,18 @@ public class GatewayServer extends NanoHTTPD {
     }
     private static final ThreadLocal<RequestContext> REQUEST_CONTEXT = new ThreadLocal<>();
     private static final ThreadLocal<CallEvidence.Entry> CALL_ENTRY = new ThreadLocal<>();
+    private static final int MAX_GATEWAY_EVENTS = 40;
+    private java.util.Deque<JSONObject> gatewayEvents;
+    private synchronized java.util.Deque<JSONObject> gatewayEventsBuffer() {
+        if (gatewayEvents == null) gatewayEvents = new java.util.ArrayDeque<>(MAX_GATEWAY_EVENTS);
+        return gatewayEvents;
+    }
+    private static final ThreadLocal<String> GATEWAY_EVENT_STAGE = new ThreadLocal<>();
+    private static final ThreadLocal<String> GATEWAY_EVENT_MODEL = new ThreadLocal<>();
+    private static final ThreadLocal<String> LAST_ERROR_SUMMARY = new ThreadLocal<>();
+    private static final ThreadLocal<String> GATEWAY_EVENT_REASON = new ThreadLocal<>();
+    private static final ThreadLocal<Boolean> GATEWAY_EVENT_LEDGERED = new ThreadLocal<>();
+    static volatile java.util.function.Consumer<String> diagnosticLogHook;
     private volatile OutboundLimiter outboundLimiter;
     private java.util.concurrent.ThreadPoolExecutor heldWorkers;
     private synchronized java.util.concurrent.ExecutorService heldWorkers() {
@@ -160,6 +172,7 @@ public class GatewayServer extends NanoHTTPD {
         synchronized(this) {
             if(activeContexts!=null) activeContexts.remove(request);
             future=contextDeadlines==null?null:contextDeadlines.remove(request);
+            notifyAll();
         }
         if(future!=null) future.cancel(false);
     }
@@ -174,6 +187,7 @@ public class GatewayServer extends NanoHTTPD {
             minimaxLifecycle().retire();
             closeTrae();
             if(dailyCheckin!=null)dailyCheckin.close();
+            if(workBuddyTasks!=null)workBuddyTasks.shutdown();
             backupRetired=true;
             requests=activeContexts==null?Collections.emptyList():new ArrayList<>(activeContexts);
             if(contextDeadlines!=null) { futures=new ArrayList<>(contextDeadlines.values()); contextDeadlines.clear(); }
@@ -185,6 +199,21 @@ public class GatewayServer extends NanoHTTPD {
         if(heldWorkers!=null) heldWorkers.shutdownNow();
         if(catalogRefresh!=null) catalogRefresh.close();
         for(RequestContext r:requests) r.cancel("service stopped");
+        if(heldWorkers!=null) {
+            try { heldWorkers.awaitTermination(1500L, java.util.concurrent.TimeUnit.MILLISECONDS); }
+            catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+        }
+        synchronized(this) {
+            long deadlineNs = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(3000L);
+            while (activeContexts != null && !activeContexts.isEmpty()) {
+                long remNs = deadlineNs - System.nanoTime();
+                if (remNs <= 0L) break;
+                try { wait(Math.max(1L, remNs / 1_000_000L)); }
+                catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+            }
+        }
+        if (liveCountersLock != null) flushLiveCountersOnStop();
+        if (UsageLedger.isInitialized()) UsageLedger.flushPending();
         if(getListeningPort()>0) super.stop();
     }
     private final Context context;
@@ -197,6 +226,17 @@ public class GatewayServer extends NanoHTTPD {
     /** True only once the rescue copy was written atomically and verified byte-for-byte. */
     private volatile boolean configRecoveryRescueValid;
     private volatile String configRecoveryRescueError = "";
+    private static final class ConfigRecoveryBlockedException extends IOException {
+        ConfigRecoveryBlockedException() { super("configuration requires recovery"); }
+    }
+
+    private synchronized void writeConfigFileGuarded(JSONObject snapshot) throws IOException {
+        if (configRecoveryRequired || backupRetired) {
+            throw new ConfigRecoveryBlockedException();
+        }
+        AtomicConfigFile.write(configFile, snapshot.toString(2));
+    }
+
     /** Test seam (null in production): runs between the fsync and the atomic rename of a rescue. */
     private static volatile Runnable atomicWriteHookForTests;
     // Production runs one gateway instance. NetworkPolicy is process-wide;
@@ -386,6 +426,7 @@ public class GatewayServer extends NanoHTTPD {
     }
     private static boolean raccoonPathAllowed(String path) {
         return "/api/web/points/v1/balance".equals(path) || "/api/web/office/v3/setting_info".equals(path)
+                || "/api/web/auth/v1/user_info".equals(path)
                 || RaccoonAccountService.billsPathAllowed(path)
                 || "/api/web/desktop/v1/login/points/grant".equals(path);
     }
@@ -474,7 +515,12 @@ public class GatewayServer extends NanoHTTPD {
                     synchronizeAccountKeyMirrors(copy,"raccoon");
                     boolean raccoonRotated=refreshValueRotated(RaccoonRefreshService.PROVIDER,
                             expected.optString("refresh",""),candidate.optString("refresh",""));
-                    try { AtomicConfigFile.write(configFile,copy.toString(2)); }
+                    try { writeConfigFileGuarded(copy); }
+                    catch (ConfigRecoveryBlockedException recoveryBlocked) {
+                        settleRefreshFence(RaccoonRefreshService.PROVIDER, expected.optString("refresh", ""), raccoonRotated);
+                        publishConfig(copy); configChangedAffinity();
+                        return new JSONObject(destination.toString());
+                    }
                     catch(Exception writeFailure) {
                         if(raccoonRotated) throw refreshOutcomeUnknown(RaccoonRefreshService.PROVIDER);
                         resolveRefreshFence(RaccoonRefreshService.PROVIDER,expected.optString("refresh",""));
@@ -725,7 +771,10 @@ public class GatewayServer extends NanoHTTPD {
             return connection;
         }
         HttpURLConnection connection = useVendorFactory ? openVendorConnection(value) : NetworkPolicy.openHttp(value);
-        if (connection != null) connection.setInstanceFollowRedirects(false);
+        if (connection != null) {
+            connection.setInstanceFollowRedirects(false);
+            if (request != null) request.attach(connection);
+        }
         return connection;
     }
     private DeepSeekWeb.Transport deepSeekTransport = new DeepSeekWeb.HttpTransport();
@@ -1488,7 +1537,17 @@ public class GatewayServer extends NanoHTTPD {
                     // All four coordinated providers can have account-owned key mirrors.
                     // Rotate those in the same transaction so deletion cannot leave the old access behind.
                     synchronizeAccountKeyMirrors(copy,p);
-                    try { AtomicConfigFile.write(configFile, copy.toString(2)); }
+                    try { writeConfigFileGuarded(copy); }
+                    catch (ConfigRecoveryBlockedException recoveryBlocked) {
+                        // Upstream already returned updated/rotated credentials while config is read-only.
+                        // Fence any consumed one-use refresh value and keep the live token in memory
+                        // without writing configFile or rolling back to the consumed refresh.
+                        settleRefreshFence(p, commitValue, rotated);
+                        forgetPendingRotation(p, key);
+                        publishConfig(copy);
+                        generation[0] = accountRevision(p, key);
+                        return new JSONObject(dest.toString());
+                    }
                     catch (Exception writeFailure) {
                         // The exchange already happened; an unchanged value stays retryable.
                         if (!rotated) {
@@ -1597,7 +1656,7 @@ public class GatewayServer extends NanoHTTPD {
             target.put("project",project);
             for (String field : new String[]{"tier", "paidTier", "plan"})
                 if (candidate.has(field)) target.put(field, candidate.opt(field));
-            AtomicConfigFile.write(configFile,copy.toString(2));publishConfig(copy);
+            writeConfigFileGuarded(copy);publishConfig(copy);
             return new JSONObject(target.toString());
         }
     }
@@ -1661,7 +1720,12 @@ public class GatewayServer extends NanoHTTPD {
         dst.put("token",next.access); dst.put("refresh",next.refresh); dst.put("deviceToken",next.deviceToken);
         dst.put("deviceRefresh",next.deviceRefresh); dst.put("expiresAt",next.expiresAt); dst.put("catalogRenewedAt",System.currentTimeMillis());
         synchronizeAccountKeyMirrors(copy,"qoder_cn");
-        try { AtomicConfigFile.write(configFile,copy.toString(2)); }
+        try { writeConfigFileGuarded(copy); }
+        catch (ConfigRecoveryBlockedException recoveryBlocked) {
+            settleRefreshFence("qoder_cn", qoderSpent, qoderRotated);
+            publishConfig(copy);
+            return new JSONObject(dst.toString());
+        }
         catch(Exception writeFailure) {
             // The refresh token in the live account was already exchanged for this rotation.
             if (!qoderRotated) {
@@ -1936,7 +2000,7 @@ public class GatewayServer extends NanoHTTPD {
                 if(applied.size()!=updated.size()) return errorResponse(409,"Qoder 账号已变化");
                 if(models.length()==0) return errorResponse(502,"Qoder 目录不可用，保留原目录");
                 cp.put("models",models); cp.put("modelMeta",meta);
-                try { AtomicConfigFile.write(configFile,copy.toString(2)); publishConfig(copy); } catch(Exception e) { return errorResponse(409,"Qoder 目录保存失败"); }
+                try { writeConfigFileGuarded(copy); publishConfig(copy); } catch(Exception e) { return errorResponse(409,"Qoder 目录保存失败"); }
                 String message=partial?"部分账号同步失败，保留原目录":disabledListing.length()>0?"上游列出 "+discoveredKeys.size()+" 个模型，当前凭据启用 "+models.length()+" 个；其余由上游禁用，可重新授权后再同步":"同步成功";
                 if (signInRequired) message += "；" + (blockedHint.isEmpty()
                         ? "部分账号的一次性刷新凭据可能已被消费且未能保存，需重新登录后才能恢复" : blockedHint);
@@ -1962,7 +2026,7 @@ public class GatewayServer extends NanoHTTPD {
                 found.put("token",si.access); found.put("refresh",si.refresh); found.put("deviceToken",si.deviceToken);
                 found.put("deviceRefresh",si.deviceRefresh); found.put("deviceChat",si.deviceChat); found.put("expiresAt",si.expiresAt);
                 found.put("machineId",si.machineId); found.remove("catalogRenewedAt");
-                AtomicConfigFile.write(configFile,copy.toString(2)); publishConfig(copy); return true;
+                writeConfigFileGuarded(copy); publishConfig(copy); return true;
             }
         }
     }
@@ -2000,7 +2064,7 @@ public class GatewayServer extends NanoHTTPD {
         target.put("models",new JSONArray(models.toString()));target.put("modelMeta",normalizedMetadata);
         target.put("accessCatalogPool",GatewayAccessCatalog.poolFingerprint(expectedProvider));
         if(GatewayAccessCatalog.hasAccountCatalog(expectedProvider.optJSONArray("accounts"))) target.put("accessAccountCatalogScoped",true);
-        AtomicConfigFile.write(configFile,copy.toString(2));publishConfig(copy);
+        writeConfigFileGuarded(copy);publishConfig(copy);
     }
 
     synchronized byte[] backupDurableConfig() throws IOException {
@@ -2181,6 +2245,92 @@ public class GatewayServer extends NanoHTTPD {
         } catch(IllegalArgumentException invalid){return errorResponse(400,"请选择支持签到的有效账号，或检查开关参数");}
           catch(Exception failed){return errorResponse(503,"签到中心暂不可用；未确认的领取不会自动重复发送");}
     }
+    private volatile WorkBuddyAutoTask.Manager workBuddyTasks;
+    private synchronized WorkBuddyAutoTask.Manager workBuddyTaskManager() {
+        if (workBuddyTasks == null) {
+            workBuddyTasks = new WorkBuddyAutoTask.Manager(new WorkBuddyAutoTask.AccountHost() {
+                @Override public List<WorkBuddyAutoTask.AccountEntry> listWorkBuddyAccounts() {
+                    JSONObject cfg;
+                    Map<String, Long> snapshotEpochs;
+                    synchronized (GatewayServer.this) {
+                        cfg = new JSONObject(configJson.toString());
+                        snapshotEpochs = new HashMap<>(displayNameEpochs());
+                    }
+                    JSONArray providers = cfg.optJSONArray("providers");
+                    List<WorkBuddyAutoTask.AccountEntry> rawList = new ArrayList<>();
+                    Map<String, Integer> nameCounts = new HashMap<>();
+                    for (int i = 0; providers != null && i < providers.length(); i++) {
+                        JSONObject p = providers.optJSONObject(i);
+                        if (p == null) continue;
+                        String pid = p.optString("id", "");
+                        if (!"workbuddy".equals(pid) && !"workbuddy-ai".equals(pid)) continue;
+                        boolean providerEnabled = p.optBoolean("enabled", true);
+                        JSONArray accounts = p.optJSONArray("accounts");
+                        for (int j = 0; accounts != null && j < accounts.length(); j++) {
+                            JSONObject a = accounts.optJSONObject(j);
+                            if (a == null) continue;
+                            String accId = a.optString("id", "").trim();
+                            if (accId.isEmpty()) continue;
+                            Long epObj = snapshotEpochs.get(pid + "|" + accId);
+                            long accEpoch = epObj == null ? 0L : epObj.longValue();
+                            String nick = resolveBillingDisplayName(pid, a, WorkBuddyAllowance.eligible(a), accEpoch);
+                            if (nick.isEmpty()) nick = a.optString("nickname", "").trim();
+                            if (nick.isEmpty()) nick = a.optString("name", "").trim();
+                            if (nick.isEmpty()) nick = "WorkBuddy 账号";
+                            nameCounts.put(nick, nameCounts.getOrDefault(nick, 0) + 1);
+                            rawList.add(new WorkBuddyAutoTask.AccountEntry(pid, accId, nick, a, providerEnabled));
+                        }
+                    }
+                    List<WorkBuddyAutoTask.AccountEntry> out = new ArrayList<>(rawList.size());
+                    for (WorkBuddyAutoTask.AccountEntry e : rawList) {
+                        String label = e.displayName;
+                        if (nameCounts.getOrDefault(label, 0) > 1) {
+                            String uid = e.account.optString("uid", "").trim();
+                            String suffix = uid.length() >= 6 ? uid.substring(uid.length() - 6)
+                                    : (e.accountId.length() >= 6 ? e.accountId.substring(e.accountId.length() - 6) : e.accountId);
+                            if (!suffix.isEmpty()) label = label + " (" + suffix + ")";
+                        }
+                        out.add(new WorkBuddyAutoTask.AccountEntry(e.provider, e.accountId, label, e.account, e.providerEnabled));
+                    }
+                    return out;
+                }
+                @Override public NetworkPolicy.Snapshot networkSnapshot() {
+                    synchronized (GatewayServer.this) { return NetworkPolicy.parse(networkFromConfig(configJson)); }
+                }
+            }, this::openVendorConnection);
+        }
+        return workBuddyTasks;
+    }
+    private Response workBuddyTasksApi(String uri, String method, String raw) {
+        try {
+            if ("/api/workbuddy/tasks/status".equals(uri)) {
+                if (!"GET".equals(method)) return errorResponse(405, "GET required");
+                return jsonResponse(workBuddyTaskManager().snapshot());
+            }
+            if (!"POST".equals(method)) return errorResponse(405, "POST required");
+            JSONObject body = raw.trim().isEmpty() ? new JSONObject() : new JSONObject(raw);
+            if ("/api/workbuddy/tasks/refresh".equals(uri)) {
+                return jsonResponse(workBuddyTaskManager().refresh(body.optString("accountId", "").trim()));
+            }
+            if ("/api/workbuddy/tasks/run".equals(uri)) {
+                String mode = body.optString("mode", "run").trim();
+                String accId = body.optString("accountId", "").trim();
+                boolean includeTier2 = body.optBoolean("includeTier2", false);
+                JSONObject res = workBuddyTaskManager().startJob(mode, accId, includeTier2);
+                if (!res.optBoolean("ok", false)) {
+                    int code = res.optBoolean("busy", false) ? 409 : 400;
+                    return errorResponse(code, res.optString("error", "无法启动任务"));
+                }
+                return jsonResponse(res);
+            }
+            if ("/api/workbuddy/tasks/stop".equals(uri)) {
+                return jsonResponse(workBuddyTaskManager().stopJob());
+            }
+            return errorResponse(404, "Not Found");
+        } catch (Exception failed) {
+            return errorResponse(503, "WorkBuddy 成长任务服务暂不可用");
+        }
+    }
     /** Magpie keeps an expiring Cline token when a refresh fails but it still has this long. */
     private static final long CLINE_REFRESH_GRACE_MS = 30000L;
     private static final Object[] CLINE_REFRESH_LOCKS = clineRefreshLocks();
@@ -2289,7 +2439,11 @@ public class GatewayServer extends NanoHTTPD {
                     synchronizeAccountKeyMirrors(copy,"cline");
                 } catch (Exception e) { throw new IOException("Cline credential persistence failed", e); }
                 try {
-                    AtomicConfigFile.write(configFile, copy.toString(2));
+                    writeConfigFileGuarded(copy);
+                } catch (ConfigRecoveryBlockedException recoveryBlocked) {
+                    settleRefreshFence("cline", clineOneUse, clineRotated);
+                    publishConfig(copy);
+                    return target;
                 } catch (Exception writeFailure) {
                     // refreshCandidate already exchanged the old refresh token upstream.
                     if (!clineRotated) {
@@ -2324,7 +2478,7 @@ public class GatewayServer extends NanoHTTPD {
         if (minimaxLifecycle == null) minimaxLifecycle = new MiniMaxLifecycle(System::currentTimeMillis);
         return minimaxLifecycle;
     }
-    synchronized void retireForRestore() { backupRetired=true; if(catalogRefresh!=null)catalogRefresh.close(); minimaxLifecycle().retire(); closeTrae(); affinityEpoch++; affinity().clear(); if(historyAffinity!=null)historyAffinity.clear(); }
+    synchronized void retireForRestore() { backupRetired=true; if(catalogRefresh!=null)catalogRefresh.close(); if(workBuddyTasks!=null)workBuddyTasks.shutdown(); minimaxLifecycle().retire(); closeTrae(); affinityEpoch++; affinity().clear(); if(historyAffinity!=null)historyAffinity.clear(); }
 
     private static JSONObject miniAccount(JSONObject config, String id) {
         JSONArray providers=config.optJSONArray("providers"); JSONObject provider=null;
@@ -2394,7 +2548,15 @@ public class GatewayServer extends NanoHTTPD {
                 if(!AccountTransferProtection.tag(configJson,"minimax-code",old.refresh).isEmpty())throw new MiniMaxRefreshJournal.Blocked();
                 ticket[0]=miniMaxJournal().begin(lease.id,old.refresh);
             }
-            MiniMaxAuth.SignIn next=(miniMaxRefreshTransport==null?MiniMaxAuth.refresh(old.refresh):miniMaxRefreshTransport.refresh(old.refresh));
+            MiniMaxAuth.SignIn next;
+            try {
+                next=(miniMaxRefreshTransport==null?MiniMaxAuth.refreshChecked(old.refresh):miniMaxRefreshTransport.refresh(old.refresh));
+            } catch (MiniMaxAuth.RefreshFailure rf) {
+                if (rf.definitelyNotSent() && ticket[0] != null) {
+                    try { miniMaxJournal().abandonUnsent(ticket[0]); } catch (IOException ignored) { }
+                }
+                throw rf;
+            }
             if(next==null || old.refresh.equals(next.refresh)) throw new IOException("MiniMax refresh outcome uncertain; sign in again");
             return new MiniMaxLifecycle.Credentials(next.access,next.refresh,next.expires);
         }, (key,generation,old,next) -> {
@@ -2481,6 +2643,336 @@ public class GatewayServer extends NanoHTTPD {
     public volatile boolean lastMaskEnabled = false;
     /** 最近一次真实转发的时间戳；0 表示还没有请求经过网关 */
     public volatile long lastMaskAt = 0;
+
+    interface LiveCountersWriterHook {
+        void write(File file, String content) throws Exception;
+    }
+
+    private static final ThreadLocal<GatewayServer> ACTIVE_SERVER = new ThreadLocal<>();
+    private File liveCountersFile;
+    private Object liveCountersLock;
+    private Object liveCountersWriteLock;
+    private volatile boolean durableCountersEnabled;
+    private long liveCountersDirtySeq;
+    private long liveCountersWrittenSeq;
+    private long liveCountersDiskSeq;
+    private boolean liveCountersFlushScheduled;
+    private boolean liveCountersRetryScheduled;
+    private int liveCountersFailureStreak;
+    private boolean liveCountersStopped;
+    private long persistedLastMaskAt;
+    private java.util.concurrent.ScheduledExecutorService liveCountersExecutor;
+    volatile LiveCountersWriterHook liveCountersWriterHookForTests;
+
+    static GatewayServer activeServerFor(RequestContext context) {
+        if (context != null && context.ownerServer != null) return context.ownerServer;
+        return ACTIVE_SERVER.get();
+    }
+
+    static void attachLiveStatsTarget(UsageLedger.Row row, RequestContext context) {
+        if (row == null) return;
+        RequestContext rc = context != null ? context : REQUEST_CONTEXT.get();
+        if (row.liveServer == null) row.liveServer = activeServerFor(rc);
+        if (row.entryCounted == null && rc != null) row.entryCounted = rc.entryCounted;
+    }
+
+    private void recordPrivacyMask(int count, boolean enabled, boolean updateLast) {
+        if (liveCountersLock == null) {
+            if (count > 0 && totalMasked != null) totalMasked.addAndGet(count);
+            if (updateLast) {
+                lastMaskedCount = count;
+                lastMaskEnabled = enabled;
+                lastMaskAt = System.currentTimeMillis();
+            }
+            return;
+        }
+        boolean dirty = count > 0;
+        long immediateSeq = 0L;
+        long immediateMaskAt = 0L;
+        File immediateFile = null;
+        String immediatePayload = null;
+        synchronized (liveCountersLock) {
+            if (count > 0 && totalMasked != null) {
+                totalMasked.addAndGet(count);
+            }
+            if (updateLast) {
+                long now = System.currentTimeMillis();
+                boolean prevEnabled = lastMaskEnabled;
+                int prevCount = lastMaskedCount;
+                boolean wasZeroAt = lastMaskAt == 0L;
+                lastMaskedCount = count;
+                lastMaskEnabled = enabled;
+                lastMaskAt = now;
+                if (count > 0 || prevEnabled != enabled || prevCount != count || wasZeroAt) {
+                    dirty = true;
+                }
+            }
+            if (dirty && durableCountersEnabled && liveCountersStopped && liveCountersFile != null) {
+                liveCountersDirtySeq = Math.max(liveCountersDirtySeq + 1, liveCountersWrittenSeq + 1);
+                immediateSeq = liveCountersDirtySeq;
+                immediateMaskAt = lastMaskAt;
+                immediateFile = liveCountersFile;
+                immediatePayload = snapshotLiveCountersJson().toString();
+                dirty = false;
+            }
+        }
+        if (immediatePayload != null && writeLiveCountersOrdered(immediateFile, immediatePayload, immediateSeq)) {
+            synchronized (liveCountersLock) {
+                liveCountersWrittenSeq = Math.max(liveCountersWrittenSeq, immediateSeq);
+                persistedLastMaskAt = Math.max(persistedLastMaskAt, immediateMaskAt);
+            }
+        }
+        if (dirty) scheduleLiveCountersFlush();
+    }
+
+    private void recordContextDropped(int dropped) {
+        if (dropped <= 0) return;
+        if (liveCountersLock == null) {
+            if (totalContextDropped != null) totalContextDropped.addAndGet(dropped);
+            return;
+        }
+        long immediateSeq = 0L;
+        File immediateFile = null;
+        String immediatePayload = null;
+        synchronized (liveCountersLock) {
+            if (totalContextDropped != null) totalContextDropped.addAndGet(dropped);
+            if (durableCountersEnabled && liveCountersStopped && liveCountersFile != null) {
+                liveCountersDirtySeq = Math.max(liveCountersDirtySeq + 1, liveCountersWrittenSeq + 1);
+                immediateSeq = liveCountersDirtySeq;
+                immediateFile = liveCountersFile;
+                immediatePayload = snapshotLiveCountersJson().toString();
+            }
+        }
+        if (immediatePayload != null) {
+            if (writeLiveCountersOrdered(immediateFile, immediatePayload, immediateSeq)) {
+                synchronized (liveCountersLock) {
+                    liveCountersWrittenSeq = Math.max(liveCountersWrittenSeq, immediateSeq);
+                }
+            }
+            return;
+        }
+        scheduleLiveCountersFlush();
+    }
+
+    /**
+     * Live request totals follow the exact UsageLedger terminal-row contract:
+     * requests rejected before ledger entry (e.g., malformed JSON or early 400 validation)
+     * do not inflate pre-restart counters relative to post-restart ledger totals.
+     */
+    void onLedgerRowRecorded(UsageLedger.Row r) {
+        if (r == null) return;
+        if (r.isTerminal() && (r.entryCounted == null || r.entryCounted.compareAndSet(false, true))) {
+            if (totalRequests != null) totalRequests.incrementAndGet();
+        }
+        if (r.countTokens()) {
+            long tokens = r.countedTokens();
+            if (tokens > 0 && totalTokens != null) totalTokens.addAndGet(tokens);
+        }
+    }
+
+    void initPersistentLiveCounters(File filesDir) {
+        this.liveCountersLock = new Object();
+        this.liveCountersWriteLock = new Object();
+        this.liveCountersFile = new File(filesDir, "live-counters.json");
+        this.durableCountersEnabled = true;
+        if (UsageLedger.isInitialized()) {
+            long[] ledgerAll = UsageLedger.allTimeTotals();
+            if (totalRequests != null) totalRequests.set((int) Math.min(Integer.MAX_VALUE, Math.max(0L, ledgerAll[0])));
+            if (totalTokens != null) totalTokens.set(Math.max(0L, ledgerAll[1]));
+        }
+        synchronized (liveCountersLock) {
+            liveCountersStopped = false;
+            liveCountersDirtySeq = 0L;
+            liveCountersWrittenSeq = 0L;
+            liveCountersDiskSeq = 0L;
+            liveCountersFlushScheduled = false;
+            liveCountersRetryScheduled = false;
+            liveCountersFailureStreak = 0;
+            if (!liveCountersFile.isFile()) return;
+            try (java.io.FileInputStream in = new java.io.FileInputStream(liveCountersFile)) {
+                byte[] raw = readFileBytes(in);
+                if (raw.length == 0) return;
+                JSONObject saved = new JSONObject(new String(raw, "UTF-8"));
+                if (totalMasked != null) totalMasked.set((int) Math.min(Integer.MAX_VALUE, Math.max(0L, saved.optLong("totalMasked", 0L))));
+                if (totalContextDropped != null) totalContextDropped.set((int) Math.min(Integer.MAX_VALUE, Math.max(0L, saved.optLong("contextDropped", 0L))));
+                lastMaskedCount = Math.max(0, saved.optInt("lastMaskedCount", 0));
+                lastMaskEnabled = saved.optBoolean("lastMaskEnabled", false);
+                lastMaskAt = Math.max(0L, saved.optLong("lastMaskAt", 0L));
+                persistedLastMaskAt = lastMaskAt;
+            } catch (Throwable e) {
+                try { android.util.Log.w("Magpie", "读取持久计数器失败（按零继续）: " + e.getMessage()); } catch (Throwable ignored) {}
+            }
+        }
+    }
+
+    private void scheduleLiveCountersFlush() {
+        if (!durableCountersEnabled || liveCountersFile == null || liveCountersLock == null) return;
+        java.util.concurrent.ScheduledExecutorService exec;
+        synchronized (liveCountersLock) {
+            if (!durableCountersEnabled || liveCountersFile == null) return;
+            liveCountersDirtySeq++;
+            if (liveCountersStopped || liveCountersFlushScheduled) return;
+            if (liveCountersExecutor == null) {
+                liveCountersExecutor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                    Thread t = new Thread(r, "allin-live-counters");
+                    t.setDaemon(true);
+                    return t;
+                });
+            }
+            liveCountersFlushScheduled = true;
+            exec = liveCountersExecutor;
+        }
+        try {
+            exec.schedule(this::drainLiveCountersAsync, 180, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (java.util.concurrent.RejectedExecutionException ignored) {
+            synchronized (liveCountersLock) { liveCountersFlushScheduled = false; }
+        }
+    }
+
+    private JSONObject snapshotLiveCountersJson() {
+        JSONObject out = new JSONObject();
+        out.put("totalMasked", totalMasked != null ? Math.max(0, totalMasked.get()) : 0);
+        out.put("contextDropped", totalContextDropped != null ? Math.max(0, totalContextDropped.get()) : 0);
+        out.put("lastMaskedCount", lastMaskedCount);
+        out.put("lastMaskEnabled", lastMaskEnabled);
+        out.put("lastMaskAt", lastMaskAt);
+        return out;
+    }
+
+    private boolean writeLiveCountersFile(File targetFile, String payload) {
+        try {
+            LiveCountersWriterHook hook = liveCountersWriterHookForTests;
+            if (hook != null) hook.write(targetFile, payload);
+            else AtomicConfigFile.write(targetFile, payload);
+            return true;
+        } catch (Throwable e) {
+            try { android.util.Log.w("Magpie", "保存持久计数器失败: " + e.getMessage()); } catch (Throwable ignored) {}
+            return false;
+        }
+    }
+
+    private boolean writeLiveCountersOrdered(File targetFile, String payload, long seq) {
+        if (targetFile == null || payload == null) return false;
+        Object writeLock = liveCountersWriteLock != null ? liveCountersWriteLock : this;
+        synchronized (writeLock) {
+            if (seq > 0 && seq <= liveCountersDiskSeq) {
+                return true;
+            }
+            boolean ok = writeLiveCountersFile(targetFile, payload);
+            if (ok && seq > liveCountersDiskSeq) {
+                liveCountersDiskSeq = seq;
+            }
+            return ok;
+        }
+    }
+
+    private void drainLiveCountersAsync() {
+        for (;;) {
+            long targetSeq;
+            long snapMaskAt;
+            File targetFile;
+            String payload;
+            synchronized (liveCountersLock) {
+                if (!durableCountersEnabled || liveCountersStopped || liveCountersFile == null
+                        || (liveCountersDirtySeq == liveCountersWrittenSeq && lastMaskAt <= persistedLastMaskAt)) {
+                    liveCountersFlushScheduled = false;
+                    return;
+                }
+                liveCountersDirtySeq = Math.max(liveCountersDirtySeq, liveCountersWrittenSeq + 1);
+                targetSeq = liveCountersDirtySeq;
+                targetFile = liveCountersFile;
+                snapMaskAt = lastMaskAt;
+                payload = snapshotLiveCountersJson().toString();
+            }
+            boolean ok = writeLiveCountersOrdered(targetFile, payload, targetSeq);
+            long retryDelayMs = 0L;
+            java.util.concurrent.ScheduledExecutorService exec = null;
+            synchronized (liveCountersLock) {
+                if (ok && targetSeq > liveCountersWrittenSeq) {
+                    liveCountersWrittenSeq = targetSeq;
+                    persistedLastMaskAt = Math.max(persistedLastMaskAt, snapMaskAt);
+                    liveCountersFailureStreak = 0;
+                }
+                if (liveCountersStopped || (liveCountersDirtySeq == liveCountersWrittenSeq && lastMaskAt <= persistedLastMaskAt)) {
+                    liveCountersFlushScheduled = false;
+                    return;
+                }
+                if (!ok) {
+                    liveCountersFailureStreak = Math.min(8, liveCountersFailureStreak + 1);
+                    retryDelayMs = Math.min(5000L, 180L * (1L << Math.min(4, liveCountersFailureStreak - 1)));
+                    exec = liveCountersExecutor;
+                    if (exec != null && !exec.isShutdown() && !liveCountersRetryScheduled) {
+                        liveCountersRetryScheduled = true;
+                        liveCountersFlushScheduled = true;
+                    } else {
+                        liveCountersFlushScheduled = liveCountersRetryScheduled;
+                        return;
+                    }
+                }
+            }
+            if (retryDelayMs > 0 && exec != null) {
+                try {
+                    exec.schedule(() -> {
+                        synchronized (liveCountersLock) { liveCountersRetryScheduled = false; }
+                        drainLiveCountersAsync();
+                    }, retryDelayMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+                } catch (java.util.concurrent.RejectedExecutionException ignored) {
+                    synchronized (liveCountersLock) {
+                        liveCountersRetryScheduled = false;
+                        liveCountersFlushScheduled = false;
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    void flushLiveCountersOnStop() {
+        Object lock = liveCountersLock;
+        if (lock == null) return;
+        java.util.concurrent.ScheduledExecutorService exec;
+        synchronized (lock) {
+            liveCountersStopped = true;
+            exec = liveCountersExecutor;
+            liveCountersExecutor = null;
+        }
+        if (exec != null) {
+            exec.shutdownNow();
+            try {
+                exec.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        for (;;) {
+            long targetSeq;
+            long snapMaskAt;
+            File targetFile;
+            String payload;
+            synchronized (lock) {
+                liveCountersFlushScheduled = false;
+                liveCountersRetryScheduled = false;
+                targetFile = liveCountersFile;
+                if (durableCountersEnabled && targetFile != null
+                        && (liveCountersDirtySeq > liveCountersWrittenSeq || lastMaskAt > persistedLastMaskAt)) {
+                    liveCountersDirtySeq = Math.max(liveCountersDirtySeq, liveCountersWrittenSeq + 1);
+                    targetSeq = liveCountersDirtySeq;
+                    snapMaskAt = lastMaskAt;
+                    payload = snapshotLiveCountersJson().toString();
+                } else {
+                    return;
+                }
+            }
+            if (!writeLiveCountersOrdered(targetFile, payload, targetSeq)) return;
+            synchronized (lock) {
+                liveCountersWrittenSeq = Math.max(liveCountersWrittenSeq, targetSeq);
+                persistedLastMaskAt = Math.max(persistedLastMaskAt, snapMaskAt);
+                if (liveCountersDirtySeq <= liveCountersWrittenSeq && lastMaskAt <= persistedLastMaskAt) {
+                    return;
+                }
+            }
+        }
+    }
 
     private final AtomicInteger wbRoundRobin = new AtomicInteger(0);
     private volatile java.util.concurrent.ConcurrentHashMap<String,java.util.concurrent.atomic.AtomicLong> accountTurns;
@@ -2657,7 +3149,20 @@ public class GatewayServer extends NanoHTTPD {
     }
     private volatile ProviderBillingTransport billingTransport;
     void setProviderBillingTransportForTest(ProviderBillingTransport transport) { billingTransport = transport; }
-    private static final java.util.concurrent.ConcurrentHashMap<String,Object> billingBusy = new java.util.concurrent.ConcurrentHashMap<>();
+    private volatile java.util.concurrent.ConcurrentHashMap<String,Object> billingBusy;
+    private java.util.concurrent.ConcurrentHashMap<String,Object> billingBusyMap() {
+        java.util.concurrent.ConcurrentHashMap<String,Object> m = billingBusy;
+        if (m == null) {
+            synchronized (this) {
+                m = billingBusy;
+                if (m == null) {
+                    m = new java.util.concurrent.ConcurrentHashMap<>();
+                    billingBusy = m;
+                }
+            }
+        }
+        return m;
+    }
 
     private JSONObject fetchTraeAllowance(JSONObject account) throws Exception {
         JSONObject usage=TraeAuth.request(account,"/trae/api/v2/pay/ide_user_ent_usage","POST",
@@ -2747,7 +3252,16 @@ public class GatewayServer extends NanoHTTPD {
         case "raccoon": {
             String id=account.optString("id",""); if(id.isEmpty()) throw new IOException("Raccoon account unavailable");
             JSONObject fresh=ensureRaccoonToken(id,null,0); if(fresh==null) throw new IOException("Raccoon account unavailable");
-            RaccoonAccountService.Balance balance = raccoonApi(id, storedAccess(fresh)).balanceDetail();
+            RaccoonAccountService raccoonSvc = raccoonApi(id, storedAccess(fresh));
+            RaccoonAccountService.Balance balance = raccoonSvc.balanceDetail();
+            String racCacheKey = "raccoon|" + id;
+            String racFp = billingDisplayNameFingerprint("raccoon", fresh);
+            long racEpoch = currentDisplayNameEpoch(racCacheKey);
+            DisplayNameEntry racCached = displayNameCache().get(racCacheKey);
+            if (racCached == null || racCached.epoch != racEpoch || !racFp.equals(racCached.fingerprint)) {
+                String phone = raccoonSvc.maskedPhone();
+                if (!phone.isEmpty()) putBillingDisplayNameIfCurrent("raccoon", fresh, phone, racEpoch);
+            }
             synchronized(this) { JSONObject currentProvider=uniqueRaccoonProvider(configJson);
                 JSONObject current=currentProvider==null?null:uniqueRaccoonAccount(currentProvider,id);
                 if(currentProvider==null || !currentProvider.optBoolean("enabled",true) || !qoderEnabled(current))
@@ -2788,7 +3302,13 @@ public class GatewayServer extends NanoHTTPD {
         }
         case "minimax-code": {
             MiniMaxLifecycle.Lease lease=miniLease(account,false,null);
+            long mmEpoch = (lease.id != null && !lease.id.isEmpty()) ? currentDisplayNameEpoch("minimax-code|" + lease.id) : 0L;
             JSONObject result=MiniMaxAllowance.fetch(lease.credentials.access,account.optString("opGroupId",account.optString("groupId","")),this::openVendorConnection);
+            String mmName = result == null ? "" : result.optString("_displayName", "").trim();
+            if (result != null) result.remove("_displayName");
+            if (!mmName.isEmpty() && lease.id != null && !lease.id.isEmpty()) {
+                putBillingDisplayNameIfCurrent("minimax-code", account, mmName, mmEpoch);
+            }
             synchronized(this) { JSONObject current=miniAccount(configJson,lease.id);
                 if(!minimaxLifecycle().isCurrent(lease) || current==null) throw new IOException("account changed");
                 billingAdoptRefresh(account,current); }
@@ -2983,7 +3503,7 @@ public class GatewayServer extends NanoHTTPD {
         if (!Double.isFinite(value)) return null;
         return ZCodeAuth.giftNumber(value);
     }
-    private JSONObject billingSnapshot(String id, JSONObject provider) throws Exception {
+    private JSONObject billingSnapshot(String id, JSONObject provider, Map<String, Long> snapshotEpochs) throws Exception {
         JSONObject models=new JSONObject();
         JSONArray ids=provider.optJSONArray("models"); JSONObject meta=provider.optJSONObject("modelMeta");
         for(int i=0;ids!=null && i<ids.length();i++) {
@@ -3039,9 +3559,211 @@ public class GatewayServer extends NanoHTTPD {
             catch(WorkBuddyAllowance.Failure e) { item.put("errorKind",e.kind); }
             catch(Exception e) { item.put("errorKind","unavailable"); }
             if(Thread.currentThread().isInterrupted()) throw new java.io.InterruptedIOException("interrupted");
+            if(billingTransport==null) {
+                String accId = a.optString("id", "").trim();
+                Long epObj = snapshotEpochs == null ? null : snapshotEpochs.get(id + "|" + accId);
+                long accEpoch = epObj == null ? 0L : epObj.longValue();
+                String dn=resolveBillingDisplayName(id,a,item.has("allowance"),accEpoch);
+                if(!dn.isEmpty()) item.put("displayName",dn);
+            }
             if(billingAccountCurrent(id,a)) results.put(item);
         }
         return new JSONObject().put("ok",true).put("provider",id).put("accounts",results).put("models",models);
+    }
+    private static final class DisplayNameEntry {
+        final long epoch;
+        final String fingerprint;
+        final String displayName;
+        DisplayNameEntry(long epoch, String fingerprint, String displayName) {
+            this.epoch = epoch;
+            this.fingerprint = fingerprint;
+            this.displayName = displayName;
+        }
+    }
+
+    private volatile java.util.concurrent.ConcurrentHashMap<String, DisplayNameEntry> billingDisplayNameCache;
+    private volatile java.util.concurrent.ConcurrentHashMap<String, Long> billingDisplayNameEpochs;
+
+    private java.util.concurrent.ConcurrentHashMap<String, DisplayNameEntry> displayNameCache() {
+        java.util.concurrent.ConcurrentHashMap<String, DisplayNameEntry> m = billingDisplayNameCache;
+        if (m == null) {
+            synchronized (this) {
+                m = billingDisplayNameCache;
+                if (m == null) {
+                    m = new java.util.concurrent.ConcurrentHashMap<>();
+                    billingDisplayNameCache = m;
+                }
+            }
+        }
+        return m;
+    }
+
+    private java.util.concurrent.ConcurrentHashMap<String, Long> displayNameEpochs() {
+        java.util.concurrent.ConcurrentHashMap<String, Long> m = billingDisplayNameEpochs;
+        if (m == null) {
+            synchronized (this) {
+                m = billingDisplayNameEpochs;
+                if (m == null) {
+                    m = new java.util.concurrent.ConcurrentHashMap<>();
+                    billingDisplayNameEpochs = m;
+                }
+            }
+        }
+        return m;
+    }
+
+    private synchronized long currentDisplayNameEpoch(String cacheKey) {
+        Long v = displayNameEpochs().get(cacheKey);
+        return v == null ? 0L : v.longValue();
+    }
+
+    private synchronized void invalidateBillingDisplayName(String provider, String accId) {
+        if (provider == null || accId == null) return;
+        String id = accId.trim();
+        if (id.isEmpty()) return;
+        String cacheKey = provider + "|" + id;
+        displayNameEpochs().put(cacheKey, currentDisplayNameEpoch(cacheKey) + 1L);
+        displayNameCache().remove(cacheKey);
+    }
+
+    private static String billingDisplayNameFingerprint(String provider, JSONObject account) {
+        if (account == null) return "";
+        StringBuilder sb = new StringBuilder();
+        sb.append(provider == null ? "" : provider).append('\0');
+        sb.append(account.optString("id", "").trim()).append('\0');
+        sb.append(account.optString("uid", "").trim()).append('\0');
+        sb.append(account.optString("accountId", "").trim()).append('\0');
+        sb.append(account.optString("nickname", "").trim()).append('\0');
+        sb.append(account.optString("name", "").trim()).append('\0');
+        sb.append(account.optString("email", "").trim()).append('\0');
+        sb.append(account.optString("opGroupId", account.optString("groupId", "")).trim()).append('\0');
+        sb.append(account.optString("domain", "").trim()).append('\0');
+        sb.append(account.optString("type", "").trim()).append('\0');
+        sb.append(account.optString("source", "").trim());
+        if ("codex".equals(provider)) {
+            sb.append('\0').append(jwtEmailFromToken(account.optString("idToken", "")));
+        }
+        return sb.toString();
+    }
+
+    private synchronized boolean billingAccountMatchesForDisplayName(String provider, JSONObject snapshot, String expectedFp) {
+        if (stopping || backupRetired || snapshot == null) return false;
+        JSONObject p = getProviderById(provider);
+        if (p == null || !p.optBoolean("enabled", true)) return false;
+        String id = snapshot.optString("id", "").trim();
+        if (id.isEmpty()) return false;
+        JSONArray accounts = p.optJSONArray("accounts");
+        JSONObject found = null;
+        for (int i = 0; accounts != null && i < accounts.length(); i++) {
+            JSONObject a = accounts.optJSONObject(i);
+            if (a != null && id.equals(a.optString("id", "").trim())) {
+                if (found != null) return false;
+                found = a;
+            }
+        }
+        if (found == null || !qoderEnabled(found)) return false;
+        return expectedFp.equals(billingDisplayNameFingerprint(provider, found));
+    }
+
+    private boolean putBillingDisplayNameIfCurrent(String provider, JSONObject snapshot, String displayName, long expectedEpoch) {
+        if (snapshot == null || displayName == null || displayName.isEmpty()) return false;
+        String accId = snapshot.optString("id", "").trim();
+        if (accId.isEmpty()) return false;
+        String cacheKey = provider + "|" + accId;
+        String fp = billingDisplayNameFingerprint(provider, snapshot);
+        synchronized (this) {
+            if (currentDisplayNameEpoch(cacheKey) != expectedEpoch
+                    || !billingAccountMatchesForDisplayName(provider, snapshot, fp)) {
+                DisplayNameEntry existing = displayNameCache().get(cacheKey);
+                if (existing != null && existing.epoch == expectedEpoch && fp.equals(existing.fingerprint)) {
+                    displayNameCache().remove(cacheKey, existing);
+                }
+                return false;
+            }
+            java.util.concurrent.ConcurrentHashMap<String, DisplayNameEntry> cache = displayNameCache();
+            if (cache.size() > 256 && !cache.containsKey(cacheKey)) cache.clear();
+            cache.put(cacheKey, new DisplayNameEntry(expectedEpoch, fp, displayName));
+            return true;
+        }
+    }
+
+    private static String jwtEmailFromToken(String jwt) {
+        if (jwt == null || jwt.isEmpty()) return "";
+        String[] parts = jwt.split("\\.");
+        if (parts.length < 2) return "";
+        try {
+            String p = parts[1].replace('-', '+').replace('_', '/');
+            int pad = (4 - (p.length() % 4)) % 4;
+            for (int i = 0; i < pad; i++) p += "=";
+            byte[] decoded;
+            try {
+                Class<?> ab = Class.forName("android.util.Base64");
+                decoded = (byte[]) ab.getMethod("decode", String.class, int.class).invoke(null, p, 0);
+            } catch (Exception jvm) {
+                decoded = (byte[]) Class.forName("java.util.Base64$Decoder")
+                        .getMethod("decode", String.class)
+                        .invoke(Class.forName("java.util.Base64").getMethod("getDecoder").invoke(null), p);
+            }
+            JSONObject claims = new JSONObject(new String(decoded, java.nio.charset.StandardCharsets.UTF_8));
+            String email = claims.optString("email", "").trim();
+            if (!email.isEmpty()) return email;
+            JSONObject profile = claims.optJSONObject("https://api.openai.com/profile");
+            if (profile != null) {
+                email = profile.optString("email", "").trim();
+                if (!email.isEmpty()) return email;
+            }
+        } catch (Exception ignored) { }
+        return "";
+    }
+
+    private String resolveBillingDisplayName(String provider, JSONObject account, boolean hasAllowance) {
+        if (account == null) return "";
+        String accId = account.optString("id", "").trim();
+        if (accId.isEmpty()) return "";
+        return resolveBillingDisplayName(provider, account, hasAllowance, currentDisplayNameEpoch(provider + "|" + accId));
+    }
+
+    private String resolveBillingDisplayName(String provider, JSONObject account, boolean hasAllowance, long expectedEpoch) {
+        if (account == null) return "";
+        String accId = account.optString("id", "").trim();
+        if (accId.isEmpty()) return "";
+        String cacheKey = provider + "|" + accId;
+        String fp = billingDisplayNameFingerprint(provider, account);
+        if (currentDisplayNameEpoch(cacheKey) != expectedEpoch) {
+            return "";
+        }
+        java.util.concurrent.ConcurrentHashMap<String, DisplayNameEntry> cache = displayNameCache();
+        DisplayNameEntry cached = cache.get(cacheKey);
+        if (cached != null && (cached.epoch != expectedEpoch || !fp.equals(cached.fingerprint))) {
+            cache.remove(cacheKey, cached);
+            cached = null;
+        }
+        if ("workbuddy".equals(provider) || "workbuddy-ai".equals(provider)) {
+            String nick = account.optString("nickname", "").trim();
+            if (!nick.isEmpty()) {
+                return putBillingDisplayNameIfCurrent(provider, account, nick, expectedEpoch) ? nick : "";
+            }
+            if (cached != null && !cached.displayName.isEmpty()) return cached.displayName;
+            if (hasAllowance) {
+                nick = WorkBuddyAllowance.fetchNickname(provider, account, this::openVendorConnection);
+                if (!nick.isEmpty()) {
+                    return putBillingDisplayNameIfCurrent(provider, account, nick, expectedEpoch) ? nick : "";
+                }
+            }
+            return "";
+        } else if ("codex".equals(provider)) {
+            if (cached != null && !cached.displayName.isEmpty()) return cached.displayName;
+            String em = account.optString("email", "").trim();
+            if (em.isEmpty() || em.startsWith("Codex-")) {
+                em = jwtEmailFromToken(account.optString("idToken", ""));
+                if (em.isEmpty()) em = jwtEmailFromToken(account.optString("access", account.optString("token", "")));
+            }
+            if (!em.isEmpty() && !em.startsWith("Codex-")) {
+                return putBillingDisplayNameIfCurrent(provider, account, em, expectedEpoch) ? em : "";
+            }
+            return "";
+        }
+        return cached != null ? cached.displayName : "";
     }
     private java.util.concurrent.ThreadPoolExecutor billingWorkers;
     private Set<java.util.concurrent.FutureTask<JSONObject>> billingTasks;
@@ -3062,7 +3784,7 @@ public class GatewayServer extends NanoHTTPD {
             billingWorkers.execute(scopedTask(() -> {
                 try { task.run(); }
                 finally {
-                    billingBusy.remove(id, operation);
+                    billingBusyMap().remove(id, operation);
                     synchronized (GatewayServer.this) { billingTasks.remove(task); }
                 }
             }));
@@ -3084,21 +3806,23 @@ public class GatewayServer extends NanoHTTPD {
         List<String> values=session.getParameters().get("provider");
         if(values==null || values.size()!=1) return errorResponse(400,"Provider required");
         String id=values.get(0); JSONObject snapshot;
+        Map<String, Long> snapshotEpochs;
         synchronized(this) { JSONObject provider=getProviderById(id);
             if(provider==null) return errorResponse(404,"Provider unavailable");
             if(!provider.optBoolean("enabled",true)) return errorResponse(403,"Provider disabled");
             snapshot=new JSONObject(provider.toString());
+            snapshotEpochs = new HashMap<>(displayNameEpochs());
         }
         final Object billingOperation=new Object();
-        if(billingBusy.putIfAbsent(id,billingOperation)!=null) return errorResponse(409,"Provider busy");
-        java.util.concurrent.FutureTask<JSONObject> task=new java.util.concurrent.FutureTask<>(() -> billingSnapshot(id,snapshot));
+        if(billingBusyMap().putIfAbsent(id,billingOperation)!=null) return errorResponse(409,"Provider busy");
+        java.util.concurrent.FutureTask<JSONObject> task=new java.util.concurrent.FutureTask<>(() -> billingSnapshot(id,snapshot,snapshotEpochs));
         try { dispatchBilling(id, billingOperation, task); }
-        catch(Throwable failure) { billingBusy.remove(id,billingOperation); return errorResponse(503,"Billing unavailable"); }
+        catch(Throwable failure) { billingBusyMap().remove(id,billingOperation); return errorResponse(503,"Billing unavailable"); }
         try {
             JSONObject result=task.get(20,java.util.concurrent.TimeUnit.SECONDS);
             // Future completion precedes the worker thread's outer finally. Release
             // only this operation now; its late cleanup cannot clear a newer operation.
-            billingBusy.remove(id,billingOperation);
+            billingBusyMap().remove(id,billingOperation);
             synchronized(this) {
                 if (stopping || backupRetired) return errorResponse(503,"Billing unavailable");
                 JSONObject current=getProviderById(id);
@@ -3337,6 +4061,7 @@ public class GatewayServer extends NanoHTTPD {
         } catch (Throwable e) {
             android.util.Log.w("Magpie", "用量账本初始化失败: " + e.getMessage());
         }
+        initPersistentLiveCounters(context.getFilesDir());
         calibrateZCodeBaseAsync();
         // Daily claims are scheduled by CheckinCenter after the listener starts.
     }
@@ -5014,23 +5739,34 @@ public class GatewayServer extends NanoHTTPD {
      * 非回环的推理入口一律拒绝，避免同网设备白用池里的额度。
      */
     private boolean publishedDefaultKeyBlocksRequest(IHTTPSession session) {
-        return session != null && !isLocalRequest(session) && isPublishedDefaultAuthKey(configuredAuthKey());
+        return session != null && !isLocalRequest(session) && !authKeyAllowsRemoteAccess(configuredAuthKey());
     }
 
-    /** 明确的迁移提示，不把「默认口令」混成普通鉴权失败。 */
+    /** 明确的迁移提示，不把「默认/过短口令」混成普通鉴权失败。 */
     private Response publishedDefaultKeyResponse() {
         JSONObject err = new JSONObject();
         try {
+            String current = configuredAuthKey();
+            boolean legacyDefault = isPublishedDefaultAuthKey(current);
             JSONObject detail = new JSONObject();
-            detail.put("message", "网关仍在使用历史公开默认口令，已拒绝来自局域网的推理请求");
+            detail.put("message", legacyDefault
+                    ? "网关仍在使用历史公开默认口令，已拒绝来自局域网的推理请求"
+                    : "网关当前口令过短（不足 " + MIN_REMOTE_AUTH_KEY_LENGTH + " 位），已拒绝来自局域网的推理请求");
             detail.put("type", "gateway_error");
-            detail.put("code", "legacy_default_auth_key");
+            detail.put("code", legacyDefault
+                    ? "legacy_default_auth_key"
+                    : (current.trim().isEmpty() ? "auth_key_missing" : "auth_key_too_short"));
             detail.put("hint", "在手机 App 面板「网关设置 → 网关口令」生成并应用新口令（至少 "
                     + MIN_REMOTE_AUTH_KEY_LENGTH
                     + " 位，且不能是历史默认值），再用同一口令更新电脑端的连接信息；手机本机访问不受影响。");
             err.put("error", detail);
         } catch (Exception ignored) {
         }
+        GATEWAY_EVENT_STAGE.set("auth");
+        String currentForSummary = configuredAuthKey();
+        LAST_ERROR_SUMMARY.set(isPublishedDefaultAuthKey(currentForSummary)
+                ? "网关仍在使用历史公开默认口令，已拒绝来自局域网的推理请求"
+                : "网关当前口令过短（不足 " + MIN_REMOTE_AUTH_KEY_LENGTH + " 位），已拒绝来自局域网的推理请求");
         Response resp = newFixedLengthResponse(Status.FORBIDDEN, "application/json; charset=UTF-8", err.toString());
         resp.addHeader("Cache-Control", "no-store");
         addCorsHeaders(resp);
@@ -5087,6 +5823,8 @@ public class GatewayServer extends NanoHTTPD {
                     + "或在 URL 加 ?key=<authKey>。口令见面板「网关设置」里的 server.authKey。");
         } catch (Exception ignored) {
         }
+        GATEWAY_EVENT_STAGE.set("auth");
+        LAST_ERROR_SUMMARY.set("需要网关口令 (Authorization / x-api-key 缺失或无效)");
         Response resp = newFixedLengthResponse(Status.UNAUTHORIZED, "application/json; charset=UTF-8", err.toString());
         addCorsHeaders(resp);
         return resp;
@@ -5334,7 +6072,9 @@ public class GatewayServer extends NanoHTTPD {
         RequestContext request=new RequestContext(session.getUri(),NetworkPolicy.capture(),
                 RequestTiming.requestMillis(failover), currentQuirksSnapshot(), affinity().fingerprint(pickSession(session.getHeaders())), affinity().fingerprint(presentedKey(session).isEmpty()?"local-anonymous":presentedKey(session)), affinityEpoch);
         if(!registerContext(request)) { gate.leave(); return errorResponse(503,"Gateway request capacity exhausted or stopping"); }
+        request.ownerServer = this;
         REQUEST_CONTEXT.set(request);
+        ACTIVE_SERVER.set(this);
         boolean heldDelivery=false;
         boolean handedOff = false;
         try {
@@ -5363,7 +6103,7 @@ public class GatewayServer extends NanoHTTPD {
                         fi.iki.elonen.AllInHeldResponse held=new fi.iki.elonen.AllInHeldResponse(() -> {
                             IngressBody.Result owned = ingress.begin();
                             if (owned == null) throw new IOException("Prepared request cancelled");
-                            REQUEST_CONTEXT.set(request); PREPARED_BODY.set(prepared); RESILIENCE_SCOPE.set(resilience);
+                            REQUEST_CONTEXT.set(request); PREPARED_BODY.set(prepared); RESILIENCE_SCOPE.set(resilience); ACTIVE_SERVER.set(GatewayServer.this);
                             try(NetworkPolicy.Scope scope=NetworkPolicy.use(request.network)) { request.check(); return serveTrackedRequest(session); }
                             finally { ingress.finish(); REQUEST_CONTEXT.remove(); PREPARED_BODY.remove(); RESILIENCE_SCOPE.remove(); BODY_ERROR.remove(); clearUsageThreadState(); }
                         },heldWorkers(),3000,3000,() -> request.cancel("held response cancelled"),request::isCancelled,protocol,request::businessWritten);
@@ -5376,6 +6116,10 @@ public class GatewayServer extends NanoHTTPD {
             } else response=serveTrackedRequest(session);
             if (response == null) return null;
             attachCallId(response,request.requestId);
+            if (response.getStatus().getRequestStatus() >= 400 && !Boolean.TRUE.equals(GATEWAY_EVENT_LEDGERED.get())) {
+                recordPreDispatchRejection(session.getUri(), session.getMethod().name(),
+                        response.getStatus().getRequestStatus(), request.requestId);
+            }
             if(response.getData()!=null) {
                 final InputStream body=response.getData();
                 request.onClose(() -> { try { body.close(); } catch(IOException ignoredClose) { } });
@@ -5390,7 +6134,7 @@ public class GatewayServer extends NanoHTTPD {
             });
             handedOff = true;
             return tracked;
-        } finally { REQUEST_CONTEXT.remove(); PREPARED_BODY.remove(); BODY_ERROR.remove(); RESILIENCE_SCOPE.remove(); if (!handedOff) { finishContext(request); gate.leave(); } }
+        } finally { ACTIVE_SERVER.remove(); REQUEST_CONTEXT.remove(); PREPARED_BODY.remove(); BODY_ERROR.remove(); RESILIENCE_SCOPE.remove(); if (!handedOff) { finishContext(request); gate.leave(); } }
     }
 
     private static void warnOnResponsesProjection(JSONObject original) {
@@ -5409,8 +6153,10 @@ public class GatewayServer extends NanoHTTPD {
             response.addHeader("Access-Control-Expose-Headers",exposed.isEmpty()?"X-AllIn-Request-Id, Retry-After":exposed+", X-AllIn-Request-Id, Retry-After");
     }
     private static void clearUsageThreadState() {
+        ACTIVE_SERVER.remove();
         CALL_ENTRY.remove();U_SESSION.remove(); U_ROW.remove();U_START.remove();U_FIRST.remove();U_LAST.remove();U_DONE.remove();
-        ATTEMPT_LEASE.remove();LOGICAL.remove();CURRENT_ORIGIN.remove();CLIENT_ANTHROPIC.remove();CLIENT_MODEL.remove();CLIENT_OUTPUT_LIMIT.remove();CODEX_CLIENT_OUTPUT_LIMIT_FIELDS.remove(); CODEX_SESSION_HEADERS.remove();CLIENT_OUTPUT_PROTOCOL.remove();
+        ATTEMPT_LEASE.remove();LOGICAL.remove();ACTIVE_SECRETS.remove();CURRENT_ORIGIN.remove();CLIENT_ANTHROPIC.remove();CLIENT_MODEL.remove();CLIENT_OUTPUT_LIMIT.remove();CODEX_CLIENT_OUTPUT_LIMIT_FIELDS.remove(); CODEX_SESSION_HEADERS.remove();CLIENT_OUTPUT_PROTOCOL.remove();
+        GATEWAY_EVENT_STAGE.remove(); GATEWAY_EVENT_MODEL.remove(); LAST_ERROR_SUMMARY.remove(); GATEWAY_EVENT_REASON.remove(); GATEWAY_EVENT_LEDGERED.remove();
     }
     private Response serveTrackedRequest(IHTTPSession session) {
         RequestContext traceContext=REQUEST_CONTEXT.get();
@@ -5434,28 +6180,53 @@ public class GatewayServer extends NanoHTTPD {
             CODEX_SESSION_HEADERS.set(codexHeaders);
             Response response = serveRequest(session);
             if(trace!=null)attachCallId(response,trace.requestId);
+            if (response != null && response.getStatus().getRequestStatus() >= 400
+                    && !Boolean.TRUE.equals(GATEWAY_EVENT_LEDGERED.get()) && GatewayAccessPolicy.model(session.getUri())) {
+                recordPreDispatchRejection(session.getUri(), session.getMethod().name(),
+                        response.getStatus().getRequestStatus(),
+                        traceContext != null ? traceContext.requestId : (trace != null ? trace.requestId : ""));
+            }
             if (GatewayAccessPolicy.responses(session.getUri()) && session.getMethod() == Method.POST && response != null
                     && response.getStatus().getRequestStatus() >= 200
                     && response.getStatus().getRequestStatus() < 300 && !Boolean.TRUE.equals(RESP_NATIVE_RESULT.get())
-                    && response.getHeader("X-AllIn-Native-Responses")==null) {
+                    && !Boolean.TRUE.equals(RESP_PROJECTED_DONE.get())
+                    && response.getHeader("X-AllIn-Native-Responses") == null) {
                 String mime = response.getMimeType();
                 if (mime != null && mime.contains("text/event-stream")) {
                     final InputStream originalStream = response.getData();
                     InputStream projected = ResponsesBridge.chatStreamToResponses(originalStream, CLIENT_MODEL.get());
-                    // Preserve completion delivery through protocol projection wrappers.
-                    response.setData(new CompletionForwardStream(projected, originalStream));
+                    // Preserve completion delivery and projection failure attribution through wrappers.
+                    response.setData(new CompletionForwardStream(projected, originalStream, RESPONSES_CHAT_ROW.get()));
                     response.setMimeType("text/event-stream; charset=UTF-8");
+                    response.setChunkedTransfer(true);
                 } else {
                     try {
                         String body = drainText(response.getData());
                         JSONObject converted = ResponsesBridge.chatResponseToResponses(new JSONObject(body), CLIENT_MODEL.get());
                         response.setData(new ByteArrayInputStream(converted.toString().getBytes("UTF-8")));
                         response.setMimeType("application/json; charset=UTF-8");
+                        UsageLedger.Row projRow = RESPONSES_CHAT_ROW.get();
+                        if (projRow != null) {
+                            projRow.bridgeStatus = "ok";
+                            if (projRow.deliveryStatus.isEmpty()) projRow.deliveryStatus = "unknown";
+                            attachFixedLengthDeliveryTracking(response, projRow, traceContext);
+                        }
+                        response.setChunkedTransfer(true);
                     } catch (Exception e) {
+                        GATEWAY_EVENT_STAGE.set("conversion");
+                        GATEWAY_EVENT_REASON.set("conversion_validation_failed");
+                        UsageLedger.Row projRow = RESPONSES_CHAT_ROW.get();
+                        if (projRow != null) {
+                            String msg = "Invalid upstream Chat response: " + (e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+                            recordRowFailureMeta(projRow, "conversion", "protocol", "conversion_validation_failed");
+                            projRow.bridgeStatus = "failed";
+                            if (projRow.ledgerPersisted) {
+                                UsageLedger.settleDelivery(projRow, false, 502, msg, "conversion", "protocol", "conversion_validation_failed", "failed");
+                            }
+                        }
                         return errorResponse(502, "Invalid upstream Chat response: " + e.getMessage());
                     }
                 }
-                response.setChunkedTransfer(true);
             }
             if(response!=null && RESP_WARNING.get()!=null) response.addHeader("X-AllIn-Compatibility-Warning",RESP_WARNING.get());
             if (response != null && wantsAnthropicOut() && response.getHeader("X-AllIn-Compatibility-Warning") == null
@@ -5468,7 +6239,7 @@ public class GatewayServer extends NanoHTTPD {
             }
             return response;
         }
-        finally { CALL_ENTRY.remove();QODER_HISTORY_ERROR.remove(); QODER_RAW_HISTORY.remove(); LOGICAL.remove(); RESP_WARNING.remove(); NATIVE_HEADERS.remove(); NATIVE_REQUEST.remove(); NATIVE_BASELINE.remove(); NATIVE_DIRECT_ALLOWED.remove(); CLIENT_OUTPUT_LIMIT.remove(); CODEX_CLIENT_OUTPUT_LIMIT_FIELDS.remove(); CODEX_SESSION_HEADERS.remove(); RESP_REQUEST.remove(); RESP_BASELINE.remove(); RESP_NATIVE_RESULT.remove(); RESP_NATIVE_CANDIDATE.remove(); CLIENT_OUTPUT_PROTOCOL.remove(); }
+        finally { CALL_ENTRY.remove();QODER_HISTORY_ERROR.remove(); QODER_RAW_HISTORY.remove(); LOGICAL.remove(); ACTIVE_SECRETS.remove(); RESP_WARNING.remove(); NATIVE_HEADERS.remove(); NATIVE_REQUEST.remove(); NATIVE_BASELINE.remove(); NATIVE_DIRECT_ALLOWED.remove(); CLIENT_OUTPUT_LIMIT.remove(); CODEX_CLIENT_OUTPUT_LIMIT_FIELDS.remove(); CODEX_SESSION_HEADERS.remove(); RESP_REQUEST.remove(); RESP_BASELINE.remove(); RESP_NATIVE_RESULT.remove(); RESP_NATIVE_CANDIDATE.remove(); CLIENT_OUTPUT_PROTOCOL.remove(); RESPONSES_CHAT_ROW.remove(); RESP_PROJECTED_DONE.remove(); }
     }
 
     private Response serveRequest(IHTTPSession session) {
@@ -5496,6 +6267,7 @@ public class GatewayServer extends NanoHTTPD {
         }
 
         // 向导完成前只允许本机访问，包括静态页面和预检请求。
+        GATEWAY_EVENT_STAGE.set("auth");
         if (!setupDone() && !isLocalRequest(session)) return errorResponse(403, "请先在手机本机完成首次设置");
 
         // 关键：CORS 预检 OPTIONS 请求无条件优先放行，绝不能被鉴权拦截或读 body 阻塞！
@@ -5512,6 +6284,7 @@ public class GatewayServer extends NanoHTTPD {
             return publishedDefaultKeyResponse();
         if (!authorized(session, uri)) return unauthorizedResponse();
 
+        GATEWAY_EVENT_STAGE.set("ingress");
         final String rawBody;
         if(PREPARED_BODY.get()!=null) { rawBody=PREPARED_BODY.get(); PREPARED_BODY.remove(); BODY_ERROR.remove(); }
         else rawBody=readUtf8Body(session);
@@ -5525,6 +6298,7 @@ public class GatewayServer extends NanoHTTPD {
             if (uri.startsWith("/api/account-ops/")) return accountOperation(session,uri,method,rawBody);
             if ("/api/providers/billing".equals(uri)) return billingResponse(session);
             if(uri.startsWith("/api/checkin/"))return checkinApi(uri,method,rawBody);
+            if(uri.startsWith("/api/workbuddy/tasks/"))return workBuddyTasksApi(uri,method,rawBody);
 
             // 0. Codex 原生 Responses / Models 端点直通拦截
             if (uri.startsWith("/backend-api/codex")) {
@@ -5609,10 +6383,10 @@ public class GatewayServer extends NanoHTTPD {
                     String name = names.next();
                     status.put(name, listen.opt(name));
                 }
-                status.put("totalRequests", totalRequests.get());
-                status.put("totalTokens", totalTokens.get());
-                status.put("totalMasked", totalMasked.get());
-                status.put("contextDropped", totalContextDropped.get());
+                status.put("totalRequests", totalRequests != null ? totalRequests.get() : 0);
+                status.put("totalTokens", totalTokens != null ? totalTokens.get() : 0L);
+                status.put("totalMasked", totalMasked != null ? totalMasked.get() : 0);
+                status.put("contextDropped", totalContextDropped != null ? totalContextDropped.get() : 0);
                 status.put("guard", ContextGuard.Config.fromJson(configJson.optJSONObject("guard")).toJson());
                 status.put("lastGuardStats", lastGuardStats);
                 status.put("connections", connectionStatus());
@@ -5866,10 +6640,10 @@ public class GatewayServer extends NanoHTTPD {
                 return jsonResponse(q);
             }
 
-            // 2.6 最近请求明细
+            // 2.6 最近请求明细（支持按仅失败、供应商过滤，并附带网关前置拦截事件）
             if ("/api/sessions".equals(uri)) {
                 Map<String, List<String>> sp = session.getParameters();
-                int limit = 12;
+                int limit = 24;
                 try {
                     if (sp.containsKey("limit") && !sp.get("limit").isEmpty()) {
                         limit = Integer.parseInt(sp.get("limit").get(0));
@@ -5877,9 +6651,21 @@ public class GatewayServer extends NanoHTTPD {
                 } catch (Exception ignored) {
                 }
                 if (limit < 1) limit = 1;
-                if (limit > 50) limit = 50;
+                if (limit > 100) limit = 100;
+                boolean failedOnly = sp.containsKey("failedOnly") && !sp.get("failedOnly").isEmpty()
+                        && ("1".equals(sp.get("failedOnly").get(0)) || "true".equalsIgnoreCase(sp.get("failedOnly").get(0)));
+                String providerFilter = (sp.containsKey("provider") && !sp.get("provider").isEmpty())
+                        ? sp.get("provider").get(0) : "";
+                if (providerFilter.length() > 64) providerFilter = providerFilter.substring(0, 64);
                 JSONObject out = new JSONObject();
-                out.put("sessions", UsageLedger.recentRequests(limit));
+                UsageLedger.QueryRows sessionResult = UsageLedger.recentRequestsWithStatus(limit, failedOnly, providerFilter);
+                out.put("sessions", sessionResult.rows);
+                if (sessionResult.patchBucketOverflow) {
+                    out.put("storageComplete", false);
+                    out.put("patchBucketOverflow", true);
+                    out.put("warning", "账本补丁分桶达到深度上限，部分记录的转换/交付状态可能不完整");
+                }
+                out.put("gatewayEvents", snapshotGatewayEvents(providerFilter));
                 return jsonResponse(out);
             }
 
@@ -6143,6 +6929,7 @@ public class GatewayServer extends NanoHTTPD {
                         return errorResponse(400, "配置缺少 providers 数组，已拒绝写入");
                     }
                     synchronized (this) {
+                    JSONObject rawSubmitted = new JSONObject(newConf.toString());
                     Object expected = newConf.has("expectedRevision") ? newConf.opt("expectedRevision") : newConf.opt("revision");
                     if (!(expected instanceof String) || !configRevision().equals(expected)
                             || (newConf.has("revision") && !expected.equals(newConf.opt("revision"))))
@@ -6150,6 +6937,9 @@ public class GatewayServer extends NanoHTTPD {
                     newConf.remove("revision"); newConf.remove("expectedRevision");
                     try { newConf = ConfigurationView.restore(newConf, configJson, GatewayManagementCredential.get()); }
                     catch (IllegalArgumentException invalidReference) { return errorResponse(409,"配置凭据引用已失效，请刷新后重试"); }
+                    if (providerEndpointChangedWithSecretRef(configJson, rawSubmitted, newConf)) {
+                        return errorResponse(400, "更改 API 地址后请重新填写凭据，旧地址凭据不会自动发送到新地址");
+                    }
                     newConf.remove("providerStateTokens");
                     newConf.remove("miniMaxMediaModels");
                     newConf.remove("codexImageModels");
@@ -7956,6 +8746,69 @@ public class GatewayServer extends NanoHTTPD {
                 return jsonResponse(res);
             }
 
+            if (uri.startsWith("/api/auth/") && uri.endsWith("/enabled")) {
+                if (!"POST".equalsIgnoreCase(method)) return errorResponse(405, "POST required");
+                String[] parts = uri.split("/");
+                if (parts.length != 5 || parts[3].trim().isEmpty()) return errorResponse(404, "Unknown account operation");
+                String targetProv = parts[3].trim();
+                JSONObject req;
+                try { req = new JSONObject(rawBody); }
+                catch (Exception invalid) { return errorResponse(400, "请求体不是合法 JSON"); }
+                Object rawId = req.opt("id");
+                Object rawEnabled = req.opt("enabled");
+                if (!(rawId instanceof String) || ((String) rawId).trim().isEmpty()
+                        || !(rawEnabled instanceof Boolean) || !validExpectedStateToken(req)
+                        || req.length() != (req.has("expectedStateToken") ? 3 : 2)) {
+                    return errorResponse(400, "需要非空账号 ID 和布尔 enabled");
+                }
+                String accountId = ((String) rawId).trim();
+                boolean nextEnabled = ((Boolean) rawEnabled).booleanValue();
+                synchronized (this) {
+                    JSONArray providersNow = configJson == null ? null : configJson.optJSONArray("providers");
+                    JSONObject current = null;
+                    for (int i = 0; providersNow != null && i < providersNow.length(); i++) {
+                        JSONObject p = providersNow.optJSONObject(i);
+                        if (p != null && targetProv.equals(p.optString("id", ""))) {
+                            if (current != null) return errorResponse(409, "供应商 ID 重复");
+                            current = p;
+                        }
+                    }
+                    if (current == null) return errorResponse(404, "供应商不存在");
+                    if (!providerStateMatches(req, current)) return errorResponse(409, "账号状态已变化，请刷新后重试");
+                    JSONObject staged = new JSONObject(configJson.toString());
+                    JSONObject target = findProviderById(staged.optJSONArray("providers"), targetProv);
+                    if (target == null) return errorResponse(404, "供应商不存在");
+                    JSONArray beforeAccounts = target.optJSONArray("accounts") == null
+                            ? null : new JSONArray(target.optJSONArray("accounts").toString());
+                    JSONArray accounts = target.optJSONArray("accounts");
+                    JSONObject selected = null;
+                    for (int i = 0; accounts != null && i < accounts.length(); i++) {
+                        JSONObject account = accounts.optJSONObject(i);
+                        if (account != null && accountId.equals(account.optString("id"))) {
+                            if (selected != null) return errorResponse(409, "账号标识冲突");
+                            selected = account;
+                        }
+                    }
+                    if (selected == null) return errorResponse(404, "该账号已不在池中");
+                    selected.put("enabled", nextEnabled);
+                    selected.remove("off");
+                    if (nextEnabled && "off".equalsIgnoreCase(selected.optString("status", ""))) {
+                        selected.remove("status");
+                    }
+                    AccountPoolPolicy.synchronizeKeys(target, beforeAccounts);
+                    try { persistConfigStrict(staged); }
+                    catch (IOException failure) { return errorResponse(500, "账号状态未保存，原账号保持不变"); }
+                    advanceProviderStateRevision(targetProv);
+                    JSONObject after = getProviderById(targetProv);
+                    return jsonResponse(new JSONObject()
+                            .put("ok", true)
+                            .put("providerId", targetProv)
+                            .put("id", accountId)
+                            .put("enabled", AccountGenerations.enabled(selected))
+                            .put("stateToken", providerStateToken(after)));
+                }
+            }
+
             // Local display labels never change authentication identity or account order.
             if (uri.startsWith("/api/auth/") && uri.endsWith("/label") && "POST".equalsIgnoreCase(method)) {
                 String[] parts=uri.split("/");
@@ -8627,12 +9480,11 @@ public class GatewayServer extends NanoHTTPD {
             if ("/responses".equals(uri)) uri="/v1/responses";
             if ("/v1/chat/completions".equals(uri) || "/v1/messages".equals(uri) || "/v1/responses".equals(uri)) {
                 if ("/v1/responses".equals(uri) && !"POST".equals(method)) return errorResponse(405, "POST required");
+                GATEWAY_EVENT_STAGE.set("ingress");
                 String postData = rawBody;
                 if (postData == null || postData.isEmpty()) {
                     return errorResponse(400, "Empty payload");
                 }
-
-                totalRequests.incrementAndGet();
 
                 PrivacyMasker.Session maskSession = new PrivacyMasker.Session();
                 PrivacyMasker.Config privCfg = PrivacyMasker.Config.fromJson(configJson.optJSONObject("privacy"));
@@ -8657,15 +9509,14 @@ public class GatewayServer extends NanoHTTPD {
                 } else {
                     payload = new JSONObject(postData);
                 }
-                totalMasked.addAndGet(maskSession.interceptedCount);
-                lastMaskedCount = maskSession.interceptedCount;
-                lastMaskEnabled = privCfg.enabled;
-                lastMaskAt = System.currentTimeMillis();
+                recordPrivacyMask(maskSession.interceptedCount, privCfg.enabled, true);
                 if ("/v1/chat/completions".equals(uri) || "/v1/responses".equals(uri)
                         || "/v1/messages".equals(uri)) {
                     CODEX_CLIENT_OUTPUT_LIMIT_FIELDS.set(captureCodexOutputLimitFields(unmaskedInput));
                 }
                 String requestedModel = payload.optString("model", "deepseek-chat");
+                GATEWAY_EVENT_MODEL.set(requestedModel);
+                GATEWAY_EVENT_STAGE.set("validation");
                 // Preserve Qoder's original tool pairing errors before generic compatibility repair.
                 // The result applies only if routing actually selects the Qoder adapter.
                 String qoderClientProtocol="/v1/responses".equals(uri)?"responses"
@@ -8688,10 +9539,10 @@ public class GatewayServer extends NanoHTTPD {
                         RESP_REQUEST.set(originalResponses); RESP_BASELINE.set(new JSONObject(payload.toString()));
                         CLIENT_MODEL.set(requestedModel);
                     }
-                    catch (Exception conversionError) { return errorResponse(400, "Responses request: " + conversionError.getMessage()); }
+                    catch (Exception conversionError) { GATEWAY_EVENT_REASON.set("conversion_validation_failed"); return errorResponse(400, "Responses request: " + conversionError.getMessage()); }
                 }
                 String validationError = validateRawMessages(payload.opt("messages"));
-                if (validationError != null) return errorResponse(400, validationError);
+                if (validationError != null) { GATEWAY_EVENT_REASON.set("conversion_validation_failed"); return errorResponse(400, validationError); }
 
                 // ===== /v1/messages 的客户端（Claude Code 等）发的是 Anthropic 格式 =====
                 // 以前把这种请求直接塞给 OpenAI 上游，system / tools 字段名对不上会被静默忽略，
@@ -8716,8 +9567,10 @@ public class GatewayServer extends NanoHTTPD {
                         for (String header : new String[]{"anthropic-version", "anthropic-beta"}) {
                             String value = session.getHeaders().get(header);
                             if (value != null) {
-                                if (value.length() > 2048 || value.indexOf('\r') >= 0 || value.indexOf('\n') >= 0)
+                                if (value.length() > 2048 || value.indexOf('\r') >= 0 || value.indexOf('\n') >= 0) {
+                                    GATEWAY_EVENT_REASON.set("conversion_validation_failed");
                                     return errorResponse(400, "Invalid Anthropic protocol header");
+                                }
                                 nativeHeaders.put(header, value);
                             }
                         }
@@ -8727,6 +9580,7 @@ public class GatewayServer extends NanoHTTPD {
                         NATIVE_DIRECT_ALLOWED.set(Boolean.TRUE);
                         CLIENT_ANTHROPIC.set(Boolean.TRUE);
                     } catch (Exception convErr) {
+                        GATEWAY_EVENT_REASON.set("conversion_validation_failed");
                         return errorResponse(400, "Anthropic 请求转换失败: " + convErr.getMessage());
                     }
                 }
@@ -8735,6 +9589,7 @@ public class GatewayServer extends NanoHTTPD {
                 // 放在这里的原因：Anthropic 请求已经转成标准 OpenAI 形状，字段命名统一；
                 // 又早于上下文保护，这样注入的 system 与封顶后的 max_tokens 都能被 guard 计入。
                 JSONObject mwCfg = configJson.optJSONObject("middleware");
+                GATEWAY_EVENT_STAGE.set("middleware");
                 if (mwCfg != null) {
                     try {
                         // model-map：别名换成真实模型。replyModel 留着给响应，客户端看到的仍是它请求的名字
@@ -8785,12 +9640,14 @@ public class GatewayServer extends NanoHTTPD {
                         normalizeCoreMessages(payload);
                     }
                 } catch (Exception invalidMessages) {
+                    GATEWAY_EVENT_REASON.set("conversion_validation_failed");
                     return errorResponse(400, "invalid_messages: " + invalidMessages.getMessage());
                 }
                 CLIENT_OUTPUT_LIMIT.set(Integer.valueOf(positiveOutputLimit(payload)));
 
                 // ===== 上下文保护：按用户设置的「网关最大上下文 / 请求体上限 / 输出上限」主动裁剪与封顶 =====
                 ContextGuard.Config guardCfg = ContextGuard.Config.fromJson(configJson.optJSONObject("guard"));
+                GATEWAY_EVENT_STAGE.set("guard");
                 ContextGuard.Result guardResult = null;
                 try {
                     guardResult = ContextGuard.fit(payload, guardCfg);
@@ -8814,7 +9671,7 @@ public class GatewayServer extends NanoHTTPD {
                     }
                     if (guardResult.changed) {
                         lastGuardStats = guardResult.toJson();
-                        if (guardResult.dropped > 0) totalContextDropped.addAndGet(guardResult.dropped);
+                        if (guardResult.dropped > 0) recordContextDropped(guardResult.dropped);
                     }
                 } catch (Exception guardErr) {
                     logException("context guard",guardErr);
@@ -8825,6 +9682,7 @@ public class GatewayServer extends NanoHTTPD {
                     NativeAnthropicPolicy.checkNativeRequired(NATIVE_REQUEST.get(), NATIVE_BASELINE.get(), payload,
                             Boolean.TRUE.equals(NATIVE_DIRECT_ALLOWED.get()));
                 } catch (IllegalArgumentException unsafeNative) {
+                    GATEWAY_EVENT_REASON.set("conversion_validation_failed");
                     return errorResponse(400, unsafeNative.getMessage());
                 }
 
@@ -8845,6 +9703,7 @@ public class GatewayServer extends NanoHTTPD {
                     if (original != null) {
                         String unsupported = ResponsesBridge.nativeOnlyReason(original);
                         if (unsupported != null) {
+                            GATEWAY_EVENT_REASON.set("conversion_validation_failed");
                             return errorResponse(400, "Responses cannot be converted for selected route: " + unsupported);
                         }
                     }
@@ -8861,6 +9720,7 @@ public class GatewayServer extends NanoHTTPD {
                 // 且只在「还没有把任何回复字节写给客户端」之前换，
                 // 所以客户端永远不会拿到半段 A、半段 B 的回复。
                 beginAccountConversation(requestedModel, payload);
+                GATEWAY_EVENT_STAGE.set("routing");
                 List<RouteTarget> candidates = resolveCandidates(requestedModel);
                 if (candidates.isEmpty()) {
                     // A candidate that was dropped for an unknown refresh outcome is not the same
@@ -9454,9 +10314,11 @@ public class GatewayServer extends NanoHTTPD {
         // The login Flow retains its candidate on failure; do not publish a phantom pool slot.
         GatewayAccessCatalog.preserveAccountScope(configJson,staged);
         persistConfigStrict(staged);
+        String savedId = saved.optString("id", "");
+        invalidateBillingDisplayName(provider, savedId);
         String refresh=saved.optString("refresh","");
         if(!refresh.isEmpty())try{resolveRefreshFence(provider,refresh);}catch(Exception ignored){}
-        return saved.optString("id");
+        return savedId;
     }
 
     /**
@@ -9855,6 +10717,8 @@ public class GatewayServer extends NanoHTTPD {
 
     private static final ThreadLocal<Boolean> CLIENT_ANTHROPIC = new ThreadLocal<Boolean>();
     private static final ThreadLocal<String> CLIENT_OUTPUT_PROTOCOL = new ThreadLocal<String>();
+    private static final ThreadLocal<UsageLedger.Row> RESPONSES_CHAT_ROW = new ThreadLocal<UsageLedger.Row>();
+    private static final ThreadLocal<Boolean> RESP_PROJECTED_DONE = new ThreadLocal<Boolean>();
 
     /**
      * 客户端请求的原始模型名（model-map 生效时与真正路由的模型不同）。
@@ -10005,9 +10869,15 @@ public class GatewayServer extends NanoHTTPD {
                                                     final PrivacyMasker.Session maskSession,
                                                     final ContextGuard.Result guardResult,
                                                     final HttpURLConnection conn) {
+        return streamForwardAnthropicResponse(upstreamIs, model, maskSession, guardResult, conn, true);
+    }
+
+    private Response streamForwardAnthropicResponse(InputStream upstreamIs, String model,
+            PrivacyMasker.Session maskSession, ContextGuard.Result guardResult, HttpURLConnection conn,
+            boolean emitUnsignedThinking) {
         Long startBox = U_START.get();
         InputStream converted = openAiToAnthropicStream(upstreamIs, model, maskSession, conn,
-                U_ROW.get(), startBox == null ? System.currentTimeMillis() : startBox.longValue());
+                U_ROW.get(), startBox == null ? System.currentTimeMillis() : startBox.longValue(), emitUnsignedThinking);
         Response resp = newFixedLengthResponse(Status.OK, "text/event-stream", converted, -1);
         resp.addHeader("X-AllIn-Compatibility-Warning", "thinking-signature-unavailable");
         resp.addHeader("Cache-Control", "no-cache");
@@ -10023,10 +10893,12 @@ public class GatewayServer extends NanoHTTPD {
         final java.util.concurrent.atomic.AtomicBoolean semantic=affinityRequest==null?null:affinityRequest.affinitySemantic;
         final Long startBox = U_START.get();
         final long start = startBox == null ? System.currentTimeMillis() : startBox.longValue();
+        final NativeAnthropicStream[] streamRef = new NativeAnthropicStream[1];
         NativeAnthropicStream stream = new NativeAnthropicStream(upstream, session, new NativeAnthropicStream.Listener() {
             long first = -1, last = -1;
             @Override public void onEvent(JSONObject event) {
                 if (row == null) return;
+                recordRowSseEvent(row, event.optString("type", ""));
                 JSONObject message = event.optJSONObject("message");
                 if (message != null) absorbUsage(row, message.optJSONObject("usage"));
                 absorbUsage(row, event.optJSONObject("usage"));
@@ -10036,22 +10908,73 @@ public class GatewayServer extends NanoHTTPD {
                     if (first < 0) first = last;
                 }
             }
+            @Override public void onFailure(String lastEvent, String reason, Throwable cause) {
+                if (row == null) return;
+                recordRowSseEvent(row, lastEvent);
+                if (cause != null) recordStreamThrowable(row, cause, false);
+                recordRowFailureReason(row, reason);
+                if ("downstream_write_failed".equals(reason)) {
+                    recordRowSseTerminal(row, true);
+                    if (row.bridgeStatus.isEmpty()) row.bridgeStatus = "native";
+                } else {
+                    row.sseTerminal = Boolean.FALSE;
+                }
+            }
             @Override public void onComplete(boolean success) {
                 if(semantic!=null) semantic.set(success);
                 if (row == null) return;
+                NativeAnthropicStream owned = streamRef[0];
+                boolean deliveryConfirmed = owned != null && owned.isDeliveryConfirmed();
+                boolean upstreamDone = owned != null && owned.isUpstreamCompleted();
                 boolean cancelled=affinityRequest!=null && affinityRequest.isCancelled()
                         && !"finished".equals(affinityRequest.cancelReason());
                 int failedStatus=cancelled?(affinityRequest.remainingMillis()==0 || "deadline".equals(affinityRequest.cancelReason())?504:499):502;
                 row.status = success ? 200 : failedStatus;
-                row.err = success ? "" : cancelled?"Native Anthropic downstream cancelled":"Native Anthropic stream incomplete";
+                if (success) {
+                    row.err = "";
+                    recordRowSseTerminal(row, true);
+                    row.bridgeStatus = "native";
+                    row.deliveryStatus = deliveryConfirmed ? "delivered" : "unknown";
+                    logGatewayOutcomeSummary(row);
+                } else {
+                    String phase;
+                    String tr;
+                    String reason;
+                    if (upstreamDone) {
+                        recordRowSseTerminal(row, true);
+                        row.bridgeStatus = "native";
+                        phase = "downstream_delivery";
+                        tr = cancelled ? "cancelled" : "downstream";
+                        reason = cancelled ? "downstream_cancelled" : "downstream_write_failed";
+                    } else {
+                        recordRowSseTerminal(row, false);
+                        phase = cancelled ? "downstream_delivery" : "read_response_body";
+                        reason = cancelled ? "downstream_cancelled"
+                                : (!row.effectiveFailureReason().isEmpty() ? row.effectiveFailureReason() : "premature_eof");
+                        tr = cancelled ? "cancelled"
+                                : ("tls_error".equals(reason) ? "tls"
+                                : ("read_timeout".equals(reason) ? "timeout"
+                                : ("conversion_validation_failed".equals(reason) ? "protocol"
+                                : ("upstream_explicit_error".equals(reason) ? "http_rejection"
+                                : (first >= 0 ? "eof" : "no_http_status")))));
+                        row.bridgeStatus = "conversion_validation_failed".equals(reason) ? "failed" : "upstream_aborted";
+                    }
+                    row.deliveryStatus = cancelled ? "cancelled" : "failed";
+                    recordRowFailureMeta(row, phase, tr, reason);
+                    row.err = (cancelled ? "Native Anthropic downstream cancelled"
+                            : (upstreamDone ? "Native Anthropic downstream write failed" : "Native Anthropic stream incomplete"))
+                            + " [" + phase + " · " + reason + ", lastSse=" + row.effectiveLastSseEvent() + "]";
+                    logGatewayFailureSummary(row);
+                }
                 row.ms = System.currentTimeMillis() - start;
                 if (first >= 0) { row.ttft = first - start; row.decMs = last - first; row.decOut = row.out; }
                 RequestDiagnostics.nativeCompletion(row,success);
-                try { recordUsageRow(row); } catch (Throwable ignored) { }
+                try { recordUsageRow(row); } catch(Throwable ignored) { }
             }
         }, new Runnable() {
             @Override public void run() { if (connection != null) connection.disconnect(); }
         }, thinkingCompat);
+        streamRef[0] = stream;
         stream.requireDeliveryConfirmation();
         Response response = newFixedLengthResponse(Status.OK, "text/event-stream; charset=UTF-8", stream, -1);
         addCorsHeaders(response);
@@ -10061,13 +10984,13 @@ public class GatewayServer extends NanoHTTPD {
 
     static InputStream openAiToAnthropicStream(final InputStream upstreamIs, String model,
                                                 PrivacyMasker.Session maskSession, final HttpURLConnection conn) {
-        return openAiToAnthropicStream(upstreamIs, model, maskSession, conn, null, System.currentTimeMillis());
+        return openAiToAnthropicStream(upstreamIs, model, maskSession, conn, null, System.currentTimeMillis(), true);
     }
 
     private static InputStream openAiToAnthropicStream(final InputStream upstreamIs, String model,
             PrivacyMasker.Session maskSession, final HttpURLConnection conn,
-            final UsageLedger.Row row, final long start) {
-        final AnthropicBridge.StreamState state = new AnthropicBridge.StreamState(model);
+            final UsageLedger.Row row, final long start, boolean emitUnsignedThinking) {
+        final AnthropicBridge.StreamState state = new AnthropicBridge.StreamState(model, emitUnsignedThinking);
         final RequestContext affinityRequest=REQUEST_CONTEXT.get();
         final java.util.concurrent.atomic.AtomicBoolean semantic=affinityRequest==null?null:affinityRequest.affinitySemantic;
         final OpenAiUnmask unmask = new OpenAiUnmask(maskSession);
@@ -10076,22 +10999,123 @@ public class GatewayServer extends NanoHTTPD {
                     new BoundedSseReader(new java.io.InputStreamReader(upstreamIs,
                             java.nio.charset.Charset.forName("UTF-8")));
             private byte[] buf = new byte[0];
-            private int pos = 0;
+            private int pos = 0, eventCount = 0;
             private boolean done = false, committed = false, closed = false, success = false, sawDone = false;
+            private boolean writeStarted = false, deliveryConfirmed = false;
+            private String streamErrorDetail = null, pendingEventName = "";
+            private Throwable streamCause = null;
+            private boolean isClientCancelled() {
+                return affinityRequest != null && affinityRequest.isCancelled()
+                        && !"finished".equals(affinityRequest.cancelReason());
+            }
+            private boolean upstreamCompletedOk() {
+                return done && success && pos >= buf.length;
+            }
             private synchronized void commit(int status, String error) {
                 if (committed || row == null) return;
                 committed = true;
-                row.status = status; row.err = error; row.ms = System.currentTimeMillis() - start;
+                row.status = status;
+                boolean upstreamTerminalOk = (sawDone && success) || (done && success);
+                if (!row.upstreamSseObserved) {
+                    recordRowSseTerminal(row, upstreamTerminalOk);
+                }
+                if (status >= 400 || (error != null && !error.isEmpty())) {
+                    boolean downstreamFail = upstreamTerminalOk || status == 499;
+                    String phase = downstreamFail ? "downstream_delivery" : "read_response_body";
+                    String presetReason = row.failureReason != null ? row.failureReason : "";
+                    String presetTr = row.transportKind != null ? row.transportKind : "";
+                    String tr = status == 499 ? "cancelled"
+                            : (!presetTr.isEmpty() ? presetTr
+                            : (downstreamFail ? "downstream"
+                            : (streamCause != null ? FailureLayers.transportName(streamCause)
+                            : (streamErrorDetail != null ? "protocol" : "eof"))));
+                    String reason = status == 499 ? "downstream_cancelled"
+                            : (!presetReason.isEmpty() ? presetReason
+                            : (downstreamFail ? "downstream_write_failed"
+                            : (streamCause != null ? classifyStreamReason(streamCause)
+                            : (streamErrorDetail != null && !streamErrorDetail.isEmpty() ? "upstream_explicit_error"
+                            : (state.isFailed() ? "conversion_validation_failed" : "premature_eof")))));
+                    if (reason == null || reason.isEmpty()) reason = "premature_eof";
+                    recordRowFailureMeta(row, phase, tr, reason);
+                    if (row.bridgeStatus.isEmpty()) {
+                        row.bridgeStatus = upstreamTerminalOk ? "ok"
+                                : ((state.isFailed() || "conversion_validation_failed".equals(reason)) ? "failed" : "upstream_aborted");
+                    } else if (state.isFailed()) {
+                        row.bridgeStatus = "failed";
+                    }
+                    if (row.deliveryStatus.isEmpty() || "unknown".equals(row.deliveryStatus) || "delivered".equals(row.deliveryStatus)) {
+                        row.deliveryStatus = status == 499 ? "cancelled" : "failed";
+                    }
+                    StringBuilder msg = new StringBuilder(error == null ? "Upstream stream failed" : error);
+                    if (streamErrorDetail != null && !streamErrorDetail.isEmpty()) {
+                        msg.append(": ").append(streamErrorDetail);
+                    } else if (streamCause != null) {
+                        msg.append(" (").append(streamCause.getClass().getSimpleName()).append(", events=").append(eventCount).append(")");
+                    } else {
+                        msg.append(" (").append(phase).append(" · ").append(tr).append(", events=").append(eventCount).append(")");
+                    }
+                    row.err = summarizeErrorForLedger(status, msg.toString(), phase, tr, row.upstreamErrorCode, row.activeSecrets);
+                    row.upstreamErrorCode = UsageLedger.scrubCodeTokens(row.upstreamErrorCode);
+                    logGatewayFailureSummary(row);
+                } else {
+                    row.err = "";
+                    if (row.bridgeStatus.isEmpty()) row.bridgeStatus = "ok";
+                    if (row.deliveryStatus.isEmpty()) row.deliveryStatus = deliveryConfirmed ? "delivered" : "unknown";
+                    logGatewayOutcomeSummary(row);
+                }
+                row.ms = System.currentTimeMillis() - start;
                 try { recordUsageRow(row); } catch (Throwable ignored) {
                     if (row.recentUsageLease != null) row.recentUsageLease.complete(row);
                 }
             }
+            @Override public synchronized void onWriteStart() { writeStarted = true; }
             @Override public synchronized void onWriteComplete(boolean delivered) {
+                boolean upstreamOk = upstreamCompletedOk();
+                deliveryConfirmed = delivered;
                 if(semantic!=null) semantic.set(delivered && done && sawDone && success && pos>=buf.length);
                 if (!delivered) {
-                    // A row already persisted at EOF is immutable. C1's separate delivery gate
-                    // still rejects this failed delivery without rewriting ledger history.
-                    if (!committed) commit(499, "Downstream stream cancelled");
+                    if (!writeStarted && upstreamOk && !isClientCancelled()) {
+                        // Response closed without ever initiating HTTP send; keep outcome unknown rather than guessed delivered.
+                        if (row != null && row.deliveryStatus.isEmpty()) row.deliveryStatus = "unknown";
+                        if (!committed) commit(200, "");
+                        return;
+                    }
+                    boolean cancelled = isClientCancelled();
+                    int failStatus = (cancelled || !upstreamOk) ? (cancelled ? 499 : 502) : 502;
+                    String phase = (upstreamOk || cancelled) ? "downstream_delivery" : "read_response_body";
+                    String tr = cancelled ? "cancelled" : (upstreamOk ? "downstream" : "eof");
+                    String reason = cancelled ? "downstream_cancelled" : (upstreamOk ? "downstream_write_failed" : "premature_eof");
+                    String msg = upstreamOk ? (cancelled ? "Downstream stream cancelled" : "Downstream final write failed")
+                            : (cancelled ? "Downstream stream cancelled" : "Upstream stream failed or incomplete");
+                    if (row != null && upstreamOk && row.bridgeStatus.isEmpty()) row.bridgeStatus = "ok";
+                    if (row != null && !row.upstreamSseObserved) recordRowSseTerminal(row, upstreamOk);
+                    if (!committed) {
+                        if (row != null) {
+                            recordRowFailureMeta(row, phase, tr, reason);
+                            row.deliveryStatus = cancelled ? "cancelled" : "failed";
+                        }
+                        commit(failStatus, msg);
+                    } else if (row != null && (upstreamOk || cancelled)) {
+                        UsageLedger.settleDelivery(row, false, failStatus, msg, phase, tr, reason);
+                    } else if (row != null && (row.deliveryStatus.isEmpty() || "unknown".equals(row.deliveryStatus))) {
+                        UsageLedger.settleDelivery(row, false, row.status >= 400 ? row.status : 502, msg,
+                                row.effectiveFailurePhase().isEmpty() ? "read_response_body" : row.effectiveFailurePhase(),
+                                row.effectiveFailureCause().isEmpty() ? "eof" : row.effectiveFailureCause(),
+                                row.effectiveFailureReason().isEmpty() ? "premature_eof" : row.effectiveFailureReason());
+                    }
+                } else {
+                    if (!committed) {
+                        if (upstreamOk) {
+                            if (row != null && (row.deliveryStatus.isEmpty() || "unknown".equals(row.deliveryStatus))) {
+                                row.deliveryStatus = "delivered";
+                            }
+                            commit(200, "");
+                        } else {
+                            commit(done ? 502 : 499, done ? "Upstream stream failed or incomplete" : "Downstream stream cancelled");
+                        }
+                    } else if (row != null && upstreamOk) {
+                        UsageLedger.settleDelivery(row, true, 200, null, null, null, null);
+                    }
                 }
             }
             private boolean end(java.util.List<String> events) {
@@ -10115,32 +11139,63 @@ public class GatewayServer extends NanoHTTPD {
 
             private boolean fill() {
                 while (pos >= buf.length) {
-                    if (done) { if (success) commit(200, ""); return false; }
+                    if (done) {
+                        if (success && !writeStarted) commit(200, "");
+                        return false;
+                    }
                     String line;
                     try { line = reader.readLine(); }
                     catch (IOException e) {
                         done = true;
+                        streamCause = e;
                         return end(state.onError(e instanceof TraeResponseFormat.InvalidOutput ? e.getMessage() : "Upstream stream read failed"));
                     }
                     if (line == null) {
                         done = true;
                         return end(state.onEnd());
                     }
+                    if (line.startsWith("event:")) { pendingEventName = line.substring(6).trim(); continue; }
                     if (!line.startsWith("data:")) continue;
                     String data = line.substring(5).trim();
                     if (data.isEmpty()) continue;
                     if ("[DONE]".equals(data)) {
                         done = true; sawDone = true;
+                        if (row != null && !row.upstreamSseObserved && (row.failureReason == null || row.failureReason.isEmpty())) {
+                            recordRowSseEvent(row, "[DONE]");
+                        }
                         return end(state.onEnd());
                     }
                     JSONObject chunk;
                     try {
                         chunk = new JSONObject(data);
                         unmask.apply(chunk);
+                        if (chunk.has("error") && !chunk.isNull("error")) {
+                            if (row != null && !row.upstreamSseObserved && (row.failureReason == null || row.failureReason.isEmpty())) {
+                                recordRowSseEvent(row, "error");
+                                recordRowFailureReason(row, "upstream_explicit_error");
+                            }
+                            streamErrorDetail = extractStreamErrorSummary(chunk.get("error"), row == null ? null : row.activeSecrets);
+                        } else {
+                            String evTag = !pendingEventName.isEmpty() ? pendingEventName : chunk.optString("type", "");
+                            if (evTag.isEmpty()) {
+                                JSONArray c = chunk.optJSONArray("choices");
+                                if (c != null && c.length() > 0 && c.optJSONObject(0) != null) {
+                                    String fin = c.optJSONObject(0).optString("finish_reason", "");
+                                    if (!fin.isEmpty() && !"null".equals(fin)) evTag = "finish:" + fin;
+                                }
+                            }
+                            if (row != null && !row.upstreamSseObserved && (row.failureReason == null || row.failureReason.isEmpty())) {
+                                recordRowSseEvent(row, evTag.isEmpty() ? "chunk" : evTag);
+                            }
+                        }
+                        pendingEventName = "";
                     } catch (Exception e) {
                         done = true;
+                        streamCause = e;
+                        recordRowFailureReason(row, "conversion_validation_failed");
                         return end(state.onError("Invalid upstream stream data"));
                     }
+                    eventCount++;
                     if (row != null) absorbUsage(row, chunk.optJSONObject("usage"));
                     java.util.List<String> events = state.onChunk(chunk);
                     if (state.isClosed()) { done = true; return end(events); }
@@ -10170,8 +11225,12 @@ public class GatewayServer extends NanoHTTPD {
                 synchronized (this) {
                     if (closed) return;
                     closed = true;
-                    if (success && pos >= buf.length) commit(200, "");
-                    else if (!committed) commit(done ? 502 : 499, done ? "Upstream stream failed or incomplete" : "Downstream stream cancelled");
+                    if (!writeStarted) {
+                        if (success && pos >= buf.length) commit(200, "");
+                        else if (!committed) commit(done ? 502 : 499, done ? "Upstream stream failed or incomplete" : "Downstream stream cancelled");
+                    } else if (!committed && !success) {
+                        commit(done ? 502 : 499, done ? "Upstream stream failed or incomplete" : "Downstream stream cancelled");
+                    }
                 }
                 try { reader.close(); } finally { if (conn != null) conn.disconnect(); }
             }
@@ -10184,19 +11243,31 @@ public class GatewayServer extends NanoHTTPD {
         ProtocolResponseException() { super("Invalid upstream response for Messages"); }
     }
     private static JSONObject checkedAnthropicResponse(JSONObject body, String model) throws ProtocolResponseException {
+        return checkedAnthropicResponse(body, model, true);
+    }
+    private static JSONObject checkedAnthropicResponse(JSONObject body, String model, boolean emitUnsignedThinking) throws ProtocolResponseException {
         try {
-            JSONObject converted=AnthropicBridge.responseToAnthropic(body,model);
+            JSONObject converted=AnthropicBridge.responseToAnthropic(body,model,emitUnsignedThinking);
             if("error".equals(converted.optString("type")) || converted.has("error")) throw new ProtocolResponseException();
             return converted;
         } catch(Exception invalid) { throw new ProtocolResponseException(); }
     }
     private String toAnthropicBodyIfNeeded(String openAiJson, String model) throws ProtocolResponseException {
+        return toAnthropicBodyIfNeeded(openAiJson, model, true);
+    }
+    private String toAnthropicBodyIfNeeded(String openAiJson, String model, boolean emitUnsignedThinking) throws ProtocolResponseException {
         if (!wantsAnthropicOut()) return openAiJson;
-        try { return checkedAnthropicResponse(new JSONObject(openAiJson),model).toString(); }
+        try { return checkedAnthropicResponse(new JSONObject(openAiJson),model,emitUnsignedThinking).toString(); }
         catch(Exception invalid) { throw new ProtocolResponseException(); }
     }
     private Attempt failedProtocolAttempt(Attempt out) {
-        WorkBuddyFailure.record(U_ROW.get(), Phase.READ_RESPONSE_BODY, Cause.PROTOCOL);
+        UsageLedger.Row row = U_ROW.get();
+        WorkBuddyFailure.record(row, Phase.READ_RESPONSE_BODY, Cause.PROTOCOL);
+        recordRowFailureMeta(row, "read_response_body", "protocol", "conversion_validation_failed");
+        if (row != null) {
+            row.bridgeStatus = "failed";
+            if (row.deliveryStatus.isEmpty()) row.deliveryStatus = "failed";
+        }
         out.ok=false; out.protocolFailure=true; out.status=502;
         out.body="Invalid upstream response for Messages";
         out.response=errorResponse(502,out.body);
@@ -10245,6 +11316,7 @@ public class GatewayServer extends NanoHTTPD {
         final java.util.concurrent.atomic.AtomicBoolean semantic=affinityRequest==null?null:affinityRequest.affinitySemantic;
         class ChatForwardStream extends InputStream implements fi.iki.elonen.AllInTrackedResponse.WriteCompletion {
             private boolean deliveryConfirmed;
+            private boolean deliverySucceeded;
             private boolean writeStarted;
             private boolean readComplete;
             private final BoundedSseReader reader = new BoundedSseReader(new InputStreamReader(upstreamIs, java.nio.charset.StandardCharsets.UTF_8));
@@ -10266,17 +11338,93 @@ public class GatewayServer extends NanoHTTPD {
             // 占位符可能被切成两半，content / reasoning / 工具参数各自一个缓冲，别互相串
             private final OpenAiUnmask unmask = new OpenAiUnmask(maskSession);
             private boolean emittedTerminalError = false;
+            private int eventCount = 0;
+            private String streamErrorDetail = null;
+            private Throwable streamCause = null;
 
             private synchronized void recordUsage() {
                 if (uRow == null || uCommitted[0] || (writeStarted && !deliveryConfirmed)
                         || (!readComplete && !sawError && !closed)
                         || (awaitDelivery && !deliveryConfirmed && !sawError)) return;
                 uCommitted[0]=true; uRow.ms=System.currentTimeMillis()-uStart; uRow.status=sawError?(downstreamCancelled?499:502):200;
-                if (sawError) uRow.err = downstreamCancelled?"Downstream stream cancelled":"Upstream stream incomplete";
+                if (!uRow.upstreamSseObserved && uRow.sseTerminal == null) {
+                    recordRowSseTerminal(uRow, readComplete && (sawDone || choicesComplete()));
+                }
+                if (sawError) {
+                    boolean downstreamAfterTerminal = uRow.sseTerminal == Boolean.TRUE
+                            && readComplete && streamCause == null && streamErrorDetail == null;
+                    String presetPhase = uRow.failurePhase != null ? uRow.failurePhase : "";
+                    String phase = !presetPhase.isEmpty() ? presetPhase
+                            : ((downstreamCancelled || downstreamAfterTerminal) ? "downstream_delivery" : "read_response_body");
+                    String presetReason = uRow.failureReason != null ? uRow.failureReason : "";
+                    String presetTr = uRow.transportKind != null ? uRow.transportKind : "";
+                    String tr = downstreamCancelled ? "cancelled"
+                            : (!presetTr.isEmpty() ? presetTr
+                            : (downstreamAfterTerminal ? "downstream"
+                            : (streamCause != null ? FailureLayers.transportName(streamCause)
+                            : (streamErrorDetail != null && !streamErrorDetail.isEmpty() ? "protocol" : "eof"))));
+                    String reason = downstreamCancelled ? "downstream_cancelled"
+                            : (!presetReason.isEmpty() ? presetReason
+                            : (downstreamAfterTerminal ? "downstream_write_failed"
+                            : (streamCause != null ? classifyStreamReason(streamCause)
+                            : (streamErrorDetail != null && !streamErrorDetail.isEmpty()
+                            ? (streamErrorDetail.contains("finish reason") ? "premature_eof"
+                            : (ChatToolCompletion.ERROR.equals(streamErrorDetail) || streamErrorDetail.contains("Invalid")
+                            ? "conversion_validation_failed" : "upstream_explicit_error"))
+                            : "premature_eof"))));
+                    if (reason == null || reason.isEmpty()) reason = "premature_eof";
+                    recordRowFailureMeta(uRow, phase, tr, reason);
+                    if (uRow.bridgeStatus.isEmpty()) {
+                        uRow.bridgeStatus = downstreamAfterTerminal ? "ok"
+                                : ("conversion_validation_failed".equals(reason) ? "failed" : "upstream_aborted");
+                    }
+                    if (!downstreamCancelled && ("conversion".equals(phase) || "delivered".equals(uRow.deliveryStatus))
+                            && !uRow.deliveryStatus.isEmpty() && !"unknown".equals(uRow.deliveryStatus)) {
+                        // Preserve explicit delivery outcome when conversion or error SSE delivery already settled cleanly.
+                    } else {
+                        uRow.deliveryStatus = downstreamCancelled ? "cancelled" : "failed";
+                    }
+                    if (streamErrorDetail != null && !streamErrorDetail.isEmpty()) {
+                        uRow.err = summarizeErrorForLedger(uRow.status,
+                                "SSE error (events=" + eventCount + "): " + streamErrorDetail,
+                                phase, tr, uRow.upstreamErrorCode, uRow.activeSecrets);
+                    } else if (downstreamCancelled) {
+                        uRow.err = "Downstream stream cancelled (events=" + eventCount + ", ttft="
+                                + (uFirst[0] > 0 ? (uFirst[0] - uStart) + "ms" : "none") + ")";
+                    } else if (downstreamAfterTerminal) {
+                        uRow.err = "Downstream final write failed (events=" + eventCount + ", ttft="
+                                + (uFirst[0] > 0 ? (uFirst[0] - uStart) + "ms" : "none") + ")";
+                    } else if (streamCause != null) {
+                        uRow.err = "Upstream stream " + tr + " (" + streamCause.getClass().getSimpleName()
+                                + ", events=" + eventCount + ", ttft=" + (uFirst[0] > 0 ? (uFirst[0] - uStart) + "ms" : "none") + ")";
+                    } else if ("conversion".equals(phase) && uRow.err != null && !uRow.err.isEmpty()) {
+                        // Preserve conversion failure summary when recorded prior to final ledger commit.
+                    } else {
+                        uRow.err = "Upstream stream incomplete (" + tr + ", events=" + eventCount
+                                + ", done=" + sawDone + ", finish=" + choicesComplete() + ")";
+                    }
+                    uRow.err = scrubDiagnosticText(uRow.err, uRow.activeSecrets);
+                    uRow.upstreamErrorCode = sanitizeErrorTag(uRow.upstreamErrorCode, uRow.activeSecrets);
+                    logGatewayFailureSummary(uRow);
+                } else {
+                    if (uRow.bridgeStatus.isEmpty()) uRow.bridgeStatus = "ok";
+                    uRow.deliveryStatus = (deliveryConfirmed && deliverySucceeded) ? "delivered" : "unknown";
+                    logGatewayOutcomeSummary(uRow);
+                }
                 if(downstreamCancelled)uRow.failureKind="cancelled";
-                if (sawError) WorkBuddyFailure.record(uRow,
-                        downstreamCancelled ? Phase.DOWNSTREAM_DELIVERY : Phase.READ_RESPONSE_BODY,
-                        downstreamCancelled ? Cause.CANCELLED : Cause.UNKNOWN);
+                if (sawError) {
+                    String resolvedReason = uRow.effectiveFailureReason();
+                    Cause wbCause = downstreamCancelled ? Cause.CANCELLED
+                            : ("downstream_write_failed".equals(resolvedReason) ? Cause.DELIVERY_UNCONFIRMED
+                            : (streamCause != null ? WorkBuddyFailure.classify(streamCause)
+                            : ("tls_error".equals(resolvedReason) ? Cause.TLS
+                            : ("read_timeout".equals(resolvedReason) ? Cause.TIMEOUT
+                            : ("conversion_validation_failed".equals(resolvedReason) ? Cause.PROTOCOL
+                            : ("upstream_explicit_error".equals(resolvedReason) ? Cause.HTTP_REJECTION : Cause.EOF))))));
+                    WorkBuddyFailure.record(uRow,
+                            (downstreamCancelled || "downstream_delivery".equals(uRow.failurePhase)) ? Phase.DOWNSTREAM_DELIVERY : Phase.READ_RESPONSE_BODY,
+                            wbCause);
+                }
                 if(uFirst[0]>0) { uRow.ttft=uFirst[0]-uStart; if(uLast[0]>=uFirst[0]) { uRow.decMs=uLast[0]-uFirst[0]; uRow.decOut=uRow.out; } }
                 try { recordUsageRow(uRow); } catch(Throwable ignored) {}
             }
@@ -10290,20 +11438,25 @@ public class GatewayServer extends NanoHTTPD {
                 BoundedSseReader.Event frame;
                 try { frame = reader.readEvent(); }
                 catch (IOException e) {
+                    streamCause = e;
                     if(affinityRequest!=null && !affinityRequest.cancelReason().isEmpty() && clientClose())downstreamCancelled=true;
                     if (!downstreamCancelled)
                         WorkBuddyFailure.record(uRow, Phase.READ_RESPONSE_BODY, WorkBuddyFailure.classify(e));
+                    recordStreamThrowable(uRow, e, downstreamCancelled);
                     sawError = true;
                     emittedTerminalError = true;
                     try { reader.close(); } catch (IOException ignored) {}
                     String message = e instanceof TraeResponseFormat.InvalidOutput ? e.getMessage()
                             : e.getMessage()!=null && e.getMessage().startsWith("SSE ") ? "Upstream stream framing size or memory limit exceeded" : "Upstream stream read failed";
+                    if (streamErrorDetail == null) streamErrorDetail = message;
                     currentChunkIs = new ByteArrayInputStream(openAiStreamError(message).getBytes("UTF-8"));
                     return currentChunkIs.read();
                 }
                 if (frame == null) {
                     if (!sawDone && !sawError && !choicesComplete()) {
                         WorkBuddyFailure.record(uRow, Phase.READ_RESPONSE_BODY, Cause.EOF);
+                        recordRowSseTerminal(uRow, false);
+                        recordRowFailureMeta(uRow, "read_response_body", "eof", "premature_eof");
                         sawError = true;
                         emittedTerminalError = true;
                         currentChunkIs = new ByteArrayInputStream(openAiStreamError("Upstream stream ended before a finish reason").getBytes("UTF-8"));
@@ -10324,26 +11477,66 @@ public class GatewayServer extends NanoHTTPD {
                     return -1;
                 }
                 String restored = frame.hasData ? "data: " + frame.data : frame.metadata;
+                if (!frame.hasData && frame.metadata != null && frame.metadata.startsWith("event:")) {
+                    String mEv = frame.metadata.substring(6).trim();
+                    if (!mEv.isEmpty() && (uRow == null || (!uRow.upstreamSseObserved && (uRow.failureReason == null || uRow.failureReason.isEmpty())))) {
+                        recordRowSseEvent(uRow, mEv);
+                    }
+                }
                 if (restored.startsWith("data:")) {
                     String eventData = restored.substring(5).trim();
                     if ("[DONE]".equals(eventData)) {
                         if (sawError) { emittedTerminalError = true; return -1; }
+                        if (uRow != null && !uRow.upstreamSseObserved && (uRow.failureReason == null || uRow.failureReason.isEmpty())) recordRowSseEvent(uRow, "[DONE]");
                         if (!choicesComplete()) {
                             sawError = true;
                             emittedTerminalError = true;
+                            if (uRow != null && !uRow.upstreamSseObserved) recordRowSseTerminal(uRow, false);
+                            recordRowFailureMeta(uRow, "read_response_body", "eof", "premature_eof");
                             currentChunkIs = new ByteArrayInputStream(openAiStreamError("Upstream stream ended before a finish reason").getBytes("UTF-8"));
                             return currentChunkIs.read();
                         }
                         sawDone = true; recordUsage();
                     } else if (!eventData.isEmpty()) {
+                        eventCount++;
                         try {
                             JSONObject event = new JSONObject(eventData);
                             if (event.has("error")) {
                                 sawError = true;
-                                // Forward the real error once. A later transport close must not
-                                // turn the already delivered failure into a second error frame.
-                                if (!event.isNull("error")) emittedTerminalError = true;
+                                if (uRow != null && !uRow.upstreamSseObserved && (uRow.failureReason == null || uRow.failureReason.isEmpty())) {
+                                    recordRowSseEvent(uRow, "error");
+                                    recordRowFailureReason(uRow, "upstream_explicit_error");
+                                    uRow.sseTerminal = Boolean.FALSE;
+                                }
+                                if (!event.isNull("error")) {
+                                    java.util.List<String> rowSecrets = uRow == null ? null : uRow.activeSecrets;
+                                    streamErrorDetail = extractStreamErrorSummary(event.get("error"), rowSecrets);
+                                    if (uRow == null || uRow.failureReason == null || uRow.failureReason.isEmpty() || "upstream_explicit_error".equals(uRow.failureReason)) {
+                                        String errCode = extractSafeErrorCode(eventData, rowSecrets);
+                                        if (uRow != null && !errCode.isEmpty() && (uRow.upstreamErrorCode == null || uRow.upstreamErrorCode.isEmpty())) {
+                                            uRow.upstreamErrorCode = errCode;
+                                        }
+                                    }
+                                    emittedTerminalError = true;
+                                }
                                 recordUsage();
+                            } else if (uRow != null && !uRow.upstreamSseObserved && (uRow.failureReason == null || uRow.failureReason.isEmpty())) {
+                                String evType = event.optString("type", "");
+                                if (evType.isEmpty()) {
+                                    JSONArray ch = event.optJSONArray("choices");
+                                    if (ch != null && ch.length() > 0 && ch.optJSONObject(0) != null) {
+                                        JSONObject ch0 = ch.optJSONObject(0);
+                                        String fin = ch0.optString("finish_reason", "");
+                                        if (!fin.isEmpty() && !"null".equals(fin)) evType = "finish:" + fin;
+                                        else if (ch0.optJSONObject("delta") != null) {
+                                            JSONObject dl = ch0.optJSONObject("delta");
+                                            if (dl.has("tool_calls")) evType = "delta:tool_calls";
+                                            else if (!dl.optString("reasoning_content", "").isEmpty()) evType = "delta:reasoning";
+                                            else evType = "delta:content";
+                                        }
+                                    }
+                                }
+                                recordRowSseEvent(uRow, evType.isEmpty() ? "chunk" : evType);
                             }
                             JSONArray choices = event.optJSONArray("choices");
                             for (int i = 0; choices != null && i < choices.length(); i++) {
@@ -10494,21 +11687,49 @@ public class GatewayServer extends NanoHTTPD {
             private int invalidToolCompletion() throws IOException {
                 sawError = true;
                 emittedTerminalError = true;
+                streamErrorDetail = ChatToolCompletion.ERROR;
                 WorkBuddyFailure.record(uRow, Phase.READ_RESPONSE_BODY, Cause.PROTOCOL);
+                recordRowFailureMeta(uRow, "read_response_body", "protocol", "conversion_validation_failed");
+                recordRowSseTerminal(uRow, false);
                 RequestDiagnostics.protocolFailure(uRow);
                 currentChunkIs = new ByteArrayInputStream(openAiStreamError(ChatToolCompletion.ERROR).getBytes("UTF-8"));
                 return currentChunkIs.read();
             }
 
             @Override public void onWriteStart() { writeStarted = true; }
-            @Override public void onWriteComplete(boolean success) {
+            @Override public synchronized void onWriteComplete(boolean success) {
                 deliveryConfirmed = true;
-                if (!success && !sawError) {
-                    if (clientClose()) downstreamCancelled = true;
-                    WorkBuddyFailure.record(uRow, Phase.DOWNSTREAM_DELIVERY,
-                            downstreamCancelled ? Cause.CANCELLED : Cause.DELIVERY_UNCONFIRMED);
+                deliverySucceeded = success;
+                boolean upstreamCompletedOk = readComplete && !sawError && (sawDone || choicesComplete());
+                if (!success) {
+                    boolean conversionFailed = uRow != null && ("conversion".equals(uRow.failurePhase) || "failed".equals(uRow.bridgeStatus));
+                    boolean cancelled = !conversionFailed && clientClose();
+                    if (cancelled && !sawError) downstreamCancelled = true;
+                    if (!writeStarted && upstreamCompletedOk && !cancelled) {
+                        if (!uCommitted[0]) { recordUsage(); }
+                        return;
+                    }
+                    if (upstreamCompletedOk) {
+                        if (uRow != null) {
+                            if (!uRow.upstreamSseObserved) recordRowSseTerminal(uRow, true);
+                            if (uRow.bridgeStatus.isEmpty()) uRow.bridgeStatus = "ok";
+                        }
+                        if (uCommitted[0] && uRow != null && !"conversion".equals(uRow.failurePhase) && !"failed".equals(uRow.bridgeStatus)) {
+                            int st = downstreamCancelled ? 499 : 502;
+                            UsageLedger.settleDelivery(uRow, false, st,
+                                    downstreamCancelled ? "Downstream stream cancelled" : "Downstream final write failed",
+                                    "downstream_delivery", downstreamCancelled ? "cancelled" : "downstream",
+                                    downstreamCancelled ? "downstream_cancelled" : "downstream_write_failed");
+                        }
+                    } else if (!sawError) {
+                        WorkBuddyFailure.record(uRow, Phase.DOWNSTREAM_DELIVERY,
+                                downstreamCancelled ? Cause.CANCELLED : Cause.DELIVERY_UNCONFIRMED);
+                    }
+                    sawError = true;
+                } else if (uCommitted[0] && uRow != null && upstreamCompletedOk) {
+                    UsageLedger.settleDelivery(uRow, true, 200, null, null, null, null);
                 }
-                if (!success || !readComplete) sawError = true;
+                if (!readComplete) sawError = true;
                 if(semantic!=null) semantic.set(success && readComplete && sawDone && sawFinish && !sawError);
                 recordUsage();
             }
@@ -10624,16 +11845,34 @@ public class GatewayServer extends NanoHTTPD {
     // 用 ThreadLocal，避免改所有 streamForwardResponse 的调用点。
     // ==================================================================================
     private static void recordUsageRow(UsageLedger.Row row) {
+        attachLiveStatsTarget(row, null);
         RequestDiagnostics.freeze(row);
         CallEvidence.freeze(row);
         LogicalRequest logical=LOGICAL.get();
-        if(logical!=null && row.attempt>0 && row.callEvidence!=null && logical.id.equals(row.requestId))logical.lastCallEvidence=row.callEvidence;
+        if(logical!=null && row.attempt>0 && logical.id.equals(row.requestId)) {
+            if (row.callEvidence != null) logical.lastCallEvidence = row.callEvidence;
+            if (!row.effectiveFailurePhase().isEmpty()) logical.lastFailurePhase = row.effectiveFailurePhase();
+            if (!row.effectiveFailureCause().isEmpty()) logical.lastTransportKind = row.effectiveFailureCause();
+            if (row.upstreamErrorCode != null && !row.upstreamErrorCode.isEmpty()) logical.lastErrorCode = row.upstreamErrorCode;
+            if (row.effectiveUpstreamHttpStatus() > 0) logical.lastUpstreamHttpStatus = row.effectiveUpstreamHttpStatus();
+            if (!row.effectiveLastSseEvent().isEmpty()) logical.lastSseEvent = row.effectiveLastSseEvent();
+            if (row.sseTerminal != null) logical.lastSseTerminal = row.sseTerminal;
+            if (!row.effectiveFailureReason().isEmpty()) logical.lastFailureReason = row.effectiveFailureReason();
+            if (row.bridgeStatus != null && !row.bridgeStatus.isEmpty()) logical.lastBridgeStatus = row.bridgeStatus;
+            if (row.deliveryStatus != null && !row.deliveryStatus.isEmpty()) logical.lastDeliveryStatus = row.deliveryStatus;
+            if (row.workBuddyFailure != null) logical.lastWorkBuddyFailure = row.workBuddyFailure;
+        }
         UsageLedger.record(row);
     }
     private static final class LogicalRequest {
         String terminalErrorCode;
         final String id = REQUEST_CONTEXT.get()==null?java.util.UUID.randomUUID().toString():REQUEST_CONTEXT.get().requestId;
         CallEvidence.Snapshot lastCallEvidence;
+        String lastFailurePhase, lastTransportKind, lastErrorCode;
+        int lastUpstreamHttpStatus;
+        String lastSseEvent, lastFailureReason, lastBridgeStatus, lastDeliveryStatus;
+        Boolean lastSseTerminal;
+        WorkBuddyFailure lastWorkBuddyFailure;
         final RequestDiagnostics.Logical diagnostics = REQUEST_CONTEXT.get()==null
                 ? new RequestDiagnostics.Logical() : REQUEST_CONTEXT.get().diagnosticScope;
         int attempts;
@@ -10673,6 +11912,7 @@ public class GatewayServer extends NanoHTTPD {
     private static void beginUsage(String prov, String reqModel, String upModel, JSONObject account) {
         UsageLedger.Row previous=U_ROW.get();
         UsageLedger.Row r = new UsageLedger.Row();
+        attachLiveStatsTarget(r, null);
         if(account==null&&previous!=null&&prov.equals(previous.prov)){r.accountRoutingLease=previous.accountRoutingLease;}
         String accountId = account == null ? (previous!=null&&prov.equals(previous.prov)?previous.accountId:"") : account.optString("id", "");
         boolean safeAccountId = accountId.length() <= 256;
@@ -10690,11 +11930,12 @@ public class GatewayServer extends NanoHTTPD {
             r.tries = logical.attempts;
             r.credentialId = logical.credentialId;
         }
-        CallEvidence.Entry entry=CALL_ENTRY.get();
-        if("antigravity".equals(prov) && entry!=null){
-            if(logical==null)r.requestId=entry.requestId;
-            r.callObservation=new CallEvidence.Builder(entry,prov,account);
+        CallEvidence.Entry entry = CALL_ENTRY.get();
+        if (entry != null) {
+            if (logical == null) r.requestId = entry.requestId;
+            r.callObservation = new CallEvidence.Builder(entry, prov, account);
         }
+        GATEWAY_EVENT_LEDGERED.set(Boolean.TRUE);
         r.prov = prov == null ? "" : prov;
         r.req = reqModel == null ? "" : reqModel;
         r.model = upModel == null ? "" : upModel;
@@ -10847,6 +12088,536 @@ public class GatewayServer extends NanoHTTPD {
         }
     }
 
+    private static void recordCallDispatched(UsageLedger.Row row, String upstreamModel, int sends) {
+        CallEvidence.Builder ev = row == null ? null : row.callObservation;
+        if (ev != null) ev.dispatched(upstreamModel, sends);
+    }
+
+    private static void recordCallReply(UsageLedger.Row row, int status, String retryAfter, String body) {
+        if (row != null && status > 0) row.upstreamHttpStatus = status;
+        CallEvidence.Builder ev = row == null ? null : row.callObservation;
+        if (ev != null) ev.reply(status, retryAfter, body);
+    }
+
+    private static void recordRowFailureMeta(UsageLedger.Row row, String phase, String transport) {
+        recordRowFailureMeta(row, phase, transport, null);
+    }
+
+    private static void recordRowFailureMeta(UsageLedger.Row row, String phase, String transport, String reason) {
+        if (row == null) return;
+        if (phase != null && !phase.isEmpty() && (row.failurePhase == null || row.failurePhase.isEmpty())) {
+            row.failurePhase = phase.toLowerCase(java.util.Locale.ROOT);
+        }
+        if (transport != null && !transport.isEmpty() && !"none".equalsIgnoreCase(transport)
+                && (row.transportKind == null || row.transportKind.isEmpty())) {
+            row.transportKind = transport.toLowerCase(java.util.Locale.ROOT);
+        }
+        recordRowFailureReason(row, reason);
+    }
+
+    private static void recordRowFailureReason(UsageLedger.Row row, String reason) {
+        if (row == null || reason == null || reason.isEmpty()) return;
+        if (row.failureReason == null || row.failureReason.isEmpty()) {
+            row.failureReason = reason.toLowerCase(java.util.Locale.ROOT);
+        }
+    }
+
+    private static void recordRowSseEvent(UsageLedger.Row row, String eventType) {
+        if (row == null || eventType == null) return;
+        String clean = eventType.trim();
+        if (clean.isEmpty()) return;
+        if (clean.length() > 64) clean = clean.substring(0, 64);
+        if (clean.matches("[A-Za-z0-9_.:/\\[\\]-]{1,64}")) row.lastSseEvent = clean;
+    }
+
+    private static void recordRowSseTerminal(UsageLedger.Row row, boolean seen) {
+        if (row == null) return;
+        if (seen) row.sseTerminal = Boolean.TRUE;
+        else if (row.sseTerminal == null) row.sseTerminal = Boolean.FALSE;
+    }
+
+    private static boolean validTerminalResponsesObject(String eventType, JSONObject response) {
+        if ("response.completed".equals(eventType) || "response.incomplete".equals(eventType)) {
+            if (response == null || !eventType.substring(9).equals(response.optString("status"))) return false;
+            return !response.has("error") || response.isNull("error");
+        }
+        if ("response.failed".equals(eventType)) {
+            return response == null || !response.has("status") || "failed".equals(response.optString("status"));
+        }
+        return false;
+    }
+
+    static String classifyStreamReason(Throwable e) {
+        if (e == null) return "";
+        Throwable t = e;
+        for (int depth = 0; t != null && depth < 8; depth++) {
+            if (t instanceof javax.net.ssl.SSLException
+                    || t instanceof java.security.cert.CertificateException
+                    || t instanceof java.security.cert.CertPathValidatorException) {
+                return "tls_error";
+            }
+            if (t instanceof java.net.SocketTimeoutException) return "read_timeout";
+            if (t instanceof java.io.EOFException) return "premature_eof";
+            if (t instanceof ProtocolResponseException
+                    || t instanceof TraeResponseFormat.InvalidOutput
+                    || t instanceof IllegalArgumentException) {
+                return "conversion_validation_failed";
+            }
+            if (t instanceof WorkBuddyNativeTransport.NoReplayException) {
+                WorkBuddyNativeTransport.NoReplayException nr = (WorkBuddyNativeTransport.NoReplayException) t;
+                if (!nr.outcomeUnknown()) return "conversion_validation_failed";
+            }
+            Throwable next = t.getCause();
+            if (next == t) break;
+            t = next;
+        }
+        String tr = FailureLayers.transportName(e);
+        if ("tls".equals(tr)) return "tls_error";
+        if ("timeout".equals(tr)) return "read_timeout";
+        Cause wb = WorkBuddyFailure.classify(e);
+        if (wb == Cause.TLS) return "tls_error";
+        if (wb == Cause.TIMEOUT) return "read_timeout";
+        if (wb == Cause.EOF) return "premature_eof";
+        if (wb == Cause.PROTOCOL) return "conversion_validation_failed";
+        String msg = e.getMessage() == null ? "" : e.getMessage().toLowerCase(java.util.Locale.ROOT);
+        if (msg.contains("incomplete frame") || msg.contains("truncated sse") || msg.contains("ended before")
+                || msg.contains("empty upstream read")) {
+            return "premature_eof";
+        }
+        if (msg.contains("tls") || msg.contains("ssl") || msg.contains("certificate") || msg.contains("handshake")) {
+            return "tls_error";
+        }
+        if (msg.contains("timed out") || msg.contains("timeout")) return "read_timeout";
+        if (msg.contains("invalid") || msg.contains("missing event type") || msg.contains("json")
+                || msg.contains("unsupported") || msg.contains("function call")
+                || msg.contains("function arguments") || msg.contains("changed in final")
+                || msg.contains("exceeds the gateway") || msg.contains("terminal responses contains error")) {
+            return "conversion_validation_failed";
+        }
+        return "";
+    }
+
+    static String classifyExceptionReason(Throwable e, String phase) {
+        String r = classifyStreamReason(e);
+        if ("read_timeout".equals(r) && "open_connection".equals(phase)) return "connect_timeout";
+        if (!r.isEmpty()) return r;
+        String tr = FailureLayers.transportName(e);
+        if ("dns".equals(tr)) return "dns_error";
+        if ("refused".equals(tr)) return "connection_refused";
+        if ("network".equals(tr)) return "network_error";
+        return "";
+    }
+
+    static void recordStreamThrowable(UsageLedger.Row row, Throwable e, boolean cancelled) {
+        if (row == null) return;
+        String tr = cancelled ? "cancelled" : FailureLayers.transportName(e);
+        String reason = cancelled ? "downstream_cancelled" : classifyStreamReason(e);
+        recordRowFailureMeta(row, cancelled ? "downstream_delivery" : "read_response_body", tr, reason);
+        row.sseTerminal = Boolean.FALSE;
+    }
+
+    private static final ThreadLocal<java.util.List<String>> ACTIVE_SECRETS = new ThreadLocal<>();
+
+    private static void addSecretValue(java.util.List<String> targetList, String secret) {
+        if (targetList == null || secret == null) return;
+        String trimmed = secret.trim();
+        if (trimmed.length() < 4 || targetList.contains(trimmed)) return;
+        targetList.add(trimmed);
+    }
+
+    private static void attachRowSecrets(UsageLedger.Row row, RouteTarget target, CodexAuth.SignInInfo info) {
+        java.util.List<String> threadList = ACTIVE_SECRETS.get();
+        if (threadList == null) {
+            threadList = new java.util.ArrayList<>();
+            ACTIVE_SECRETS.set(threadList);
+        }
+        java.util.List<String> rowList = row == null ? null : row.activeSecrets;
+        if (row != null && rowList == null) {
+            rowList = new java.util.ArrayList<>();
+            row.activeSecrets = rowList;
+        }
+        java.util.List<String> collected = new java.util.ArrayList<>();
+        if (target != null) {
+            addSecretValue(collected, target.apiKey);
+            if (target.commercialCandidates != null) {
+                for (CommercialKeyPool.Credential c : target.commercialCandidates) addSecretValue(collected, c.secret());
+            }
+            if (target.account != null) {
+                for (String k : new String[]{"token", "access", "accessToken", "refresh", "refreshToken", "idToken", "secret", "apiKey"}) {
+                    addSecretValue(collected, target.account.optString(k, ""));
+                }
+            }
+            if (target.customProvider != null) {
+                JSONObject headers = target.customProvider.optJSONObject("headers");
+                if (headers != null) {
+                    for (String name : headers.keySet()) {
+                        String val = headers.optString(name, "");
+                        if (val.isEmpty()) continue;
+                        if (isSensitiveCustomHeaderName(name) || val.length() >= 6) {
+                            addSecretValue(collected, val);
+                            if ("authorization".equalsIgnoreCase(name)) {
+                                int sp = val.indexOf(' ');
+                                if (sp > 0 && sp + 1 < val.length()) addSecretValue(collected, val.substring(sp + 1));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (info != null) {
+            addSecretValue(collected, info.accessToken);
+            addSecretValue(collected, info.refreshToken);
+            addSecretValue(collected, info.idToken);
+        }
+        LogicalRequest logical = LOGICAL.get();
+        if (logical != null && logical.credentials != null) {
+            for (CommercialKeyPool.Credential c : logical.credentials) addSecretValue(collected, c.secret());
+        }
+        for (String s : collected) {
+            addSecretValue(threadList, s);
+            addSecretValue(rowList, s);
+        }
+    }
+
+    private static String scrubDiagnosticText(String text, java.util.List<String> extraSecrets) {
+        if (text == null || text.isEmpty()) return "";
+        String out = text;
+        java.util.List<String> active = ACTIVE_SECRETS.get();
+        if (active != null) {
+            for (String s : active) {
+                if (s != null && s.length() >= 4) out = out.replace(s, "[REDACTED]");
+            }
+        }
+        if (extraSecrets != null) {
+            for (String s : extraSecrets) {
+                if (s != null && s.length() >= 4) out = out.replace(s, "[REDACTED]");
+            }
+        }
+        LogicalRequest logical = LOGICAL.get();
+        if (logical != null && logical.credentials != null) {
+            for (CommercialKeyPool.Credential c : logical.credentials) {
+                String secret = c.secret();
+                if (secret != null && !secret.isEmpty()) out = out.replace(secret, "[REDACTED]");
+            }
+        }
+        return UsageLedger.scrubTextTokens(out);
+    }
+
+    private static String sanitizeErrorTag(String tag, java.util.List<String> extraSecrets) {
+        if (tag == null || tag.isEmpty()) return "";
+        String scrubbed = scrubDiagnosticText(tag.replace('\n', ' ').replace('\r', ' ').trim(), extraSecrets);
+        if (scrubbed.isEmpty() || scrubbed.contains("[REDACTED]") || "null".equals(scrubbed)
+                || scrubbed.startsWith("sk-") || scrubbed.startsWith("eyJ")) {
+            return "";
+        }
+        return scrubbed;
+    }
+
+    private static ResponsesBridge.StreamObserver responsesStreamObserver(final UsageLedger.Row row) {
+        return new ResponsesBridge.StreamObserver() {
+            @Override public void onEvent(String eventType, JSONObject event) {
+                if (row == null) return;
+                row.upstreamSseObserved = true;
+                if (row.sseTerminal == null && (row.failureReason == null || row.failureReason.isEmpty())) {
+                    recordRowSseEvent(row, eventType);
+                }
+                if (event != null) {
+                    JSONObject r = event.optJSONObject("response");
+                    if (r != null) absorbUsage(row, r.optJSONObject("usage"));
+                    absorbUsage(row, event.optJSONObject("usage"));
+                }
+            }
+            @Override public void onTerminal(boolean seen, String eventType) {
+                if (row == null) return;
+                row.upstreamSseObserved = true;
+                if (eventType != null && !eventType.isEmpty() && (row.failureReason == null || row.failureReason.isEmpty())) {
+                    recordRowSseEvent(row, eventType);
+                }
+                recordRowSseTerminal(row, seen);
+                if (seen && !"response.failed".equals(eventType) && row.bridgeStatus.isEmpty()) {
+                    row.bridgeStatus = "ok";
+                }
+            }
+            @Override public void onFailure(String reason, String lastEvent, Throwable cause, String rawError) {
+                if (row == null) return;
+                row.upstreamSseObserved = true;
+                if (lastEvent != null && !lastEvent.isEmpty()) recordRowSseEvent(row, lastEvent);
+                if (!Boolean.TRUE.equals(row.sseTerminal)) {
+                    recordRowSseTerminal(row, "response.failed".equals(lastEvent));
+                }
+                String normalized = (reason == null || reason.isEmpty()) ? "premature_eof" : reason;
+                String tr = cause != null ? FailureLayers.transportName(cause)
+                        : ("upstream_explicit_error".equals(normalized) ? "http_rejection"
+                        : ("conversion_validation_failed".equals(normalized) ? "protocol" : "eof"));
+                recordRowFailureMeta(row, "read_response_body", tr, normalized);
+                row.bridgeStatus = "conversion_validation_failed".equals(normalized) ? "failed" : "upstream_aborted";
+                if ("upstream_explicit_error".equals(normalized) && rawError != null && !rawError.isEmpty()) {
+                    String code = extractSafeErrorCode(rawError, row.activeSecrets);
+                    if (!code.isEmpty() && (row.upstreamErrorCode == null || row.upstreamErrorCode.isEmpty())) {
+                        row.upstreamErrorCode = code;
+                    }
+                }
+            }
+        };
+    }
+
+    private static String extractSafeErrorCode(String rawBody) {
+        return extractSafeErrorCode(rawBody, null);
+    }
+
+    private static String extractSafeErrorCode(String rawBody, java.util.List<String> extraSecrets) {
+        if (rawBody == null || rawBody.isEmpty()) return "";
+        String t = scrubDiagnosticText(rawBody, extraSecrets).trim();
+        if (!t.startsWith("{")) return "";
+        try {
+            JSONObject root = new JSONObject(t);
+            JSONObject err = root.optJSONObject("error");
+            JSONObject metaErr = root.optJSONObject("ResponseMetadata") != null
+                    ? root.optJSONObject("ResponseMetadata").optJSONObject("Error") : null;
+            for (JSONObject src : new JSONObject[]{err, metaErr, root}) {
+                if (src == null) continue;
+                for (String key : new String[]{"code", "Code", "type", "status"}) {
+                    Object val = src.opt(key);
+                    if (val instanceof String || val instanceof Number) {
+                        String s = sanitizeErrorTag(String.valueOf(val), extraSecrets);
+                        if (s.matches("[A-Za-z0-9_.:-]{1,64}")) return s;
+                    }
+                }
+            }
+        } catch (Exception ignored) { }
+        return "";
+    }
+
+    private static String extractStreamErrorSummary(Object rawError) {
+        return extractStreamErrorSummary(rawError, null);
+    }
+
+    private static String extractStreamErrorSummary(Object rawError, java.util.List<String> extraSecrets) {
+        if (rawError == null || rawError == JSONObject.NULL) return "SSE error";
+        if (rawError instanceof JSONObject) {
+            return summarizeErrorForLedger(502, new JSONObject().put("error", rawError).toString(),
+                    "read_response_body", "protocol", "", extraSecrets);
+        }
+        String text = scrubDiagnosticText(String.valueOf(rawError).replace('\n', ' ').replace('\r', ' ').trim(), extraSecrets);
+        return text.length() > 280 ? text.substring(0, 280) + "…" : text;
+    }
+
+    /** Extract concise, human-readable scrubbed diagnostic text (max 512 chars) without raw HTML/envelopes. */
+    private static String summarizeErrorForLedger(int status, String rawErr, String phase, String transport, String code) {
+        return summarizeErrorForLedger(status, rawErr, phase, transport, code, null);
+    }
+
+    private static String summarizeErrorForLedger(int status, String rawErr, String phase, String transport, String code,
+                                                  java.util.List<String> extraSecrets) {
+        String s = scrubDiagnosticText(rawErr == null ? "" : rawErr.replace('\n', ' ').replace('\r', ' ').trim(), extraSecrets);
+        String safeCode = sanitizeErrorTag(code, extraSecrets);
+        String lower = s.toLowerCase(java.util.Locale.ROOT);
+        if (lower.contains("<html") || lower.contains("<!doctype html")) {
+            String title = "";
+            int ts = lower.indexOf("<title>");
+            int te = ts >= 0 ? lower.indexOf("</title>", ts + 7) : -1;
+            if (ts >= 0 && te > ts + 7) {
+                title = s.substring(ts + 7, te).replaceAll("\\s+", " ").trim();
+            }
+            s = "HTML error page (HTTP " + (status > 0 ? status : 502) + ")"
+                    + (title.isEmpty() ? "" : ": " + scrubDiagnosticText(title, extraSecrets));
+        } else if (s.startsWith("{")) {
+            try {
+                JSONObject root = new JSONObject(s);
+                JSONObject detail = root.optJSONObject("error");
+                if (detail == null && root.optJSONObject("ResponseMetadata") != null) {
+                    detail = root.optJSONObject("ResponseMetadata").optJSONObject("Error");
+                }
+                String extractedCode = "";
+                String extractedParam = "";
+                String extractedMsg = "";
+                for (JSONObject src : new JSONObject[]{detail, root}) {
+                    if (src == null) continue;
+                    if (extractedCode.isEmpty()) {
+                        for (String ck : new String[]{"code", "Code", "type", "status"}) {
+                            Object cv = src.opt(ck);
+                            if (cv instanceof String || cv instanceof Number) {
+                                String cs = sanitizeErrorTag(String.valueOf(cv), extraSecrets);
+                                if (!cs.isEmpty()) { extractedCode = cs; break; }
+                            }
+                        }
+                    }
+                    if (extractedParam.isEmpty()) {
+                        Object pv = src.opt("param");
+                        if (pv instanceof String && !((String) pv).trim().isEmpty()) {
+                            extractedParam = sanitizeErrorTag((String) pv, extraSecrets);
+                        }
+                    }
+                    if (extractedMsg.isEmpty()) {
+                        for (String mk : new String[]{"message", "msg", "detail", "Message"}) {
+                            Object mv = src.opt(mk);
+                            if (mv instanceof String && !((String) mv).trim().isEmpty()) {
+                                extractedMsg = scrubDiagnosticText(((String) mv).trim(), extraSecrets);
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (extractedMsg.isEmpty() && root.opt("error") instanceof String) {
+                    extractedMsg = scrubDiagnosticText(root.optString("error", "").trim(), extraSecrets);
+                }
+                if (!extractedMsg.isEmpty() || !extractedCode.isEmpty()) {
+                    StringBuilder formatted = new StringBuilder();
+                    String tagCode = !extractedCode.isEmpty() ? extractedCode : safeCode;
+                    if (!tagCode.isEmpty() || !extractedParam.isEmpty()) {
+                        formatted.append("[");
+                        if (!tagCode.isEmpty()) formatted.append(tagCode);
+                        if (!extractedParam.isEmpty()) {
+                            if (!tagCode.isEmpty()) formatted.append(" · param=");
+                            formatted.append(extractedParam);
+                        }
+                        formatted.append("] ");
+                    }
+                    formatted.append(extractedMsg);
+                    s = formatted.toString().trim();
+                }
+            } catch (Exception ignored) { }
+        }
+        if ("Upstream connection failed; execution outcome unknown".equals(s)
+                && ((phase != null && !phase.isEmpty()) || (transport != null && !transport.isEmpty()))) {
+            StringBuilder detail = new StringBuilder(s).append(" [");
+            if (phase != null && !phase.isEmpty()) detail.append(phase);
+            if (phase != null && !phase.isEmpty() && transport != null && !transport.isEmpty()) detail.append(" · ");
+            if (transport != null && !transport.isEmpty()) detail.append(transport);
+            detail.append("]");
+            s = detail.toString();
+        }
+        s = scrubDiagnosticText(s, extraSecrets);
+        return s.length() > 512 ? s.substring(0, 512) + "…" : s;
+    }
+
+    static void logGatewayOutcomeSummary(UsageLedger.Row r) {
+        if (r == null) return;
+        if (r.failed()) { logGatewayFailureSummary(r); return; }
+        if (r.sseTerminal == null) return;
+        try {
+            StringBuilder msg = new StringBuilder("gateway_stream");
+            if (r.prov != null && !r.prov.isEmpty()) msg.append(" prov=").append(r.prov);
+            if (r.model != null && !r.model.isEmpty()) msg.append(" model=").append(r.model);
+            msg.append(" status=").append(r.status);
+            int upSt = r.effectiveUpstreamHttpStatus();
+            if (upSt > 0) msg.append(" upstreamStatus=").append(upSt);
+            String lastSse = r.effectiveLastSseEvent();
+            if (!lastSse.isEmpty()) msg.append(" lastSse=").append(lastSse);
+            msg.append(" terminalSeen=").append(r.sseTerminal);
+            if (r.requestId != null && !r.requestId.isEmpty()) msg.append(" reqId=").append(r.requestId);
+            String line = msg.toString();
+            emitDiagnosticLog(false, line);
+        } catch (Throwable ignored) { }
+    }
+
+    private static void emitDiagnosticLog(boolean warn, String line) {
+        try {
+            java.util.function.Consumer<String> hook = diagnosticLogHook;
+            if (hook != null) hook.accept((warn ? "W/Magpie: " : "I/Magpie: ") + line);
+        } catch (Throwable ignored) { }
+        try {
+            if (warn) android.util.Log.w("Magpie", line);
+            else android.util.Log.i("Magpie", line);
+        } catch (Throwable ignored) { }
+    }
+
+    private static void logGatewayFailureSummary(UsageLedger.Row r) {
+        if (r == null || !r.failed()) return;
+        try {
+            StringBuilder msg = new StringBuilder("gateway_failure");
+            if (r.prov != null && !r.prov.isEmpty()) msg.append(" prov=").append(r.prov);
+            if (r.model != null && !r.model.isEmpty()) msg.append(" model=").append(r.model);
+            msg.append(" status=").append(r.status);
+            msg.append(" upstreamStatus=").append(r.effectiveUpstreamHttpStatus());
+            if (r.failureKind != null && !r.failureKind.isEmpty()) msg.append(" kind=").append(r.failureKind);
+            String ph = r.effectiveFailurePhase();
+            if (!ph.isEmpty()) msg.append(" phase=").append(ph);
+            String tr = r.effectiveFailureCause();
+            if (!tr.isEmpty()) msg.append(" transport=").append(tr);
+            String reason = r.effectiveFailureReason();
+            if (!reason.isEmpty()) msg.append(" reason=").append(reason);
+            String lastSse = r.effectiveLastSseEvent();
+            if (!lastSse.isEmpty()) msg.append(" lastSse=").append(lastSse);
+            if (r.sseTerminal != null) msg.append(" terminalSeen=").append(r.sseTerminal);
+            String safeCode = sanitizeErrorTag(r.upstreamErrorCode, r.activeSecrets);
+            if (!safeCode.isEmpty()) msg.append(" code=").append(safeCode);
+            if (r.requestId != null && !r.requestId.isEmpty()) msg.append(" reqId=").append(r.requestId);
+            emitDiagnosticLog(true, scrubDiagnosticText(msg.toString(), r.activeSecrets));
+        } catch (Throwable ignored) { }
+    }
+
+    private static String safeGatewayModelTag(String model) {
+        if (model == null) return "";
+        String t = model.trim();
+        if (t.isEmpty() || t.length() > 160 || t.startsWith("eyJ") || t.startsWith("sk-")) return "";
+        return t.matches("[A-Za-z0-9_.:/+\\-@]{1,160}") ? t : "";
+    }
+
+    private void recordPreDispatchRejection(String uri, String method, int status, String requestId) {
+        if (status < 400) return;
+        if (!"/v1/chat/completions".equals(uri) && !"/v1/messages".equals(uri)
+                && !"/v1/responses".equals(uri) && !"/responses".equals(uri)
+                && !"/api/test-model".equals(uri)) {
+            return;
+        }
+        String summary = LAST_ERROR_SUMMARY.get();
+        LAST_ERROR_SUMMARY.remove();
+        if (summary == null || summary.isEmpty()) summary = "HTTP " + status;
+        summary = summary.replace('\n', ' ').replace('\r', ' ').trim();
+        if (summary.length() > 240) summary = summary.substring(0, 240) + "…";
+        String stage = GATEWAY_EVENT_STAGE.get();
+        String reason = GATEWAY_EVENT_REASON.get();
+        GATEWAY_EVENT_REASON.remove();
+        String model = safeGatewayModelTag(GATEWAY_EVENT_MODEL.get());
+        String prov = model.contains("/") ? model.substring(0, model.indexOf('/')) : "";
+        String normStage = stage == null || stage.isEmpty() ? "ingress" : stage;
+        if (reason == null || reason.isEmpty()) {
+            if ("auth".equals(normStage)) reason = "auth_rejected";
+            else if ("guard".equals(normStage)) reason = "guard_rejected";
+            else if ("middleware".equals(normStage)) reason = "middleware_blocked";
+            else if ("routing".equals(normStage)) reason = "routing_not_found";
+            else if ("ingress".equals(normStage) && summary.contains("JSON")) reason = "conversion_validation_failed";
+        }
+        JSONObject ev = new JSONObject();
+        try {
+            ev.put("t", System.currentTimeMillis());
+            ev.put("requestId", requestId == null ? "" : requestId);
+            ev.put("path", uri == null ? "" : uri);
+            ev.put("method", method == null ? "" : method);
+            ev.put("status", status);
+            ev.put("upstreamStatus", 0);
+            ev.put("stage", normStage);
+            if (reason != null && !reason.isEmpty()) ev.put("reason", reason);
+            if (!model.isEmpty()) ev.put("model", model);
+            if (!prov.isEmpty()) ev.put("provider", prov);
+            ev.put("message", summary);
+            java.util.Deque<JSONObject> buf = gatewayEventsBuffer();
+            synchronized (buf) {
+                while (buf.size() >= MAX_GATEWAY_EVENTS) buf.removeLast();
+                buf.addFirst(ev);
+            }
+            emitDiagnosticLog(true, "gateway_reject path=" + uri + " status=" + status + " upstreamStatus=0"
+                    + " stage=" + normStage
+                    + (reason == null || reason.isEmpty() ? "" : " reason=" + reason)
+                    + (prov.isEmpty() ? "" : " prov=" + prov)
+                    + (requestId == null || requestId.isEmpty() ? "" : " reqId=" + requestId));
+        } catch (Throwable ignored) { }
+    }
+
+    private JSONArray snapshotGatewayEvents(String providerFilter) {
+        JSONArray arr = new JSONArray();
+        String pf = providerFilter == null ? "" : providerFilter.trim();
+        java.util.Deque<JSONObject> buf = gatewayEventsBuffer();
+        synchronized (buf) {
+            for (JSONObject ev : buf) {
+                if (!pf.isEmpty() && !pf.equalsIgnoreCase(ev.optString("provider", ""))) continue;
+                arr.put(new JSONObject(ev.toString()));
+            }
+        }
+        return arr;
+    }
+
     /** 收尾写一行；失败也记（请求数、错误原因要准） */
     private void commitUsage(int status, String err) {
         if (Boolean.TRUE.equals(U_DONE.get())) return;
@@ -10871,6 +12642,24 @@ public class GatewayServer extends NanoHTTPD {
                 JSONObject detail = error.optJSONObject("error");
                 if (detail != null) absorbUsage(r, detail.optJSONObject("usage"));
             } catch (Exception ignored) { }
+        }
+        if (r.failed()) {
+            r.upstreamErrorCode = sanitizeErrorTag(r.upstreamErrorCode, r.activeSecrets);
+            if (r.upstreamErrorCode.isEmpty()) {
+                String code = extractSafeErrorCode(r.err, r.activeSecrets);
+                if (!code.isEmpty()) r.upstreamErrorCode = code;
+            }
+            r.err = summarizeErrorForLedger(r.status, r.err, r.effectiveFailurePhase(), r.effectiveFailureCause(), r.upstreamErrorCode, r.activeSecrets);
+            if (r.bridgeStatus == null || r.bridgeStatus.isEmpty()) {
+                r.bridgeStatus = "conversion_validation_failed".equals(r.effectiveFailureReason()) ? "failed" : "upstream_aborted";
+            }
+            if (r.deliveryStatus == null || r.deliveryStatus.isEmpty()) {
+                r.deliveryStatus = r.status == 499 ? "cancelled" : "failed";
+            }
+            logGatewayFailureSummary(r);
+        } else {
+            if (r.bridgeStatus == null || r.bridgeStatus.isEmpty()) r.bridgeStatus = "ok";
+            if (r.deliveryStatus == null || r.deliveryStatus.isEmpty()) r.deliveryStatus = "unknown";
         }
         Long first = U_FIRST.get();
         Long last = U_LAST.get();
@@ -11487,15 +13276,97 @@ public class GatewayServer extends NanoHTTPD {
 
     private static final class CompletionForwardStream extends java.io.FilterInputStream implements fi.iki.elonen.AllInTrackedResponse.WriteCompletion {
         private final InputStream completion;
-        CompletionForwardStream(InputStream projected, InputStream completion) { super(projected); this.completion = completion; }
+        private final UsageLedger.Row row;
+        CompletionForwardStream(InputStream projected, InputStream completion) {
+            this(projected, completion, null);
+        }
+        CompletionForwardStream(InputStream projected, InputStream completion, UsageLedger.Row row) {
+            super(projected);
+            this.completion = completion;
+            this.row = row;
+        }
         public void onWriteStart() {
-            if (completion instanceof fi.iki.elonen.AllInTrackedResponse.WriteCompletion)
+            if (in instanceof fi.iki.elonen.AllInTrackedResponse.WriteCompletion) {
+                ((fi.iki.elonen.AllInTrackedResponse.WriteCompletion) in).onWriteStart();
+            } else if (completion instanceof fi.iki.elonen.AllInTrackedResponse.WriteCompletion) {
                 ((fi.iki.elonen.AllInTrackedResponse.WriteCompletion) completion).onWriteStart();
+            }
         }
         public void onWriteComplete(boolean success) {
-            if (completion instanceof fi.iki.elonen.AllInTrackedResponse.WriteCompletion)
+            boolean upstreamAlreadyFailed = row != null && (row.sseTerminal == Boolean.FALSE
+                    || (!row.failurePhase.isEmpty() && !"conversion".equals(row.failurePhase) && !"downstream_delivery".equals(row.failurePhase))
+                    || (!row.failureReason.isEmpty() && !"conversion_validation_failed".equals(row.failureReason)
+                        && !"downstream_cancelled".equals(row.failureReason) && !"downstream_write_failed".equals(row.failureReason)));
+            if (in instanceof ResponsesBridge.ProjectionCompletion) {
+                ResponsesBridge.ProjectionCompletion pc = (ResponsesBridge.ProjectionCompletion) in;
+                if (pc.isProjectionFailed() && row != null && !upstreamAlreadyFailed) {
+                    String detail = pc.projectionErrorMessage();
+                    String msg = detail.isEmpty() ? "Chat->Responses stream conversion failed" : ("Invalid upstream Chat response: " + detail);
+                    recordRowFailureMeta(row, "conversion", "protocol", "conversion_validation_failed");
+                    row.bridgeStatus = "failed";
+                    row.deliveryStatus = success ? "delivered" : "failed";
+                    if (row.err == null || row.err.isEmpty()) row.err = UsageLedger.scrubTextTokens(msg);
+                    if (row.ledgerPersisted) {
+                        UsageLedger.settleDelivery(row, success, 502, msg, "conversion", "protocol", "conversion_validation_failed", "failed");
+                    }
+                } else if (upstreamAlreadyFailed && row != null) {
+                    if (row.bridgeStatus == null || row.bridgeStatus.isEmpty()) row.bridgeStatus = "upstream_aborted";
+                    if (row.ledgerPersisted) {
+                        UsageLedger.settleUpstreamErrorDelivery(row, success);
+                    } else {
+                        row.deliveryStatus = success ? "delivered" : "failed";
+                    }
+                }
+                pc.onWriteComplete(success);
+                return;
+            }
+            if (in instanceof fi.iki.elonen.AllInTrackedResponse.WriteCompletion) {
+                ((fi.iki.elonen.AllInTrackedResponse.WriteCompletion) in).onWriteComplete(success);
+            } else if (completion instanceof fi.iki.elonen.AllInTrackedResponse.WriteCompletion) {
                 ((fi.iki.elonen.AllInTrackedResponse.WriteCompletion) completion).onWriteComplete(success);
+            }
         }
+    }
+
+    private static final class DeliveryTrackedStream extends java.io.FilterInputStream implements fi.iki.elonen.AllInTrackedResponse.WriteCompletion {
+        private final UsageLedger.Row row;
+        private final RequestContext request;
+        private final java.util.concurrent.atomic.AtomicBoolean settled = new java.util.concurrent.atomic.AtomicBoolean();
+        private volatile boolean writeStarted;
+        DeliveryTrackedStream(InputStream delegate, UsageLedger.Row row, RequestContext request) {
+            super(delegate);
+            this.row = row;
+            this.request = request;
+        }
+        @Override public void onWriteStart() { writeStarted = true; }
+        @Override public void onWriteComplete(boolean success) {
+            if (!settled.compareAndSet(false, true) || row == null) return;
+            boolean cancelled = request != null && request.isCancelled() && !"finished".equals(request.cancelReason());
+            if (!writeStarted) {
+                if (cancelled) {
+                    int st = (request.remainingMillis() == 0 || "deadline".equals(request.cancelReason())) ? 504 : 499;
+                    UsageLedger.settleDelivery(row, false, st, "Downstream response cancelled before send",
+                            "downstream_delivery", "cancelled", "downstream_cancelled");
+                }
+                return;
+            }
+            if (success) {
+                UsageLedger.settleDelivery(row, true, 200, null, null, null, null);
+                return;
+            }
+            int st = cancelled ? ((request.remainingMillis() == 0 || "deadline".equals(request.cancelReason())) ? 504 : 499) : 502;
+            String tr = st == 499 ? "cancelled" : "downstream";
+            String reason = st == 499 ? "downstream_cancelled" : "downstream_write_failed";
+            String msg = st == 499 ? "Downstream response cancelled" : "Downstream response write failed";
+            UsageLedger.settleDelivery(row, false, st, msg, "downstream_delivery", tr, reason);
+        }
+    }
+
+    private static void attachFixedLengthDeliveryTracking(Response resp, UsageLedger.Row row, RequestContext request) {
+        if (resp == null || row == null || resp.getStatus() == null || resp.getStatus().getRequestStatus() >= 400) return;
+        InputStream data = resp.getData();
+        if (data == null || data instanceof fi.iki.elonen.AllInTrackedResponse.WriteCompletion) return;
+        resp.setData(new DeliveryTrackedStream(data, row, request));
     }
 
     private static final class RecentUsageStream extends InputStream implements fi.iki.elonen.AllInTrackedResponse.WriteCompletion {
@@ -11932,17 +13803,45 @@ public class GatewayServer extends NanoHTTPD {
     private static void terminalMarker(LogicalRequest logical, String requestedModel, RouteTarget target,
                                        int status, String error) {
         UsageLedger.Row row = new UsageLedger.Row();
+        attachLiveStatsTarget(row, null);
         row.requestId = logical.id; row.attempt = 0; row.terminal = true; row.tries = logical.attempts;
         row.req = requestedModel == null ? "" : requestedModel;
         row.session = U_SESSION.get() == null ? "" : U_SESSION.get();
         if (target != null) { row.prov = target.providerId; row.model = target.upstreamModel; }
         row.callEvidence=logical.lastCallEvidence;
+        if (row.workBuddyFailure == null) row.workBuddyFailure = logical.lastWorkBuddyFailure;
+        if (row.upstreamHttpStatus <= 0 && logical.lastUpstreamHttpStatus > 0) row.upstreamHttpStatus = logical.lastUpstreamHttpStatus;
+        if ((row.lastSseEvent == null || row.lastSseEvent.isEmpty()) && logical.lastSseEvent != null) row.lastSseEvent = logical.lastSseEvent;
+        if (row.sseTerminal == null && logical.lastSseTerminal != null) row.sseTerminal = logical.lastSseTerminal;
+        if ((row.bridgeStatus == null || row.bridgeStatus.isEmpty()) && logical.lastBridgeStatus != null) row.bridgeStatus = logical.lastBridgeStatus;
+        if ((row.deliveryStatus == null || row.deliveryStatus.isEmpty()) && logical.lastDeliveryStatus != null) row.deliveryStatus = logical.lastDeliveryStatus;
+        recordRowFailureMeta(row, logical.lastFailurePhase, logical.lastTransportKind, logical.lastFailureReason);
         row.status = status < 400 ? 502 : status;
+        if (row.bridgeStatus == null || row.bridgeStatus.isEmpty()) {
+            row.bridgeStatus = "conversion_validation_failed".equals(row.effectiveFailureReason()) ? "failed" : "upstream_aborted";
+        }
+        if (row.deliveryStatus == null || row.deliveryStatus.isEmpty()) {
+            row.deliveryStatus = row.status == 499 ? "cancelled" : "failed";
+        }
         row.err = error == null ? "" : error;
         if (logical.terminalErrorCode != null) row.upstreamErrorCode = logical.terminalErrorCode;
+        else if ((row.upstreamErrorCode == null || row.upstreamErrorCode.isEmpty()) && logical.lastErrorCode != null) {
+            row.upstreamErrorCode = logical.lastErrorCode;
+        }
         if (logical.credentials != null) for (CommercialKeyPool.Credential c : logical.credentials)
             row.err = row.err.replace(c.secret(), "[REDACTED]");
+        row.upstreamErrorCode = sanitizeErrorTag(row.upstreamErrorCode, row.activeSecrets);
+        if (row.upstreamErrorCode.isEmpty()) {
+            String code = extractSafeErrorCode(row.err, row.activeSecrets);
+            if (!code.isEmpty()) row.upstreamErrorCode = code;
+        }
         RequestDiagnostics.marker(row,logical.diagnostics,REQUEST_CONTEXT.get(),logical.attempts);
+        if (row.diagnostics != null) {
+            if (row.failureKind == null || row.failureKind.isEmpty()) row.failureKind = row.diagnostics.failureKind == null ? "" : row.diagnostics.failureKind;
+            recordRowFailureMeta(row, null, row.failureKind);
+        }
+        row.err = summarizeErrorForLedger(row.status, row.err, row.effectiveFailurePhase(), row.effectiveFailureCause(), row.upstreamErrorCode, row.activeSecrets);
+        logGatewayFailureSummary(row);
         try { recordUsageRow(row); } catch (Throwable ignored) { }
     }
 
@@ -12421,10 +14320,7 @@ public class GatewayServer extends NanoHTTPD {
         } catch (IllegalArgumentException invalid) {
             return errorResponse(400, invalid.getMessage());
         }
-        totalMasked.addAndGet(mask.interceptedCount);
-        lastMaskedCount = mask.interceptedCount;
-        lastMaskEnabled = privacy.enabled;
-        lastMaskAt = System.currentTimeMillis();
+        recordPrivacyMask(mask.interceptedCount, privacy.enabled, true);
 
         RouteTarget target = new RouteTarget();
         target.providerId = CodexImages.PROVIDER;
@@ -12512,6 +14408,8 @@ public class GatewayServer extends NanoHTTPD {
             return errorResponse(503, "Codex drawing cancelled");
         } catch (java.net.SocketTimeoutException timeout) {
             return errorResponse(504, "Codex drawing timed out");
+        } catch (CodexAuth.RefreshFailure rf) {
+            return codexRefreshErrorResponse(rf);
         } catch (Exception failure) {
             return errorResponse(request.isCancelled() ? 503 : 502, "Codex drawing request failed");
         }
@@ -12537,10 +14435,7 @@ public class GatewayServer extends NanoHTTPD {
                 PrivacyMasker.Session mask = new PrivacyMasker.Session();
                 PrivacyMasker.Config privacy = PrivacyMasker.Config.fromJson(configJson.optJSONObject("privacy"));
                 body.put("prompt", PrivacyMasker.maskText(MiniMaxMedia.string(body.opt("prompt")), mask, privacy));
-                totalMasked.addAndGet(mask.interceptedCount);
-                lastMaskedCount = mask.interceptedCount;
-                lastMaskEnabled = privacy.enabled;
-                lastMaskAt = System.currentTimeMillis();
+                recordPrivacyMask(mask.interceptedCount, privacy.enabled, true);
             } else {
                 handle = path.substring("/v1/videos/".length()).replaceFirst("/content$", "");
                 int split = handle.indexOf("::"), dot = handle.lastIndexOf('.');
@@ -12839,10 +14734,7 @@ public class GatewayServer extends NanoHTTPD {
         } catch (PrivacyMasker.PrivacyException tooLarge) {
             return errorResponse(400, "Image prompt exceeds the privacy placeholder budget");
         }
-        totalMasked.addAndGet(maskSession.interceptedCount);
-        lastMaskedCount = maskSession.interceptedCount;
-        lastMaskEnabled = privCfg.enabled;
-        lastMaskAt = System.currentTimeMillis();
+        recordPrivacyMask(maskSession.interceptedCount, privCfg.enabled, true);
 
         RouteTarget target = new RouteTarget();
         target.providerId = "loomy"; target.baseUrl = LOOMY_IMAGES_URL;
@@ -13465,7 +15357,9 @@ public class GatewayServer extends NanoHTTPD {
             // and the send before it is fully released first: one live ticket at a time, never a
             // second send admitted on the first one's ticket.
             JSONObject sendBody=nativeBody;
-            for(int send=0;;send++) {
+            boolean nativeSignInRenewed=false;
+            boolean signatureRetried=false;
+            for(;;) {
                 final JSONObject bodyForSend=sendBody;
                 WorkBuddyNativeTransport.Request nativeRequest=new WorkBuddyNativeTransport.Request(
                         target.providerId,target.upstreamModel,target.apiKey,target.account,U_SESSION.get(),bodyForSend,
@@ -13479,20 +15373,62 @@ public class GatewayServer extends NanoHTTPD {
                 result.connection=WorkBuddyNativeGatewayTransport.connection(transportResponse);
                 out.sent=true;
                 out.status=transportResponse.statusCode();
-                if(out.status>=200 && out.status<300) break;
+                if(out.status>=200 && out.status<300) {
+                    recordCallReply(U_ROW.get(), out.status, null, null);
+                    break;
+                }
+                Map<String,String> errHeaders=transportResponse.headers();
                 String error=transportResponse.readErrorBody();
-                JSONObject reduced=send==0 && WorkBuddyNativeSignatureRecovery.isSignatureRefusal(out.status,error)
+                // Explicit 401 invalid_token recovery (at most once; bare 401 never triggers refresh).
+                if (out.status == 401 && !nativeSignInRenewed
+                        && target.account != null && "oauth".equals(target.account.optString("type"))
+                        && !target.account.optString("refresh", "").isEmpty()
+                        && (request == null || request.mayContinueAfterRejection())) {
+                    String wbChallenge = null;
+                    if (errHeaders != null) {
+                        for (Map.Entry<String, String> h : errHeaders.entrySet()) {
+                            if ("WWW-Authenticate".equalsIgnoreCase(h.getKey())) { wbChallenge = h.getValue(); break; }
+                        }
+                    }
+                    boolean wbInvalidToken = wbChallenge != null
+                            && wbChallenge.toLowerCase(java.util.Locale.ROOT).contains("invalid_token");
+                    if (wbInvalidToken) {
+                        try {
+                            JSONObject refreshed = ensureStoredToken(target.providerId, target.account, target.apiKey);
+                            String next = storedAccess(refreshed);
+                            if (refreshed != null && !next.isEmpty() && !next.equals(target.apiKey)) {
+                                nativeSignInRenewed = true;
+                                target.account = refreshed;
+                                target.apiKey = next;
+                                attachRowSecrets(U_ROW.get(), target, null);
+                                transportResponse = null;
+                                releaseNativeSend(result, request);
+                                continue;
+                            }
+                        } catch (Exception ignored) { }
+                    }
+                }
+                JSONObject reduced=!signatureRetried && WorkBuddyNativeSignatureRecovery.isSignatureRefusal(out.status,error)
                         ? WorkBuddyNativeSignatureRecovery.withoutThinkingBlocks(bodyForSend) : null;
                 if(reduced==null) {
                     out.ok=false;
                     out.stopFallback=!(request!=null && request.accountConversation && confirmedAccountRefusal(out.status,error));
                     out.body=safeUpstreamErrorJson(error,target);
+                    String wbRetry = null;
+                    if (errHeaders != null) {
+                        for (Map.Entry<String, String> h : errHeaders.entrySet()) {
+                            if ("Retry-After".equalsIgnoreCase(h.getKey())) { wbRetry = h.getValue(); break; }
+                        }
+                    }
+                    recordCallReply(U_ROW.get(), out.status, wbRetry, out.body);
+                    recordRowFailureMeta(U_ROW.get(), "await_response_headers", "http_rejection");
                     out.response=errorResponse(out.status,"WorkBuddy native Messages request rejected: "+out.body);
-                    copyProviderRetryAfter(transportResponse.headers(),out.response);
+                    copyProviderRetryAfter(errHeaders,out.response);
                     return result;
                 }
                 // readErrorBody closed and disconnected this response; give back its ticket and drop
                 // its cancellation registration before the next send is admitted.
+                signatureRetried=true;
                 transportResponse=null;
                 releaseNativeSend(result,request);
                 sendBody=reduced;
@@ -13547,17 +15483,24 @@ public class GatewayServer extends NanoHTTPD {
             out.ok=false; out.stopFallback=true; out.sent=true;
             out.status=noReplay.outcomeUnknown()?0:502;
             out.protocolFailure=!noReplay.outcomeUnknown();
+            out.transportKind = noReplay.outcomeUnknown() ? FailureLayers.transportName(noReplay) : "protocol";
+            String nrReason = noReplay.outcomeUnknown() ? classifyExceptionReason(noReplay, "read_response_body") : "conversion_validation_failed";
+            if (noReplay.outcomeUnknown() && (nrReason == null || nrReason.isEmpty())) nrReason = "premature_eof";
+            recordRowFailureMeta(U_ROW.get(), "read_response_body", out.transportKind, nrReason);
             out.body=noReplay.outcomeUnknown()?"WorkBuddy execution outcome unknown; request was not replayed"
                     :"WorkBuddy native response invalid; request was not replayed";
             out.response=errorResponse(502,out.body);
             return result;
         } catch(WorkBuddyNativeTransport.ConnectException connect) {
             out.ok=false;out.stopFallback=true;out.sent=result.sends>0;out.status=502;out.transportKind=FailureLayers.transportName(connect);
-            out.body="WorkBuddy connection failed before dispatch";out.response=errorResponse(502,out.body);return result;
+            recordRowFailureMeta(U_ROW.get(), "open_connection", out.transportKind, classifyExceptionReason(connect, "open_connection"));
+            out.body="WorkBuddy connection failed before dispatch ["+out.transportKind+"]";out.response=errorResponse(502,out.body);return result;
         } catch(WorkBuddyNativeTransport.InvalidRequestException invalid) {
+            recordRowFailureMeta(U_ROW.get(), "request_preparation", "local_rejection", "conversion_validation_failed");
             out.ok=false;out.localRejection=result.sends==0;out.stopFallback=true;out.sent=result.sends>0;out.status=400;
             out.body="WorkBuddy native request invalid";out.response=errorResponse(400,out.body);return result;
         } catch(OutboundRejected rejected) {
+            recordRowFailureMeta(U_ROW.get(), "outbound_admission", "local_rejection", "admission_rejected");
             // A resend rejected at admission still follows a send that really happened.
             out.ok=false; out.localRejection=!out.sent; out.stopFallback=true; out.status=rejected.status;
             out.body=rejected.getMessage(); out.response=errorResponse(out.status,out.body);
@@ -13566,6 +15509,10 @@ public class GatewayServer extends NanoHTTPD {
         } catch(PrivacyMasker.PrivacyException privacy) {
             throw privacy;
         } catch(Exception failure) {
+            out.transportKind = FailureLayers.transportName(failure);
+            String ph = out.sent ? "read_response_body" : "request_preparation";
+            String exReason = out.sent ? classifyExceptionReason(failure, ph) : "conversion_validation_failed";
+            recordRowFailureMeta(U_ROW.get(), ph, out.transportKind, exReason);
             if(!out.sent) {
                 out.ok=false; out.localRejection=true; out.stopFallback=true; out.status=400;
                 out.body="WorkBuddy native request invalid"; out.response=errorResponse(400,out.body);
@@ -13621,8 +15568,10 @@ public class GatewayServer extends NanoHTTPD {
             result.connection=connection;
             if(request!=null) request.check();
             result.ticket.markSent(); result.attempt.sent=true; result.sends++;
-            UsageLedger.Row row=U_ROW.get(); if(row!=null) row.outboundAt=System.currentTimeMillis();
-            RequestDiagnostics.handoff(U_ROW.get());
+            UsageLedger.Row row=U_ROW.get();
+            if(row!=null) row.outboundAt=System.currentTimeMillis();
+            recordCallDispatched(row, target.upstreamModel, 1);
+            RequestDiagnostics.handoff(row);
         } catch(IOException | RuntimeException failure) {
             releaseNativeSend(result,request);
             throw failure;
@@ -13657,11 +15606,26 @@ public class GatewayServer extends NanoHTTPD {
             if(len==0)return 0;
             if(pendingAt>=pending.length) {
                 if(done)return -1;
-                String line=reader.readLine();
-                if(line==null) { done=true; if(request!=null && request.affinitySemantic!=null)request.affinitySemantic.set(true); return -1; }
+                String line;
+                try { line=reader.readLine(); }
+                catch(IOException ioe) { recordStreamThrowable(row, ioe, false); throw ioe; }
+                if(line==null) {
+                    done=true;
+                    if(request!=null && request.affinitySemantic!=null)request.affinitySemantic.set(true);
+                    if(row!=null && row.sseTerminal==null) recordRowSseTerminal(row, "message_stop".equals(row.lastSseEvent));
+                    return -1;
+                }
                 pending=(line+"\n").getBytes(java.nio.charset.StandardCharsets.UTF_8); pendingAt=0;
-                if(line.startsWith("data:")) {
+                if(line.startsWith("event:")) {
+                    recordRowSseEvent(row, line.substring(6).trim());
+                } else if(line.startsWith("data:")) {
                     try { JSONObject event=new JSONObject(line.substring(5).trim());
+                        String et = event.optString("type", "");
+                        if (!et.isEmpty()) {
+                            recordRowSseEvent(row, et);
+                            if ("message_stop".equals(et)) recordRowSseTerminal(row, true);
+                            else if ("error".equals(et)) { recordRowSseTerminal(row, false); recordRowFailureReason(row, "upstream_explicit_error"); }
+                        }
                         JSONObject message=event.optJSONObject("message");if(message!=null)absorbUsage(row,message.optJSONObject("usage"));
                         absorbUsage(row,event.optJSONObject("usage"));
                     } catch(Exception ignored) { }
@@ -13752,6 +15716,7 @@ public class GatewayServer extends NanoHTTPD {
         Attempt out = new Attempt();
         out.providerId = target.providerId;
         out.modelRef = target.providerId + "/" + target.upstreamModel;
+        attachRowSecrets(U_ROW.get(), target, null);
         out.localRejection = true;
         out.zcodePlanDenied = true;
         out.safeZcodeRejection = true;
@@ -13775,6 +15740,7 @@ public class GatewayServer extends NanoHTTPD {
         String aggFinish = "";
         JSONObject aggUsage = new JSONObject();
         String line;
+        int malformedFrames = 0;
         while ((line = br.readLine()) != null) {
             if (line.startsWith("data:")) {
                 String data=line.substring(5).trim();
@@ -13801,7 +15767,7 @@ public class GatewayServer extends NanoHTTPD {
                             JSONArray tcs = delta.optJSONArray("tool_calls");
                             for (int ti = 0; tcs != null && ti < tcs.length(); ti++) {
                                 JSONObject tc = tcs.optJSONObject(ti);
-                                if (tc == null) continue;
+                                if (tc == null) { malformedFrames++; continue; }
                                 int idx = tc.optInt("index", ti);
                                 JSONObject acc = toolAcc.get(Integer.valueOf(idx));
                                 if (acc == null) {
@@ -13828,16 +15794,22 @@ public class GatewayServer extends NanoHTTPD {
                             }
                         }
                     }
-                } catch (Exception ignored) {}
+                } catch (Exception badFrame) { malformedFrames++; }
             }
         }
         br.close();
 
+        if (malformedFrames > 0) return failedProtocolAttempt(out);
         if (!java.util.Arrays.asList("stop", "length", "tool_calls", "function_call", "content_filter").contains(aggFinish))
             return failedProtocolAttempt(out);
         boolean missingTool = "tool_calls".equals(aggFinish) && toolAcc.isEmpty();
+        java.util.Set<String> seenToolIds = new java.util.HashSet<>();
         for (JSONObject tool : toolAcc.values()) {
-            if (ChatToolCompletion.string(tool.optJSONObject("function"), "name").trim().isEmpty()) missingTool = true;
+            String tid = ChatToolCompletion.string(tool, "id").trim();
+            if (tid.isEmpty() || !seenToolIds.add(tid)
+                    || ChatToolCompletion.string(tool.optJSONObject("function"), "name").trim().isEmpty()) {
+                missingTool = true;
+            }
         }
         if (missingTool) {
             failedProtocolAttempt(out);
@@ -13957,6 +15929,7 @@ public class GatewayServer extends NanoHTTPD {
         Attempt out = new Attempt();
         out.providerId = target.providerId;
         out.modelRef = target.providerId + "/" + target.upstreamModel;
+        attachRowSecrets(U_ROW.get(), target, null);
         JSONObject currentProvider = getProviderById(target.providerId);
         if (currentProvider == null || !currentProvider.optBoolean("enabled", true)) {
             RecentUsageScheduler.Lease lease = ATTEMPT_LEASE.get(); if (lease != null) lease.cancel();
@@ -14119,12 +16092,15 @@ public class GatewayServer extends NanoHTTPD {
                         ContextGuard.Result nativeOutputGuard=codexNativeOutputGuard(candidate,guardCfg);
                         CodexRequestPolicy.prepareFinalOutbound(candidate,codexOutputConstraints(nativeOutputGuard));
                     } catch(CodexRequestPolicy.InvalidOutputLimitException invalid) {
+                        recordRowFailureMeta(U_ROW.get(), "request_preparation", "local_rejection", "conversion_validation_failed");
                         out.localRejection=true; out.stopFallback=true; out.status=400;
                         out.body=invalid.getMessage(); out.response=errorResponse(400,out.body); return out;
                     } catch(CodexRequestPolicy.UnpreservableOutputLimitException unpreservable) {
+                        recordRowFailureMeta(U_ROW.get(), "request_preparation", "local_rejection", "conversion_validation_failed");
                         out.localRejection=true; out.stopFallback=true; out.status=400;
                         out.body=unpreservable.getMessage(); out.response=errorResponse(400,out.body); return out;
                     } catch(IllegalArgumentException invalid) {
+                        recordRowFailureMeta(U_ROW.get(), "request_preparation", "local_rejection", "conversion_validation_failed");
                         out.localRejection=true; out.stopFallback=true; out.status=400;
                         out.body=invalid.getMessage()==null?"Invalid Codex request":invalid.getMessage();
                         out.response=errorResponse(400,out.body); return out;
@@ -14135,9 +16111,13 @@ public class GatewayServer extends NanoHTTPD {
                 if (candidate == null) {
                     warnOnResponsesProjection(responseOriginal);
                     String unsupported=ResponsesBridge.nativeOnlyReason(responseOriginal);
-                    if (unsupported!=null) { out.status=400; out.body="Responses cannot be converted for selected route: "+unsupported; out.response=errorResponse(400,out.body); return out; }
+                    if (unsupported!=null) {
+                        recordRowFailureMeta(U_ROW.get(), "request_preparation", "local_rejection", "conversion_validation_failed");
+                        out.status=400; out.body="Responses cannot be converted for selected route: "+unsupported; out.response=errorResponse(400,out.body); return out;
+                    }
                     if ("responses".equalsIgnoreCase(target.protocol) && !"codex".equals(target.providerId)) {
                         if(Middleware.wordGuardEnabled(configJson.optJSONObject("middleware")) || Middleware.thinkTagsEnabled(configJson.optJSONObject("middleware"))) {
+                            recordRowFailureMeta(U_ROW.get(), "request_preparation", "local_rejection", "conversion_validation_failed");
                             out.status=400; out.body="Responses route cannot safely apply configured response middleware"; out.response=errorResponse(400,out.body); return out;
                         }
                         JSONObject converted=ResponsesBridge.chatToResponses(payload,target.upstreamModel);
@@ -14149,6 +16129,7 @@ public class GatewayServer extends NanoHTTPD {
                         if(converted.optInt("max_output_tokens",0)>0) checkedInput.put("max_tokens",converted.getInt("max_output_tokens"));
                         ContextGuard.Result checked=ContextGuard.fit(checkedInput,guardCfg);
                         if(checked.error!=null || checked.budgetExceeded || checked.changed || !jsonEquivalent(checkedInput,checked.payload)) {
+                            recordRowFailureMeta(U_ROW.get(), "request_preparation", "local_rejection", "conversion_validation_failed");
                             out.status=400; out.body="Converted Responses payload exceeds guard"; out.response=errorResponse(400,out.body); return out;
                         }
                         Attempt nativeAttempt=forwardNativeResponses(target,converted,clientWantsStream,maskSession,guardResult,guardCfg);
@@ -14163,12 +16144,16 @@ public class GatewayServer extends NanoHTTPD {
                     JSONObject converted=ResponsesBridge.chatToResponses(payload,target.upstreamModel);
                     converted.put("stream",clientWantsStream);
                     if(!responsesGuardAccepted(converted,guardCfg)) {
+                        recordRowFailureMeta(U_ROW.get(), "request_preparation", "local_rejection", "conversion_validation_failed");
                         out.status=400; out.body="Converted Responses payload exceeds guard"; out.response=errorResponse(400,out.body); return out;
                     }
                     Attempt translated=forwardTranslatedResponses(target,converted,clientWantsStream,requestedModel,maskSession,guardResult,guardCfg);
                     if(translated.ok && clientWantsStream) handedOff=true;
                     return adopt(out,translated);
-                } catch(IllegalArgumentException e) { out.status=400;out.body="Cannot convert Chat to Responses: "+e.getMessage();out.response=errorResponse(400,out.body);return out; }
+                } catch(IllegalArgumentException e) {
+                    recordRowFailureMeta(U_ROW.get(), "request_preparation", "local_rejection", "conversion_validation_failed");
+                    out.status=400;out.body="Cannot convert Chat to Responses: "+e.getMessage();out.response=errorResponse(400,out.body);return out;
+                }
             }
             if ("trae-cn".equals(target.providerId)) {
                 Attempt result=forwardTrae(target,payload,clientWantsStream,requestedModel,maskSession,guardResult);
@@ -14251,11 +16236,17 @@ public class GatewayServer extends NanoHTTPD {
                     payload=WorkBuddyRequestPolicy.transform(payload, true, harnessReport);
                     if(harnessReport!=null) RequestDiagnostics.workbuddyHarness(U_ROW.get(),harnessReport.messages,harnessReport.descriptions);
                 }
-                catch(Exception invalid) {out.localRejection=true;out.stopFallback=true;out.status=400;out.body="WorkBuddy request parameters unsupported";out.response=errorResponse(400,out.body);return out;}
+                catch(Exception invalid) {
+                    recordRowFailureMeta(U_ROW.get(), "request_preparation", "local_rejection", "conversion_validation_failed");
+                    out.localRejection=true;out.stopFallback=true;out.status=400;out.body="WorkBuddy request parameters unsupported";out.response=errorResponse(400,out.body);return out;
+                }
             }
             if ("loomy".equals(target.providerId)) {
                 try { payload = LoomyImagePolicy.prepare(payload, target.upstreamModel); }
-                catch (Exception invalidImagePolicy) { out.status=400; out.body="Loomy image request invalid"; out.response=errorResponse(400,out.body); return out; }
+                catch (Exception invalidImagePolicy) {
+                    recordRowFailureMeta(U_ROW.get(), "request_preparation", "local_rejection", "conversion_validation_failed");
+                    out.status=400; out.body="Loomy image request invalid"; out.response=errorResponse(400,out.body); return out;
+                }
                 foldLoomyReasoning(payload);
             }
             String targetUrl = target.baseUrl.replaceAll("/+$", "")
@@ -14297,6 +16288,7 @@ public class GatewayServer extends NanoHTTPD {
             InputStream is;
             String preReadError = null;
             RaccoonHttpResponse raccoonError=null;
+            boolean workBuddySignInRenewed = false;
             while (true) {
             workBuddyPhase = Phase.OPEN_CONNECTION;
             workBuddyHttpStatus = 0;
@@ -14305,7 +16297,7 @@ public class GatewayServer extends NanoHTTPD {
             } else {
                 conn = openInferenceConnection(targetUrl, true);
             }
-            if (target.commercialCandidates != null || isWorkBuddy || "loomy".equals(target.providerId) || "raccoon".equals(target.providerId)) conn.setInstanceFollowRedirects(false);
+            if (conn != null) conn.setInstanceFollowRedirects(false);
             conn.setRequestMethod("POST");
             conn.setDoOutput(true);
             conn.setConnectTimeout(guardCfg.connectTimeoutSeconds * 1000);
@@ -14415,6 +16407,7 @@ public class GatewayServer extends NanoHTTPD {
             workBuddyPhase = Phase.OPEN_REQUEST_STREAM;
             OutputStream os = conn.getOutputStream();
             workBuddyPhase = Phase.WRITE_REQUEST_BODY;
+            recordCallDispatched(U_ROW.get(), target.upstreamModel, 1);
             os.write(requestBytes);
             os.flush();
             os.close();
@@ -14423,8 +16416,10 @@ public class GatewayServer extends NanoHTTPD {
             statusCode = conn.getResponseCode();
             workBuddyHttpStatus = statusCode;
             if (statusCode <= 0) WorkBuddyFailure.record(evidenceRow, workBuddyPhase, Cause.NO_HTTP_STATUS);
+            else recordCallReply(U_ROW.get(), statusCode, conn.getHeaderField("Retry-After"), null);
             if(customRedirect(out,target,statusCode)) return out;
-            okStatus = statusCode >= 200 && statusCode < (target.commercialCandidates != null || "raccoon".equals(target.providerId) ? 300 : 400);
+            boolean strictNoRedirect = target.commercialCandidates != null || "raccoon".equals(target.providerId) || "cline".equals(target.providerId);
+            okStatus = statusCode >= 200 && statusCode < (strictNoRedirect ? 300 : 400);
             workBuddyPhase = Phase.OPEN_RESPONSE_BODY;
             is = okStatus ? conn.getInputStream() : null;
             workBuddyPhase = Phase.READ_RESPONSE_BODY;
@@ -14454,6 +16449,33 @@ public class GatewayServer extends NanoHTTPD {
                 break;
             }
             if (okStatus) { compat.response(statusCode, null); break; }
+            if (statusCode == 401 && !workBuddySignInRenewed
+                    && target.account != null && "oauth".equals(target.account.optString("type"))
+                    && !target.account.optString("refresh", "").isEmpty()
+                    && (request == null || request.mayContinueAfterRejection())) {
+                String wbChallenge = conn.getHeaderField("WWW-Authenticate");
+                boolean wbInvalidToken = wbChallenge != null
+                        && wbChallenge.toLowerCase(java.util.Locale.ROOT).contains("invalid_token");
+                if (wbInvalidToken) {
+                    try {
+                        // Reuses already-updated stored access first via AccountTokenCoordinator;
+                        // only consumes refresh if stored access still matches the rejected token.
+                        JSONObject refreshed = ensureStoredToken(target.providerId, target.account, target.apiKey);
+                        String next = storedAccess(refreshed);
+                        if (refreshed != null && !next.isEmpty() && !next.equals(target.apiKey)) {
+                            workBuddySignInRenewed = true;
+                            target.account = refreshed;
+                            target.apiKey = next;
+                            attachRowSecrets(U_ROW.get(), target, null);
+                            if (request != null) { request.check(); request.detach(conn); }
+                            conn.disconnect(); conn = null;
+                            if (outboundTicket != null) { outboundTicket.close(); outboundTicket = null; }
+                            preReadError = null;
+                            continue;
+                        }
+                    } catch (Exception ignored) { }
+                }
+            }
             WorkBuddyError error = readWorkBuddyError(conn, target, out);
             preReadError = error.safe;
             // Only a complete, structured capacity rejection proves no inference ran.
@@ -14512,6 +16534,17 @@ public class GatewayServer extends NanoHTTPD {
                     out.stopFallback = !quotaExhausted(statusCode, errBody);
                 if("zcode".equals(target.providerId)) {ZCodeRefusalPolicy.Kind kind=zcodeRefusals().observe(targetUrl,zcodeAccountScope(target),zcodeNetworkScope(),statusCode,errBody);out.safeZcodeRejection=kind==ZCodeRefusalPolicy.Kind.ACCOUNT||kind==ZCodeRefusalPolicy.Kind.EDGE;}
                 if ("cline".equals(target.providerId)) {
+                    if (statusCode >= 300 && statusCode < 400) {
+                        out.status = 502;
+                        out.redirected = true;
+                        out.stopFallback = true;
+                        errBody = "Cline 上游返回重定向（HTTP " + statusCode + "），未跟随或转发凭据；请检查网络或直连地址";
+                        out.body = errBody;
+                        recordCallReply(U_ROW.get(), statusCode, out.retryAfter, errBody);
+                        recordRowFailureMeta(U_ROW.get(), "await_response_headers", "http_rejection", "upstream_explicit_error");
+                        out.response = errorResponse(502, errBody);
+                        return out;
+                    }
                     JSONObject classified=ClineFailurePolicy.classify(statusCode,errBody);
                     statusCode=classified.optInt("status",statusCode);out.status=statusCode;
                     JSONObject safe=new JSONObject().put("error",classified.getJSONObject("error"));errBody=safe.toString();
@@ -14540,6 +16573,8 @@ public class GatewayServer extends NanoHTTPD {
                 }
                 out.ok = false;
                 out.body = errBody;
+                recordCallReply(U_ROW.get(), statusCode, out.retryAfter, errBody);
+                recordRowFailureMeta(U_ROW.get(), "await_response_headers", statusCode <= 0 ? "no_http_status" : "http_rejection");
                 if(isWorkBuddy && request!=null && request.accountConversation && confirmedAccountRefusal(statusCode,errBody))out.stopFallback=false;
                 Status st = Status.lookup(statusCode);
                 Response.IStatus responseStatus = st;
@@ -14558,6 +16593,8 @@ public class GatewayServer extends NanoHTTPD {
                 is.close();
                 out.retryAfter = conn.getHeaderField("Retry-After");
                 setEnvelopeError(out, target, envelope, maskSession, guardResult);
+                recordCallReply(U_ROW.get(), out.status, out.retryAfter, out.body);
+                recordRowFailureMeta(U_ROW.get(), "read_response_body", "http_rejection");
                 if("zcode".equals(target.providerId)) {ZCodeRefusalPolicy.Kind kind=zcodeRefusals().observe(targetUrl,zcodeAccountScope(target),zcodeNetworkScope(),out.status,envelope.errorBody);out.safeZcodeRejection=kind==ZCodeRefusalPolicy.Kind.ACCOUNT||kind==ZCodeRefusalPolicy.Kind.EDGE;}
                 return out;
             }
@@ -14602,147 +16639,19 @@ public class GatewayServer extends NanoHTTPD {
                 return out;
             }
 
-            String rawResponse = readLimitedText(is, BoundedResponse.MAX_BYTES);
-            // A 2xx body must still be one complete JSON object. A broken socket
-            // can otherwise produce HTTP 200 with a syntactically truncated payload.
-            JSONObject parsedResponse;
-            try {
-                com.gaeul.allin.json.JSONTokener parser = new com.gaeul.allin.json.JSONTokener(rawResponse);
-                Object value = parser.nextValue();
-                if (!(value instanceof JSONObject) || parser.nextClean() != 0) throw new IOException("Invalid upstream JSON");
-                parsedResponse = (JSONObject) value;
-            } catch (Exception invalid) { return failedProtocolAttempt(out); }
-            out.affinitySemanticComplete=affinitySemanticComplete(rawResponse,target.protocol);
-            String unmaskedResponse;
-            if (maskSession != null && !maskSession.placeholderToReal.isEmpty()) {
-                unmaskJson(parsedResponse, maskSession);
-                unmaskedResponse = parsedResponse.toString();
-            } else {
-                unmaskedResponse = rawResponse;
-            }
-
-            // 用量：非流式响应里一次带走整个 usage
-            try {
-                UsageLedger.Row ur = U_ROW.get();
-                if (ur != null) {
-                    JSONObject uj = new JSONObject(unmaskedResponse);
-                    absorbUsage(ur, uj.optJSONObject("usage"));
-                    JSONObject data=uj.optJSONObject("data");
-                    if(data!=null) absorbUsage(ur,data.optJSONObject("usage"));
-                }
-            } catch (Throwable ignored) {
-            }
-
-            if ("cline".equals(target.providerId)) {
-                try {
-                    JSONObject cWrap = new JSONObject(unmaskedResponse);
-                    if (cWrap.has("data") && cWrap.optJSONObject("data") != null) {
-                        JSONObject cData = cWrap.getJSONObject("data");
-                        if (cData.has("choices")) {
-                            JSONObject wrappedUsage=cWrap.optJSONObject("usage");
-                            if(wrappedUsage==null) wrappedUsage=cWrap.optJSONObject("data").optJSONObject("usage");
-                            if(wrappedUsage!=null && !cData.has("usage")) cData.put("usage",wrappedUsage);
-                            unmaskedResponse = cData.toString();
-                        }
-                    }
-                } catch (Throwable ignored) {
-                }
-            }
-
-            // ===== 响应侧中间件：think-tags 与 word-guard =====
-            // 只在 OpenAI 形状（有 choices）上动手；拿不到结构就原样放行，
-            // 绝不因为中间件把正常回复弄坏。
-            try {
-                JSONObject mwOut = configJson.optJSONObject("middleware");
-                if (mwOut != null && (Middleware.thinkTagsEnabled(mwOut) || Middleware.wordGuardEnabled(mwOut))) {
-                    JSONObject oj = new JSONObject(unmaskedResponse);
-                    JSONArray chs = oj.optJSONArray("choices");
-                    if (chs != null) {
-                        boolean touched = false;
-                        for (int ci = 0; ci < chs.length(); ci++) {
-                            JSONObject ch0 = chs.optJSONObject(ci);
-                            if (ch0 == null) continue;
-                            JSONObject msg = ch0.optJSONObject("message");
-                            if (msg == null) continue;
-                            String txt = msg.optString("content", "");
-                            String rsn = msg.optString("reasoning_content", "");
-                            String[] fixed = Middleware.applyThinkTags(txt, rsn, mwOut);
-                            if (!fixed[0].equals(txt) || !fixed[1].equals(rsn)) {
-                                if (fixed[0].isEmpty()) msg.put("content", "");
-                                else msg.put("content", fixed[0]);
-                                if (fixed[1].isEmpty()) msg.remove("reasoning_content");
-                                else msg.put("reasoning_content", fixed[1]);
-                                touched = true;
-                            }
-                            if (Middleware.wordGuardEnabled(mwOut)) {
-                                Object cur = msg.opt("content");
-                                if (cur instanceof String) {
-                                    String maskedTxt = Middleware.maskWords((String) cur, mwOut);
-                                    if (!maskedTxt.equals(cur)) { msg.put("content", maskedTxt); touched = true; }
-                                }
-                            }
-                        }
-                        if (touched) unmaskedResponse = oj.toString();
-                    }
-                    // model-map 的语义：回复报客户端请求的名字
-                    String aliasOut = CLIENT_MODEL.get();
-                    if (aliasOut != null && !aliasOut.isEmpty()) {
-                        JSONObject oj2 = new JSONObject(unmaskedResponse);
-                        if (oj2.has("model")) {
-                            oj2.put("model", aliasOut);
-                            unmaskedResponse = oj2.toString();
-                        }
-                    }
-                }
-            } catch (Throwable mwOutErr) {
-                logException("response middleware",mwOutErr);
-            }
-
-            try {
-                if (wantsAnthropicOut()) {
-                    JSONObject anth = AnthropicBridge.responseToAnthropic(
-                            new JSONObject(unmaskedResponse), requestedModel);
-                    JSONArray ac = anth.optJSONArray("content");
-                    StringBuilder tb = new StringBuilder();
-                    StringBuilder rb = new StringBuilder();
-                    for (int i = 0; ac != null && i < ac.length(); i++) {
-                        JSONObject blk = ac.optJSONObject(i);
-                        if (blk == null) continue;
-                        if ("text".equals(blk.optString("type"))) tb.append(blk.optString("text", ""));
-                        else if ("thinking".equals(blk.optString("type"))) rb.append(blk.optString("thinking", ""));
-                    }
-                    out.textOut = tb.toString();
-                    out.reasoningOut = rb.toString();
-                } else {
-                    JSONObject oj = new JSONObject(unmaskedResponse);
-                    out.textOut = extractReplyText(oj);
-                }
-            } catch (Exception ignored) {}
-            // Raccoon reports back the model the client asked for (its plugin rewrites
-            // only a body that already carries "model"). The body is rebuilt into a new
-            // fixed-length response below, so the stale Content-Length never ships.
-            if("raccoon".equals(target.providerId))
-                unmaskedResponse = RaccoonResponsePolicy.rewriteJson(unmaskedResponse, raccoonVisibleModel(requestedModel));
-            unmaskedResponse = toAnthropicBodyIfNeeded(unmaskedResponse, requestedModel);
-
-            Status status = Status.lookup(statusCode);
-            if (status == null) status = Status.OK;
-            Response resp = newFixedLengthResponse(status, "application/json; charset=UTF-8", unmaskedResponse);
-            // 这次请求实际由哪个供应商答的：路由组/rotate 下排查问题全靠它
-            resp.addHeader("X-Magpie-Served-By", out.modelRef == null ? target.providerId : out.modelRef);
-            addCorsHeaders(resp);
-            applyGuardHeaders(resp, guardResult);
-            out.response = resp;
-            return out;
+            return buildNonStreamingJsonAttempt(is, target, out, statusCode, requestedModel, maskSession, guardResult);
 
         } catch (ResponseBodyLimitException oversized) {
             WorkBuddyFailure.record(evidenceRow, workBuddyPhase, Cause.LOCAL_REJECTION);
+            recordRowFailureMeta(evidenceRow, workBuddyPhase.name().toLowerCase(java.util.Locale.ROOT), "local_rejection", "conversion_validation_failed");
             return oversizedInferenceResponse(out);
         } catch (ProtocolResponseException invalid) {
             WorkBuddyFailure.record(evidenceRow, workBuddyPhase, Cause.PROTOCOL);
+            recordRowFailureMeta(evidenceRow, workBuddyPhase.name().toLowerCase(java.util.Locale.ROOT), "protocol", "conversion_validation_failed");
             return failedProtocolAttempt(out);
         } catch (OutboundRejected rejected) {
             WorkBuddyFailure.record(evidenceRow, Phase.OUTBOUND_ADMISSION, Cause.LOCAL_REJECTION);
+            recordRowFailureMeta(evidenceRow, "outbound_admission", "local_rejection", "admission_rejected");
             out.ok=false; out.localRejection=!out.sent; RequestDiagnostics.admissionRejected(U_ROW.get()); out.status=rejected.status; out.body=rejected.getMessage();
             out.response=errorResponse(out.status,out.body);
             if(rejected.retryMillis>0) { out.retryAfter=Long.toString((rejected.retryMillis+999)/1000); out.response.addHeader("Retry-After",out.retryAfter); }
@@ -14751,13 +16660,17 @@ public class GatewayServer extends NanoHTTPD {
             throw e;
         } catch (IllegalArgumentException invalidRequest) {
             WorkBuddyFailure.record(evidenceRow, workBuddyPhase, Cause.LOCAL_REJECTION);
+            recordRowFailureMeta(evidenceRow, workBuddyPhase.name().toLowerCase(java.util.Locale.ROOT), "local_rejection", "conversion_validation_failed");
             out.ok=false; out.localRejection=true; out.stopFallback=true; out.status=400;
             out.body=invalidRequest.getMessage()==null?"Invalid request":invalidRequest.getMessage();
             out.response=errorResponse(400,out.body);
             return out;
         } catch (Exception e) {
-            WorkBuddyFailure.record(evidenceRow, workBuddyPhase, request != null && request.isCancelled()
-                    ? Cause.CANCELLED : WorkBuddyFailure.classify(e));
+            Cause wbCause = request != null && request.isCancelled() ? Cause.CANCELLED : WorkBuddyFailure.classify(e);
+            WorkBuddyFailure.record(evidenceRow, workBuddyPhase, wbCause);
+            String phName = workBuddyPhase.name().toLowerCase(java.util.Locale.ROOT);
+            String wbReason = request != null && request.isCancelled() ? "downstream_cancelled" : classifyExceptionReason(e, phName);
+            recordRowFailureMeta(evidenceRow, phName, wbCause.name().toLowerCase(java.util.Locale.ROOT), wbReason);
             if(request!=null && request.isCancelled()) {
                 out.ok=false; out.localRejection=!out.sent; out.status=503; out.body="Request cancelled or deadline exhausted";
                 out.response=errorResponse(503,out.body); return out;
@@ -14766,6 +16679,7 @@ public class GatewayServer extends NanoHTTPD {
             out.ok = false;
             out.status = 0;
             out.transportKind = FailureLayers.transportName(e);
+            recordRowFailureMeta(evidenceRow, phName, out.transportKind, wbReason);
             if (target.commercialCandidates != null || "raccoon".equals(target.providerId)) {
                 out.body = "Upstream connection failed; execution outcome unknown";
                 out.response = errorResponse(502, out.body);
@@ -14777,8 +16691,10 @@ public class GatewayServer extends NanoHTTPD {
             }
             return out;
         } finally {
-            if (!out.ok && workBuddyHttpStatus >= 400)
+            if (!out.ok && workBuddyHttpStatus >= 400) {
                 WorkBuddyFailure.record(evidenceRow, Phase.AWAIT_RESPONSE_HEADERS, Cause.HTTP_REJECTION);
+                recordRowFailureMeta(evidenceRow, "await_response_headers", "http_rejection");
+            }
             if("raccoon".equals(target.providerId) && out.response!=null) {
                 boolean okResponse=out.status>=200 && out.status<300;
                 out.response.addHeader(RaccoonResponsePolicy.SIGN_IN_HEADER,
@@ -14802,6 +16718,9 @@ public class GatewayServer extends NanoHTTPD {
             // 流式由 streamForwardResponse 的 EOF 记账，这里只管非流式与失败
             if (handedOff) {
                 UsageLedger.Row streamRow = U_ROW.get();
+                if (streamRow != null && "responses".equals(CLIENT_OUTPUT_PROTOCOL.get())) {
+                    RESPONSES_CHAT_ROW.set(streamRow);
+                }
                 RecentUsageScheduler.Lease lease = ATTEMPT_LEASE.get();
                 if (lease != null) {
                     if (out.response == null || out.response.getData() == null || streamRow == null) lease.cancel();
@@ -14809,24 +16728,202 @@ public class GatewayServer extends NanoHTTPD {
                 }
                 U_ROW.remove(); U_START.remove(); U_FIRST.remove(); U_LAST.remove(); U_DONE.remove();
             } else {
-                UsageLedger.Row attemptRow = U_ROW.get();
-                if (attemptRow != null && attemptRow.recentUsageLease == null) attemptRow.recentUsageLease = ATTEMPT_LEASE.get();
-                int st = out.status;
-                String er = out.ok ? "" : (out.body == null ? "" : out.body);
-                // 有些分支失败时没设 status，会记成 0 而看不出是失败；这里兜底
-                if (!out.ok && st < 400) {
-                    st = 502;
-                    if (er.isEmpty()) er = "请求失败：上游无响应或路由无可用候选";
-                }
-                RecentUsageScheduler.Lease finishedLease = ATTEMPT_LEASE.get();
-                boolean bufferedStream = clientWantsStream && out.ok && isEventStream(out.response)
-                        && attemptRow != null && out.response.getData() != null;
-                if (finishedLease != null && !bufferedStream) finishedLease.deliveryComplete(true);
-                commitUsage(st, er);
-                if (finishedLease != null && bufferedStream)
-                    out.response.setData(new RecentUsageStream(out.response.getData(), attemptRow, finishedLease));
+                finalizeNonStreamingAttempt(out, clientWantsStream, request);
             }
         }
+    }
+
+    private Attempt buildNonStreamingJsonAttempt(InputStream is, RouteTarget target, Attempt out, int statusCode,
+                                                 String requestedModel, PrivacyMasker.Session maskSession,
+                                                 ContextGuard.Result guardResult) throws Exception {
+        String rawResponse = readLimitedText(is, BoundedResponse.MAX_BYTES);
+        // A 2xx body must still be one complete JSON object. A broken socket
+        // can otherwise produce HTTP 200 with a syntactically truncated payload.
+        JSONObject parsedResponse;
+        try {
+            com.gaeul.allin.json.JSONTokener parser = new com.gaeul.allin.json.JSONTokener(rawResponse);
+            Object value = parser.nextValue();
+            if (!(value instanceof JSONObject) || parser.nextClean() != 0) throw new IOException("Invalid upstream JSON");
+            parsedResponse = (JSONObject) value;
+        } catch (Exception invalid) { return failedProtocolAttempt(out); }
+        out.affinitySemanticComplete=affinitySemanticComplete(rawResponse,target.protocol);
+        String unmaskedResponse;
+        if (maskSession != null && !maskSession.placeholderToReal.isEmpty()) {
+            unmaskJson(parsedResponse, maskSession);
+            unmaskedResponse = parsedResponse.toString();
+        } else {
+            unmaskedResponse = rawResponse;
+        }
+
+        // 用量：非流式响应里一次带走整个 usage
+        try {
+            UsageLedger.Row ur = U_ROW.get();
+            if (ur != null) {
+                JSONObject uj = new JSONObject(unmaskedResponse);
+                absorbUsage(ur, uj.optJSONObject("usage"));
+                JSONObject data=uj.optJSONObject("data");
+                if(data!=null) absorbUsage(ur,data.optJSONObject("usage"));
+            }
+        } catch (Throwable ignored) {
+        }
+
+        if ("cline".equals(target.providerId)) {
+            try {
+                JSONObject cWrap = new JSONObject(unmaskedResponse);
+                if (cWrap.has("data") && cWrap.optJSONObject("data") != null) {
+                    JSONObject cData = cWrap.getJSONObject("data");
+                    if (cData.has("choices")) {
+                        JSONObject wrappedUsage=cWrap.optJSONObject("usage");
+                        if(wrappedUsage==null) wrappedUsage=cWrap.optJSONObject("data").optJSONObject("usage");
+                        if(wrappedUsage!=null && !cData.has("usage")) cData.put("usage",wrappedUsage);
+                        unmaskedResponse = cData.toString();
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+
+        // ===== 响应侧中间件：think-tags 与 word-guard =====
+        // 只在 OpenAI 形状（有 choices）上动手；拿不到结构就原样放行，
+        // 绝不因为中间件把正常回复弄坏。
+        try {
+            JSONObject mwOut = configJson.optJSONObject("middleware");
+            if (mwOut != null && (Middleware.thinkTagsEnabled(mwOut) || Middleware.wordGuardEnabled(mwOut))) {
+                JSONObject oj = new JSONObject(unmaskedResponse);
+                JSONArray chs = oj.optJSONArray("choices");
+                if (chs != null) {
+                    boolean touched = false;
+                    for (int ci = 0; ci < chs.length(); ci++) {
+                        JSONObject ch0 = chs.optJSONObject(ci);
+                        if (ch0 == null) continue;
+                        JSONObject msg = ch0.optJSONObject("message");
+                        if (msg == null) continue;
+                        String txt = msg.optString("content", "");
+                        String rsn = msg.optString("reasoning_content", "");
+                        String[] fixed = Middleware.applyThinkTags(txt, rsn, mwOut);
+                        if (!fixed[0].equals(txt) || !fixed[1].equals(rsn)) {
+                            if (fixed[0].isEmpty()) msg.put("content", "");
+                            else msg.put("content", fixed[0]);
+                            if (fixed[1].isEmpty()) msg.remove("reasoning_content");
+                            else msg.put("reasoning_content", fixed[1]);
+                            touched = true;
+                        }
+                        if (Middleware.wordGuardEnabled(mwOut)) {
+                            Object cur = msg.opt("content");
+                            if (cur instanceof String) {
+                                String maskedTxt = Middleware.maskWords((String) cur, mwOut);
+                                if (!maskedTxt.equals(cur)) { msg.put("content", maskedTxt); touched = true; }
+                            }
+                        }
+                    }
+                    if (touched) unmaskedResponse = oj.toString();
+                }
+                // model-map 的语义：回复报客户端请求的名字
+                String aliasOut = CLIENT_MODEL.get();
+                if (aliasOut != null && !aliasOut.isEmpty()) {
+                    JSONObject oj2 = new JSONObject(unmaskedResponse);
+                    if (oj2.has("model")) {
+                        oj2.put("model", aliasOut);
+                        unmaskedResponse = oj2.toString();
+                    }
+                }
+            }
+        } catch (Throwable mwOutErr) {
+            logException("response middleware",mwOutErr);
+        }
+
+        try {
+            if (wantsAnthropicOut()) {
+                JSONObject anth = AnthropicBridge.responseToAnthropic(
+                        new JSONObject(unmaskedResponse), requestedModel);
+                JSONArray ac = anth.optJSONArray("content");
+                StringBuilder tb = new StringBuilder();
+                StringBuilder rb = new StringBuilder();
+                for (int i = 0; ac != null && i < ac.length(); i++) {
+                    JSONObject blk = ac.optJSONObject(i);
+                    if (blk == null) continue;
+                    if ("text".equals(blk.optString("type"))) tb.append(blk.optString("text", ""));
+                    else if ("thinking".equals(blk.optString("type"))) rb.append(blk.optString("thinking", ""));
+                }
+                out.textOut = tb.toString();
+                out.reasoningOut = rb.toString();
+            } else {
+                JSONObject oj = new JSONObject(unmaskedResponse);
+                out.textOut = extractReplyText(oj);
+            }
+        } catch (Exception ignored) {}
+        // Raccoon reports back the model the client asked for (its plugin rewrites
+        // only a body that already carries "model"). The body is rebuilt into a new
+        // fixed-length response below, so the stale Content-Length never ships.
+        if("raccoon".equals(target.providerId))
+            unmaskedResponse = RaccoonResponsePolicy.rewriteJson(unmaskedResponse, raccoonVisibleModel(requestedModel));
+        unmaskedResponse = toAnthropicBodyIfNeeded(unmaskedResponse, requestedModel);
+
+        Status status = Status.lookup(statusCode);
+        if (status == null) status = Status.OK;
+        Response resp = newFixedLengthResponse(status, "application/json; charset=UTF-8", unmaskedResponse);
+        // 这次请求实际由哪个供应商答的：路由组/rotate 下排查问题全靠它
+        resp.addHeader("X-Magpie-Served-By", out.modelRef == null ? target.providerId : out.modelRef);
+        addCorsHeaders(resp);
+        applyGuardHeaders(resp, guardResult);
+        out.response = resp;
+        return out;
+    }
+
+    private void finalizeNonStreamingAttempt(Attempt out, boolean clientWantsStream, RequestContext request) {
+        UsageLedger.Row attemptRow = U_ROW.get();
+        if (attemptRow != null && attemptRow.recentUsageLease == null) attemptRow.recentUsageLease = ATTEMPT_LEASE.get();
+        if (attemptRow != null && "responses".equals(CLIENT_OUTPUT_PROTOCOL.get())) {
+            RESPONSES_CHAT_ROW.set(attemptRow);
+        }
+        int st = out.status;
+        String er = out.ok ? "" : (out.body == null ? "" : out.body);
+        // 有些分支失败时没设 status，会记成 0 而看不出是失败；这里兜底
+        if (!out.ok && st < 400) {
+            st = 502;
+            if (er.isEmpty()) er = "请求失败：上游无响应或路由无可用候选";
+        }
+        RecentUsageScheduler.Lease finishedLease = ATTEMPT_LEASE.get();
+        boolean bufferedStream = clientWantsStream && out.ok && isEventStream(out.response)
+                && attemptRow != null && out.response.getData() != null;
+        if ("responses".equals(CLIENT_OUTPUT_PROTOCOL.get()) && !Boolean.TRUE.equals(RESP_NATIVE_RESULT.get())
+                && out.ok && st >= 200 && st < 300 && out.response != null && !bufferedStream
+                && !isEventStream(out.response) && out.response.getHeader("X-AllIn-Native-Responses") == null) {
+            try {
+                String body = drainText(out.response.getData());
+                JSONObject converted = ResponsesBridge.chatResponseToResponses(new JSONObject(body), CLIENT_MODEL.get());
+                out.response.setData(new ByteArrayInputStream(converted.toString().getBytes("UTF-8")));
+                out.response.setMimeType("application/json; charset=UTF-8");
+                out.response.setChunkedTransfer(true);
+                RESP_PROJECTED_DONE.set(Boolean.TRUE);
+                if (attemptRow != null && attemptRow.bridgeStatus.isEmpty()) attemptRow.bridgeStatus = "ok";
+            } catch (Exception projErr) {
+                st = 502;
+                er = "Invalid upstream Chat response: " + (projErr.getMessage() == null ? projErr.getClass().getSimpleName() : projErr.getMessage());
+                out.ok = false;
+                out.status = 502;
+                out.protocolFailure = true;
+                out.body = er;
+                out.response = errorResponse(502, er);
+                RESP_PROJECTED_DONE.set(Boolean.TRUE);
+                if (attemptRow != null) {
+                    recordRowFailureMeta(attemptRow, "conversion", "protocol", "conversion_validation_failed");
+                    attemptRow.bridgeStatus = "failed";
+                    attemptRow.deliveryStatus = "failed";
+                }
+                if (finishedLease != null) {
+                    finishedLease.deliveryComplete(false);
+                    finishedLease = null;
+                }
+            }
+        }
+        if (finishedLease != null && !bufferedStream) finishedLease.deliveryComplete(true);
+        if (out.ok && st < 400 && attemptRow != null && out.response != null && !bufferedStream) {
+            attachFixedLengthDeliveryTracking(out.response, attemptRow, request);
+        }
+        commitUsage(st, er);
+        if (finishedLease != null && bufferedStream)
+            out.response.setData(new RecentUsageStream(out.response.getData(), attemptRow, finishedLease));
     }
 
     private void recordAttemptFailure(RouteTarget target, Attempt out) {
@@ -14842,9 +16939,13 @@ public class GatewayServer extends NanoHTTPD {
         }
         if(!out.ok && U_ROW.get()!=null) {
             UsageLedger.Row row=U_ROW.get(); row.failureKind=out.failure.kind.name().toLowerCase(java.util.Locale.ROOT);
+            recordRowFailureMeta(row, null, out.transportKind);
             boolean structuredQoder="qoder".equals(target.protocol) && row.upstreamErrorCode!=null
                     && row.upstreamErrorCode.matches("[0-9]{1,9}");
-            if(!structuredQoder) row.upstreamErrorCode=java.util.Arrays.asList("user_model_rate_limited","rate_limit","rate_limit_error","insufficient_quota","authentication_error","context_length_exceeded","overloaded_error","invalid_request_error").contains(out.failure.code)?out.failure.code:"";
+            if(!structuredQoder) {
+                String known=java.util.Arrays.asList("user_model_rate_limited","rate_limit","rate_limit_error","insufficient_quota","authentication_error","context_length_exceeded","overloaded_error","invalid_request_error").contains(out.failure.code)?out.failure.code:"";
+                row.upstreamErrorCode=!known.isEmpty()?known:extractSafeErrorCode(out.body);
+            }
             String retry=out.retryAfter; if(retry!=null && retry.length()<=128) row.upstreamRetryAfter=Long.toString(CommercialKeyPool.retryAfterDeadline(retry,0,0));
         }
     }
@@ -14963,6 +17064,7 @@ public class GatewayServer extends NanoHTTPD {
                 public void sent() {
                     out.sent=true; admitted.markSent();
                     if(row!=null) {row.outboundAt=System.currentTimeMillis();row.ep="subscription";}
+                    recordCallDispatched(row, target.upstreamModel, 1);
                     RequestDiagnostics.handoff(row);
                 }
                 public void usage(JSONObject usage) {absorbUsage(row,usage);}
@@ -15016,6 +17118,7 @@ public class GatewayServer extends NanoHTTPD {
             // The send that opened the stream is the one still holding a ticket.
             final OutboundLimiter.Ticket opened=ticket;
             if(stream) {
+                recordCallReply(U_ROW.get(), 200, null, null);
                 Response response=wantsAnthropicOut()?streamForwardAnthropicResponse(converted,requested,mask,guard,converted.connection)
                         :streamForwardResponse(converted,mask,guard,converted.connection,out.modelRef);
                 final QoderStream.Stream held=converted;
@@ -15048,12 +17151,21 @@ public class GatewayServer extends NanoHTTPD {
             out.status=failure.status;out.body=failure.getMessage();
             if(failure.retryAfter>0) out.retryAfter=Integer.toString(failure.retryAfter);
             UsageLedger.Row row=U_ROW.get();if(row!=null && failure.code>0) row.upstreamErrorCode=Integer.toString(failure.code);
+            if (failure.status > 0) recordCallReply(row, failure.status, out.retryAfter, null);
+            String qr = failure.status >= 400 ? "upstream_explicit_error"
+                    : (classifyStreamReason(failure).isEmpty() ? "conversion_validation_failed" : classifyStreamReason(failure));
+            recordRowFailureMeta(row, "read_response_body", failure.status >= 400 ? "http_rejection" : "protocol", qr);
         } catch(OutboundRejected failure) {
             // A resend rejected at admission still follows a send that really happened.
             out.localRejection=!out.sent;out.status=failure.status;out.body="Qoder outbound admission rejected";
+            recordRowFailureMeta(U_ROW.get(), "outbound_admission", "local_rejection", "admission_rejected");
             if(failure.retryMillis>0) out.retryAfter=Long.toString((failure.retryMillis+999)/1000);
         } catch(Exception failure) {
             out.localRejection=!out.sent;out.protocolFailure=out.sent;out.status=out.sent?502:400;
+            out.transportKind = FailureLayers.transportName(failure);
+            String qph = out.sent ? "read_response_body" : "request_preparation";
+            String qrs = out.sent ? classifyExceptionReason(failure, qph) : "conversion_validation_failed";
+            recordRowFailureMeta(U_ROW.get(), qph, out.transportKind, qrs);
             out.body=out.sent?"Qoder response incomplete or execution outcome unknown; request was not replayed"
                     :"Qoder local request validation failed";
             if(!out.sent && failure instanceof IllegalArgumentException) {
@@ -15418,7 +17530,7 @@ public class GatewayServer extends NanoHTTPD {
             public void admission(long started) { RequestDiagnostics.admissionElapsed(giftRow,started); }
             public void handoff(long at) { giftRow.outboundAt=at; RequestDiagnostics.handoff(giftRow); }
             long waited;
-            public void send(int ordinal,long at) {handoff(at);RequestDiagnostics.zcodeGift(giftRow,ordinal,null,waited,"upstream");}
+            public void send(int ordinal,long at) {handoff(at);recordCallDispatched(giftRow, giftRow == null ? "" : giftRow.model, 1);RequestDiagnostics.zcodeGift(giftRow,ordinal,null,waited,"upstream");}
             public void busy(String code,int sends,long wait,String source) {waited=wait;RequestDiagnostics.zcodeGift(giftRow,sends,code,waited,source);}
         }, giftStableAccount(acc,site));
         if (st.observed) {
@@ -15432,10 +17544,14 @@ public class GatewayServer extends NanoHTTPD {
             boolean local="local_admission".equals(st.source) || "local_cooldown".equals(st.source) || "local_busy_hold".equals(st.source);
             if ("local_admission".equals(st.source)) RequestDiagnostics.admissionRejected(giftRow);
             int status=st.status >= 400 && st.status <= 599 ? st.status : st.refused && st.status>0 ? 405 : 502;
+            if (!local && st.status > 0) recordCallReply(giftRow, st.status, st.retryAfter, null);
+            recordRowFailureMeta(giftRow, local ? "outbound_admission" : "await_response_headers",
+                    st.source == null ? "transport" : st.source);
             RequestDiagnostics.outcome(giftRow,false,local,status==429?"rate":st.sent && st.status<=0?"unknown_execution":"other",!local && st.status>=400 && st.status<=599);
             finishGiftUsage(status, "ZCode gift " + (st.source==null?"transport":st.source) + " failure", true);
             return new ZCodeGiftAttempt(giftErrorResponse(st), ZCodeGiftAttempt.UPSTREAM);
         }
+        if (st.status > 0) recordCallReply(giftRow, st.status, st.retryAfter, null);
 
         if (clientWantsStream) {
             InputStream giftInput=search.restoreStream(st.is,true);
@@ -15444,8 +17560,12 @@ public class GatewayServer extends NanoHTTPD {
                 resp = nativeAnthropicResponse(giftInput, maskSession, guardResult, st.conn, thinkingCompat("zcode", "anthropic", upstream));
                 resp.addHeader("X-AllIn-Native-Anthropic", "true");
             } else {
-                InputStream converted = new AnthropicSseToOpenAI(giftInput, new ZCodeAnthropic.StreamState(requestedModel, thinkingCompat("zcode", "anthropic", upstream)), U_ROW.get());
+                UsageLedger.Row giftStreamRow = U_ROW.get();
+                InputStream converted = new AnthropicSseToOpenAI(giftInput, new ZCodeAnthropic.StreamState(requestedModel, thinkingCompat("zcode", "anthropic", upstream)), giftStreamRow);
                 resp = streamForwardResponse(converted, maskSession, guardResult, st.conn, "zcode-gift");
+                if (giftStreamRow != null && "responses".equals(CLIENT_OUTPUT_PROTOCOL.get())) {
+                    RESPONSES_CHAT_ROW.set(giftStreamRow);
+                }
             }
             resp.addHeader("X-Magpie-Served-By", "zcode-gift");
             handedOff = true;
@@ -15470,14 +17590,54 @@ public class GatewayServer extends NanoHTTPD {
                 resp.addHeader("X-AllIn-Native-Anthropic", "true");
                 addCorsHeaders(resp);
                 applyGuardHeaders(resp, guardResult);
+                UsageLedger.Row giftRowDone = U_ROW.get();
+                if (giftRowDone != null) {
+                    if (giftRowDone.bridgeStatus.isEmpty()) giftRowDone.bridgeStatus = "native";
+                    if (giftRowDone.deliveryStatus.isEmpty()) giftRowDone.deliveryStatus = "unknown";
+                }
+                attachFixedLengthDeliveryTracking(resp, giftRowDone, REQUEST_CONTEXT.get());
                 finishGiftUsage(200, "", true);
                 return new ZCodeGiftAttempt(resp, ZCodeGiftAttempt.SERVED);
             }
             JSONObject out = ZCodeAnthropic.toOpenAI(msg, requestedModel);
+            UsageLedger.Row giftRowDone = U_ROW.get();
+            if ("responses".equals(CLIENT_OUTPUT_PROTOCOL.get())) {
+                try {
+                    JSONObject converted = ResponsesBridge.chatResponseToResponses(out, CLIENT_MODEL.get());
+                    Response resp = newFixedLengthResponse(Status.OK, "application/json; charset=UTF-8", converted.toString());
+                    resp.addHeader("X-Magpie-Served-By", "zcode-gift");
+                    addCorsHeaders(resp);
+                    applyGuardHeaders(resp, guardResult);
+                    resp.setChunkedTransfer(true);
+                    RESP_PROJECTED_DONE.set(Boolean.TRUE);
+                    if (giftRowDone != null) {
+                        if (giftRowDone.bridgeStatus.isEmpty()) giftRowDone.bridgeStatus = "ok";
+                        if (giftRowDone.deliveryStatus.isEmpty()) giftRowDone.deliveryStatus = "unknown";
+                    }
+                    attachFixedLengthDeliveryTracking(resp, giftRowDone, REQUEST_CONTEXT.get());
+                    finishGiftUsage(200, "", true);
+                    return resp;
+                } catch (Exception projErr) {
+                    String errMsg = "Invalid upstream Chat response: " + (projErr.getMessage() == null ? projErr.getClass().getSimpleName() : projErr.getMessage());
+                    if (giftRowDone != null) {
+                        recordRowFailureMeta(giftRowDone, "conversion", "protocol", "conversion_validation_failed");
+                        giftRowDone.bridgeStatus = "failed";
+                        giftRowDone.deliveryStatus = "failed";
+                    }
+                    RESP_PROJECTED_DONE.set(Boolean.TRUE);
+                    finishGiftUsage(502, errMsg, true);
+                    return errorResponse(502, errMsg);
+                }
+            }
             Response resp = newFixedLengthResponse(Status.OK, "application/json; charset=UTF-8", out.toString());
             resp.addHeader("X-Magpie-Served-By", "zcode-gift");
             addCorsHeaders(resp);
             applyGuardHeaders(resp, guardResult);
+            if (giftRowDone != null) {
+                if (giftRowDone.bridgeStatus.isEmpty()) giftRowDone.bridgeStatus = "ok";
+                if (giftRowDone.deliveryStatus.isEmpty()) giftRowDone.deliveryStatus = "unknown";
+            }
+            attachFixedLengthDeliveryTracking(resp, giftRowDone, REQUEST_CONTEXT.get());
             finishGiftUsage(200, "", true);
             return new ZCodeGiftAttempt(resp, ZCodeGiftAttempt.SERVED);
         } catch (PrivacyMasker.PrivacyException e) {
@@ -15647,8 +17807,14 @@ public class GatewayServer extends NanoHTTPD {
         private boolean started = false;
         private boolean finished = false;
 
-        private boolean fail(String message) {
+        private boolean fail(String message, String reason, Throwable cause) {
             done = true;
+            if (originalUsage != null) {
+                originalUsage.upstreamSseObserved = true;
+                if (cause != null) recordStreamThrowable(originalUsage, cause, false);
+                recordRowFailureReason(originalUsage, reason);
+                recordRowSseTerminal(originalUsage, false);
+            }
             buf = openAiStreamError(message).getBytes(java.nio.charset.Charset.forName("UTF-8"));
             pos = 0;
             return true;
@@ -15659,6 +17825,7 @@ public class GatewayServer extends NanoHTTPD {
         }
         AnthropicSseToOpenAI(InputStream upstream, ZCodeAnthropic.StreamState state, UsageLedger.Row originalUsage) {
             this.originalUsage = originalUsage;
+            if (originalUsage != null) originalUsage.upstreamSseObserved = true;
             this.reader = new BoundedSseReader(
                     new java.io.InputStreamReader(upstream, java.nio.charset.Charset.forName("UTF-8")));
             this.state = state;
@@ -15669,36 +17836,41 @@ public class GatewayServer extends NanoHTTPD {
                 if (done) return false;
                 String line;
                 try { line = reader.readLine(); }
-                catch (IOException e) { return fail("Anthropic upstream stream read failed"); }
-                if (line == null) return fail("Anthropic upstream ended before message_stop");
+                catch (IOException e) { return fail("Anthropic upstream stream read failed", classifyStreamReason(e), e); }
+                if (line == null) return fail("Anthropic upstream ended before message_stop", "premature_eof", null);
                 if (line.startsWith("event:")) {
                     pendingEvent = line.substring(6).trim();
+                    recordRowSseEvent(originalUsage, pendingEvent);
                     continue;
                 }
                 if (line.startsWith("data:")) {
                     String d = line.substring(5).trim();
                     if ("[DONE]".equals(d)) {
-                        return fail("Anthropic upstream sent [DONE] before message_stop");
+                        return fail("Anthropic upstream sent [DONE] before message_stop", "conversion_validation_failed", null);
                     }
                     JSONObject obj = null;
                     try {
                         obj = new JSONObject(d);
                     } catch (Exception ignored) {
                     }
-                    if (obj == null) return fail("Invalid Anthropic upstream stream data");
+                    if (obj == null) return fail("Invalid Anthropic upstream stream data", "conversion_validation_failed", null);
                     String type = obj.optString("type", pendingEvent == null ? "" : pendingEvent);
+                    recordRowSseEvent(originalUsage, type);
                     if (originalUsage != null) {
                         JSONObject message = obj.optJSONObject("message");
                         if (message != null) absorbUsage(originalUsage, message.optJSONObject("usage"));
                         absorbUsage(originalUsage, obj.optJSONObject("usage"));
                     }
                     if ("error".equals(type) || obj.has("error")) {
+                        recordRowSseEvent(originalUsage, "error");
                         JSONObject error = obj.optJSONObject("error");
-                        return fail(error == null ? "Anthropic upstream stream error" : error.optString("message", "Anthropic upstream stream error"));
+                        return fail(error == null ? "Anthropic upstream stream error" : error.optString("message", "Anthropic upstream stream error"),
+                                "upstream_explicit_error", null);
                     }
                     if ("message_start".equals(type)) started = true;
                     if ("message_stop".equals(type)) {
-                        if (!started || !finished) return fail("Anthropic upstream ended without a complete message");
+                        if (!started || !finished) return fail("Anthropic upstream ended without a complete message", "conversion_validation_failed", null);
+                        recordRowSseTerminal(originalUsage, true);
                         done = true;
                         buf = "data: [DONE]\n\n".getBytes(java.nio.charset.Charset.forName("UTF-8"));
                         pos = 0;
@@ -15706,7 +17878,7 @@ public class GatewayServer extends NanoHTTPD {
                     }
                     java.util.List<String> outs;
                     try { outs = state.onEvent(pendingEvent, obj); }
-                    catch (RuntimeException invalid) { return fail("Invalid Anthropic upstream completion reason"); }
+                    catch (RuntimeException invalid) { return fail("Invalid Anthropic upstream completion reason", "conversion_validation_failed", invalid); }
                     if ("message_delta".equals(type)) {
                         JSONObject delta = obj.optJSONObject("delta");
                         if (delta != null && delta.has("stop_reason") && !delta.isNull("stop_reason")) finished = true;
@@ -15994,10 +18166,12 @@ public class GatewayServer extends NanoHTTPD {
 
     private static String readLimitedText(InputStream input, int limit) throws IOException {
         if (input == null) return "";
+        RequestContext current = REQUEST_CONTEXT.get();
         try (InputStream source = input) {
             ByteArrayOutputStream body = new ByteArrayOutputStream();
             byte[] buffer = new byte[8192];
             while (true) {
+                if (current != null) current.check();
                 int remaining = limit - body.size();
                 int count = source.read(buffer, 0, Math.min(buffer.length, remaining + 1));
                 if (count < 0) return body.toString("UTF-8");
@@ -16049,6 +18223,7 @@ public class GatewayServer extends NanoHTTPD {
         Attempt out = new Attempt();
         out.providerId = target.providerId;
         out.modelRef = target.providerId + "/" + target.upstreamModel;
+        attachRowSecrets(U_ROW.get(), target, null);
         HttpURLConnection conn = null;
         boolean handedOff = false;
         OutboundLimiter.Ticket customTicket = null;
@@ -16147,8 +18322,15 @@ public class GatewayServer extends NanoHTTPD {
                 conn.setInstanceFollowRedirects(false);
                 conn.setRequestMethod("POST");
                 conn.setDoOutput(true);
-                conn.setConnectTimeout(20000);
-                conn.setReadTimeout(15 * 60 * 1000);
+                int cfgConnectMs = (guardCfg != null ? Math.max(5, guardCfg.connectTimeoutSeconds) : 30) * 1000;
+                int cfgReadMs = (guardCfg != null ? Math.max(15, guardCfg.requestTimeoutSeconds) : 120) * 1000;
+                RequestContext reqCtx = REQUEST_CONTEXT.get();
+                if (reqCtx != null && reqCtx.remainingMillis() > 0) {
+                    cfgConnectMs = (int) Math.max(1L, Math.min(cfgConnectMs, reqCtx.remainingMillis()));
+                    cfgReadMs = (int) Math.max(1L, Math.min(cfgReadMs, reqCtx.remainingMillis()));
+                }
+                conn.setConnectTimeout(cfgConnectMs);
+                conn.setReadTimeout(cfgReadMs);
                 conn.setRequestProperty("Content-Type", "application/json");
                 if(target.customProvider!=null) {
                     CustomProvider.apply(conn,target.customProvider,target.apiKey,clientWantsStream);
@@ -16187,13 +18369,19 @@ public class GatewayServer extends NanoHTTPD {
                     out.sent=true;
                     if(U_ROW.get()!=null) U_ROW.get().outboundAt=System.currentTimeMillis();
                     RequestDiagnostics.handoff(U_ROW.get());
+                } else {
+                    RequestContext current = REQUEST_CONTEXT.get();
+                    if (current != null) current.check();
+                    out.sent = true;
                 }
                 OutputStream os = conn.getOutputStream();
+                recordCallDispatched(U_ROW.get(), target.upstreamModel, 1);
                 os.write(requestBytes);
                 os.flush();
                 os.close();
 
                 status = conn.getResponseCode();
+                if (status > 0) recordCallReply(U_ROW.get(), status, conn.getHeaderField("Retry-After"), null);
                 if(customRedirect(out,target,status)) return out;
                 // A redirect is an answer, and it is not this request being served. The reference
                 // siteFetch sends every call with redirect "manual", follows a same-host hop at most
@@ -16267,6 +18455,8 @@ public class GatewayServer extends NanoHTTPD {
                 out.ok = false;
                 out.status = status;
                 out.body = errBody;
+                recordCallReply(U_ROW.get(), status, out.retryAfter, errBody);
+                recordRowFailureMeta(U_ROW.get(), "await_response_headers", status <= 0 ? "no_http_status" : "http_rejection");
                 out.response = errorResponse(status <= 0 ? 502 : status,
                         (genericAnthropic ? "Anthropic: " : "MiniMax Code: ") + (errBody.isEmpty() ? "上游没有返回响应体" : errBody));
                 addUpstreamRetryAfter(out, target);
@@ -16295,7 +18485,7 @@ public class GatewayServer extends NanoHTTPD {
                 if (wantsAnthropicOut()) {
                     resp = nativeAnthropicResponse(is, maskSession, guardResult, conn, thinkingCompat(target.providerId, target.protocol, target.upstreamModel));
                 } else {
-                    InputStream openAi = new AnthropicSseToOpenAI(is, new ZCodeAnthropic.StreamState(requestedModel, thinkingCompat(target.providerId, target.protocol, target.upstreamModel)));
+                    InputStream openAi = new AnthropicSseToOpenAI(is, new ZCodeAnthropic.StreamState(requestedModel, thinkingCompat(target.providerId, target.protocol, target.upstreamModel)), U_ROW.get());
                     resp = streamForwardResponse(openAi, maskSession, guardResult, conn, target.providerId);
                 }
                 resp.addHeader("Cache-Control", "no-cache");
@@ -16343,11 +18533,14 @@ public class GatewayServer extends NanoHTTPD {
             out.response = resp;
             return out;
         } catch (ResponseBodyLimitException oversized) {
+            recordRowFailureMeta(U_ROW.get(), "read_response_body", "local_rejection", "conversion_validation_failed");
             return oversizedInferenceResponse(out);
         } catch (OutboundRejected rejected) {
+            recordRowFailureMeta(U_ROW.get(), "outbound_admission", "local_rejection", "admission_rejected");
             out.localRejection=true; out.status=rejected.status; out.body=rejected.getMessage();
             out.response=errorResponse(out.status,out.body); return out;
         } catch (IllegalArgumentException invalidRequest) {
+            recordRowFailureMeta(U_ROW.get(), "request_preparation", "local_rejection", "conversion_validation_failed");
             out.ok=false; out.localRejection=true; out.stopFallback=true; out.status=400;
             out.body=invalidRequest.getMessage()==null?"Invalid Anthropic reasoning request":invalidRequest.getMessage();
             out.response=errorResponse(400,out.body);
@@ -16356,6 +18549,8 @@ public class GatewayServer extends NanoHTTPD {
             out.ok = false;
             out.status = 0;
             out.transportKind = FailureLayers.transportName(e);
+            String ph = out.sent ? "await_response_headers" : "open_connection";
+            recordRowFailureMeta(U_ROW.get(), ph, out.transportKind, classifyExceptionReason(e, ph));
             if (target.commercialCandidates != null || "raccoon".equals(target.providerId)) {
                 out.body = "Upstream connection failed; execution outcome unknown";
                 out.response = errorResponse(502, out.body);
@@ -16563,10 +18758,13 @@ public class GatewayServer extends NanoHTTPD {
             call.conn.setRequestProperty("Accept","text/event-stream");call.conn.setRequestProperty("Accept-Encoding","gzip");
             byte[] bytes=body.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8); call.conn.setFixedLengthStreamingMode(bytes.length);
             if(req!=null){req.check();req.attach(call.conn);} out.sent=true;call.ticket.markSent();
-            UsageLedger.Row row=U_ROW.get(); if(row!=null) {row.outboundAt=System.currentTimeMillis();row.ep="subscription";} RequestDiagnostics.handoff(row);
+            UsageLedger.Row row=U_ROW.get(); if(row!=null) {row.outboundAt=System.currentTimeMillis();row.ep="subscription";}
+            recordCallDispatched(row, target.upstreamModel, 1);
+            RequestDiagnostics.handoff(row);
             try(OutputStream os=call.conn.getOutputStream()){os.write(bytes);}
             int status=call.conn.getResponseCode();
             call.upstreamHttp=status;
+            if (status > 0) recordCallReply(row, status, call.conn.getHeaderField("Retry-After"), null);
             if(status<200 || status>=300) {
                 // failure(): a rejection that names sign-out or quota is answered as 401 or 429, not as the
                 // 400 that carried it, and a status that is not an HTTP error is answered as 502.
@@ -16654,8 +18852,10 @@ public class GatewayServer extends NanoHTTPD {
                 if(call.stream==null) { out.status=call.status;out.body=call.body;out.response=traeErrorResponse(out,rejections);return out; }
                 call.usage.serve();
                 traeServedFunction().put(account.optString("id"),function);
+                // Trae reasoning cannot be signed as native Anthropic thinking. Never emit
+                // blocks that the client cannot replay on the same Messages route.
                 if(stream) {
-                    Response response=wantsAnthropicOut()?streamForwardAnthropicResponse(call.stream,requested,mask,guard,call.conn):streamForwardResponse(call.stream,mask,guard,call.conn,out.modelRef,format!=null);
+                    Response response=wantsAnthropicOut()?streamForwardAnthropicResponse(call.stream,requested,mask,guard,call.conn,false):streamForwardResponse(call.stream,mask,guard,call.conn,out.modelRef,format!=null);
                     final OutboundLimiter.Ticket held=call.ticket; final HttpURLConnection connection=call.conn;
                     Runnable release=()->{held.close();if(req!=null)req.detach(connection);connection.disconnect();if(ownsContext)req.close();};
                     if(req!=null)req.onClose(release);
@@ -16671,21 +18871,31 @@ public class GatewayServer extends NanoHTTPD {
                 if(message!=null && format==null) {String content=message.optString("content",""); String[] transformed=Middleware.applyThinkTags(content,message.optString("reasoning_content",""),mw);content=transformed[0];message.put("reasoning_content",transformed[1]);
                     if(Middleware.wordGuardEnabled(mw))content=Middleware.maskWords(content,mw); message.put("content",content);out.textOut=content;out.reasoningOut=message.optString("reasoning_content","");}
                 out.affinitySemanticComplete=affinitySemanticComplete(modified.toString(),"openai");
-            out.response=newFixedLengthResponse(Status.OK,"application/json; charset=UTF-8",toAnthropicBodyIfNeeded(modified.toString(),requested));
+                out.response=newFixedLengthResponse(Status.OK,"application/json; charset=UTF-8",toAnthropicBodyIfNeeded(modified.toString(),requested,false));
                 addCorsHeaders(out.response);applyGuardHeaders(out.response,guard);out.response.addHeader("X-Magpie-Served-By",out.modelRef);
                 out.ok=true;out.status=200;return out;
             }
             throw new IOException("no Trae function candidate");
         } catch(TraeResponseFormat.InvalidOutput invalid) {
+            recordRowFailureMeta(U_ROW.get(), "read_response_body", "protocol");
             out.status=502;out.body=invalid.getMessage();out.ok=false;out.protocolFailure=true;out.stopFallback=true;
         } catch(TraeProtocol.UpstreamError e) {
+            recordCallReply(U_ROW.get(), e.status, null, null);
+            recordRowFailureMeta(U_ROW.get(), "read_response_body", "http_rejection");
+            UsageLedger.Row trRow = U_ROW.get();
+            if (trRow != null && e.code != null && !e.code.isEmpty()) trRow.upstreamErrorCode = e.code;
             out.status=e.status;out.body=e.safeMessage+"（code "+e.code+"）";out.ok=false;
             if(e.status==429 && target.account!=null) {
                 traeRateUntil().put(target.account.optString("id"),System.currentTimeMillis()+60000L);
                 out.retryAfter="60";
             }
-        } catch(OutboundRejected e) {out.localRejection=!out.sent;out.status=e.status;out.body="Trae outbound admission rejected";
-        } catch(Exception e) {out.status=out.sent?502:400;out.localRejection=!out.sent;out.protocolFailure=out.sent;
+        } catch(OutboundRejected e) {
+            recordRowFailureMeta(U_ROW.get(), "outbound_admission", "local_rejection");
+            out.localRejection=!out.sent;out.status=e.status;out.body="Trae outbound admission rejected";
+        } catch(Exception e) {
+            out.status=out.sent?502:400;out.localRejection=!out.sent;out.protocolFailure=out.sent;
+            out.transportKind = FailureLayers.transportName(e);
+            recordRowFailureMeta(U_ROW.get(), out.sent ? "read_response_body" : "request_preparation", out.transportKind);
             String detail=e.getMessage();
             // Adapter validation messages are generated locally. Do not echo request values or upstream text.
             if(!out.sent && detail!=null && detail.startsWith("Trae protocol:"))out.body="Trae 本地请求校验失败："+detail.replaceAll("[^A-Za-z0-9 _.,:()/-]","?").substring(0,Math.min(180,detail.length()));
@@ -16707,6 +18917,7 @@ public class GatewayServer extends NanoHTTPD {
         Attempt out = new Attempt();
         out.providerId = target.providerId;
         out.modelRef = target.providerId + "/" + target.upstreamModel;
+        attachRowSecrets(U_ROW.get(), target, null);
 
         try {
             String token = target.apiKey;
@@ -16752,7 +18963,9 @@ public class GatewayServer extends NanoHTTPD {
                 OutboundLimiter.Ticket ticket=null;CatPawStream live=null;boolean transferred=false;
                 try {
                     ticket=admitOutbound(target,request);ticket.markSent();out.sent=true;
-                    UsageLedger.Row row=U_ROW.get();if(row!=null){row.outboundAt=System.currentTimeMillis();row.ep="subscription";}RequestDiagnostics.handoff(row);
+                    UsageLedger.Row row=U_ROW.get();if(row!=null){row.outboundAt=System.currentTimeMillis();row.ep="subscription";}
+                    recordCallDispatched(row, target.upstreamModel, 1);
+                    RequestDiagnostics.handoff(row);
                     CatPawStream.Transport transport=catPawStreamForTests!=null?catPawStreamForTests:catPawTransportForTests!=null?CatPawStream.legacy(catPawTransportForTests):CatPawStream.HTTP;
                     live = CatPawStream.open(token, target.upstreamModel, prepared, trustedType, requestedModel,
                             request, transport, streamTools, toolChoice, maskSession);
@@ -16806,6 +19019,9 @@ public class GatewayServer extends NanoHTTPD {
             }
             out.ok=false;out.stopFallback=true;out.sent=CatPawAuth.failureSentOrUnknown(e);
             out.status=CatPawAuth.failureStatus(e);out.localRejection=!out.sent && out.status==400;out.protocolFailure=out.sent;
+            out.transportKind = out.status >= 400 ? "http_rejection" : FailureLayers.transportName(e);
+            if (out.status > 0) recordCallReply(U_ROW.get(), out.status, out.status == 429 ? "45" : null, null);
+            recordRowFailureMeta(U_ROW.get(), out.sent ? "await_response_headers" : "request_preparation", out.transportKind);
             out.body=out.status==402 ? "妙手余额不足，未得到模型回复；请在官方查看额度，未重复发送请求"
                     : out.status==429 ? "妙手限流，请等待约45秒后再试；本次请求未重复发送"
                     : out.status==401 ? "妙手登录态已过期，请重新官方授权；本次请求未重复发送"
@@ -17475,6 +19691,10 @@ public class GatewayServer extends NanoHTTPD {
     }
 
     private Response errorResponseWithDetail(int code, JSONObject detail) {
+        if (detail != null) {
+            String summary = detail.optString("message", "");
+            if (!summary.isEmpty()) LAST_ERROR_SUMMARY.set(summary);
+        }
         JSONObject err = new JSONObject().put("error", detail);
         Response.IStatus status = Status.lookup(code);
         if (status == null && code >= 400 && code <= 599) {
@@ -18123,6 +20343,56 @@ public class GatewayServer extends NanoHTTPD {
             else if(id.startsWith("custom-")) throw new IllegalArgumentException("custom- ID 仅用于自定义供应商");
         }
     }
+    private static boolean containsSecretRefValue(Object value) {
+        if (value instanceof String) return ((String) value).startsWith("allin-secret-ref:");
+        if (value instanceof JSONArray) {
+            JSONArray a = (JSONArray) value;
+            for (int i = 0; i < a.length(); i++) if (containsSecretRefValue(a.opt(i))) return true;
+        } else if (value instanceof JSONObject) {
+            JSONObject o = (JSONObject) value;
+            java.util.Iterator<String> it = o.keys();
+            while (it.hasNext()) if (containsSecretRefValue(o.opt(it.next()))) return true;
+        }
+        return false;
+    }
+
+    private static boolean providerHasSecretReference(JSONObject provider) {
+        if (provider == null) return false;
+        return containsSecretRefValue(provider.opt("keys"))
+                || containsSecretRefValue(provider.opt("headers"))
+                || containsSecretRefValue(provider.opt("accounts"));
+    }
+
+    private static String normalizedProviderBaseUrl(JSONObject provider) {
+        if (provider == null) return "";
+        String raw = provider.optString("baseUrl", "");
+        if (raw == null || raw.trim().isEmpty()) return "";
+        return CustomProvider.base(raw);
+    }
+
+    private static boolean providerEndpointChangedWithSecretRef(JSONObject currentConf, JSONObject rawSubmitted, JSONObject restoredConf) {
+        JSONArray rawPs = rawSubmitted == null ? null : rawSubmitted.optJSONArray("providers");
+        JSONArray resPs = restoredConf == null ? null : restoredConf.optJSONArray("providers");
+        JSONArray curPs = currentConf == null ? null : currentConf.optJSONArray("providers");
+        if (rawPs == null || resPs == null || curPs == null) return false;
+        java.util.Map<String, JSONObject> currentById = new java.util.HashMap<>();
+        for (int i = 0; i < curPs.length(); i++) {
+            JSONObject cp = curPs.optJSONObject(i);
+            if (cp != null && !cp.optString("id").isEmpty()) currentById.put(cp.optString("id"), cp);
+        }
+        for (int i = 0; i < rawPs.length() && i < resPs.length(); i++) {
+            JSONObject rp = rawPs.optJSONObject(i);
+            JSONObject sp = resPs.optJSONObject(i);
+            if (rp == null || sp == null) continue;
+            JSONObject cur = currentById.get(sp.optString("id"));
+            if (cur == null) continue;
+            if (!normalizedProviderBaseUrl(cur).equals(normalizedProviderBaseUrl(sp)) && providerHasSecretReference(rp)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private Response customProviderMutation(String body) {
         try {
             JSONObject req=new JSONObject(body); String action=CustomProvider.text(req,"action");
@@ -18145,6 +20415,9 @@ public class GatewayServer extends NanoHTTPD {
                     JSONObject incoming=new JSONObject().put("providers",new JSONArray().put(draft));
                     JSONObject restored=ConfigurationView.restore(incoming,configJson,GatewayManagementCredential.get()).getJSONArray("providers").getJSONObject(0);
                     JSONObject clean=CustomProvider.validate(restored);
+                    if(current!=null && !CustomProvider.base(current.optString("baseUrl")).equals(CustomProvider.base(clean.optString("baseUrl")))
+                            && providerHasSecretReference(draft))
+                        return errorResponse(400,"更改 API 地址后请重新填写凭据，旧地址凭据不会自动发送到新地址");
                     if(current==null) providers.put(clean);
                     else for(String f:clean.keySet()) current.put(f,clean.get(f));
                     JSONObject target=findProviderById(providers,id); target.remove("accessCatalogPool"); target.remove("modelMeta");
@@ -18417,7 +20690,7 @@ public class GatewayServer extends NanoHTTPD {
             String mapped=body.optString("model",modelRef);
             if(!mapped.startsWith("github-copilot/"))return errorResponse(400,"Native Responses model map must retain the Copilot provider");
             upstreamModel=mapped.substring("github-copilot/".length());
-            totalMasked.addAndGet(nativeMask.interceptedCount);
+            recordPrivacyMask(nativeMask.interceptedCount, false, false);
         } catch(IllegalArgumentException invalid) { return errorResponse(400,invalid.getMessage()); }
         catch(Exception invalid) { return errorResponse(400,"Invalid native Responses request"); }
 
@@ -18577,6 +20850,8 @@ public class GatewayServer extends NanoHTTPD {
             bindCodexPersistence(activeAcc, info);
             if (info.expiresAt > 0 && info.expiresAt - System.currentTimeMillis() < 5 * 60 * 1000L && !info.refreshToken.isEmpty())
                 CodexAuth.refreshToken(info, "proactive_expiry");
+        } catch (CodexAuth.RefreshFailure rf) {
+            return codexRefreshErrorResponse(rf);
         } catch (Exception failure) { return errorResponse(502, "Codex credential refresh failed"); }
 
         if (uri.endsWith("/models") && "GET".equalsIgnoreCase(method)) {
@@ -18660,6 +20935,7 @@ public class GatewayServer extends NanoHTTPD {
                 if (code == 401 && attempt < 1 && !info.refreshToken.isEmpty()) {
                     conn.disconnect();if(nativeContext!=null)nativeContext.detach(conn);conn=null;
                     CodexAuth.refreshToken(info, "unauthorized_recovery");
+                    attachRowSecrets(U_ROW.get(), null, info);
                     if (attempt < 1) {
                         return handleCodexNative(session, uri, method, headers, rawBody, attempt + 1,lifecycle);
                     }
@@ -18701,6 +20977,8 @@ public class GatewayServer extends NanoHTTPD {
                 return errorResponse(400,invalid.getMessage()==null?"Invalid Codex request":invalid.getMessage());
             } catch (ResponseBodyLimitException oversized) {
                 return errorResponse(502, RESPONSE_BODY_LIMIT_MESSAGE);
+            } catch (CodexAuth.RefreshFailure rf) {
+                return codexRefreshErrorResponse(rf);
             } catch (Exception e) {
                 return errorResponse(502, "Codex 原生转发失败");
             } finally {
@@ -18974,7 +21252,7 @@ public class GatewayServer extends NanoHTTPD {
                 } else delta.remove("sequence_number");
                 return "event: "+delta.getString("type")+"\ndata: "+delta.toString()+"\n\n";
             }
-            volatile boolean writeStarted,writeFinished,readComplete,closed;
+            volatile boolean writeStarted,writeFinished,readComplete,closed,deliveryConfirmed,deliverySucceeded;
             boolean completed;
             volatile int resultStatus=200;volatile String resultError="";
             final java.util.concurrent.atomic.AtomicBoolean released=new java.util.concurrent.atomic.AtomicBoolean();
@@ -19014,7 +21292,13 @@ public class GatewayServer extends NanoHTTPD {
                     if(closed)return false;
                     if(ended) {
                         readComplete=true;
-                        if(!writeStarted){if(semantic!=null)semantic.set(completed && resultStatus==200);lifecycle.complete(resultStatus,resultError,null);}
+                        if(!writeStarted){
+                            if(row!=null && row.deliveryStatus.isEmpty()) {
+                                row.deliveryStatus=(completed && resultStatus==200)?"unknown":((resultStatus==499||resultStatus==504)?"cancelled":"failed");
+                            }
+                            if(semantic!=null)semantic.set(completed && resultStatus==200);
+                            lifecycle.complete(resultStatus,resultError,null);
+                        }
                         return false;
                     }
                     String result="";
@@ -19028,21 +21312,52 @@ public class GatewayServer extends NanoHTTPD {
                         }
                         if(line==null && data.length()>0) throw new IOException("truncated SSE event");
                         if(data.length()==0) {
-                            if(line==null) { ended=true; if(!terminal) result=failure("Responses stream ended before terminal event"); }
+                            if(line==null) {
+                                ended=true;
+                                if(!terminal) {
+                                    recordRowSseTerminal(row, false);
+                                    recordRowFailureMeta(row, "read_response_body", "eof", "premature_eof");
+                                    result=failure("Responses stream ended before terminal event");
+                                }
+                            }
                         } else if("[DONE]".equals(data.toString())) {
-                            ended=true; if(!terminal) result=failure("Responses stream ended before terminal event");
+                            if (row != null && !terminal && row.lastSseEvent.isEmpty()) recordRowSseEvent(row, "[DONE]");
+                            ended=true;
+                            if(!terminal) {
+                                recordRowSseTerminal(row, false);
+                                recordRowFailureMeta(row, "read_response_body", "eof", "premature_eof");
+                                if (row != null && row.bridgeStatus.isEmpty()) row.bridgeStatus = "upstream_aborted";
+                                result=failure("Responses stream ended before terminal event");
+                            }
                         } else {
                             JSONObject event=new JSONObject(data.toString()); String type=event.optString("type",eventName);
                             if(type.isEmpty())throw new IOException("missing event type");
+                            recordRowSseEvent(row, type);
                             JSONObject response=event.optJSONObject("response");
                             if(response!=null && clientModel!=null && response.has("model")) response.put("model",clientModel);
                             if(response!=null) { lastResponse=response; JSONObject usage=response.optJSONObject("usage"); if(row!=null && usage!=null)synchronized(this){if(!closed)absorbUsage(row,usage);} }
-                            if("error".equals(type)) throw new IOException("upstream Responses error");
+                            if("error".equals(type)) {
+                                recordRowSseTerminal(row, false);
+                                recordRowFailureMeta(row, "read_response_body", "http_rejection", "upstream_explicit_error");
+                                if (row != null) row.bridgeStatus = "upstream_aborted";
+                                throw new IOException("upstream Responses error");
+                            }
                             if("response.completed".equals(type) || "response.incomplete".equals(type) || "response.failed".equals(type)) {
+                                if (!validTerminalResponsesObject(type, response)) {
+                                    if (row != null) row.bridgeStatus = "failed";
+                                    recordRowFailureMeta(row, "read_response_body", "protocol", "conversion_validation_failed");
+                                    throw new IOException("invalid terminal response object");
+                                }
                                 if("response.completed".equals(type) || "response.incomplete".equals(type)) for(String key:new java.util.ArrayList<String>(deltas.keySet())) result+=flushDelta(key);
-                                if(("response.completed".equals(type) || "response.incomplete".equals(type)) && (response==null || !type.substring(9).equals(response.optString("status")))) throw new IOException("invalid terminal response status");
                                 terminal=true; ended=true;
-                                completed="response.completed".equals(type);
+                                completed="response.completed".equals(type) || "response.incomplete".equals(type);
+                                recordRowSseTerminal(row, true);
+                                if ("response.failed".equals(type)) {
+                                    recordRowFailureMeta(row, "read_response_body", "http_rejection", "upstream_explicit_error");
+                                    if (row != null && row.bridgeStatus.isEmpty()) row.bridgeStatus = "native";
+                                } else if (row != null) {
+                                    row.bridgeStatus = "native";
+                                }
                             }
                             if(event.opt("delta") instanceof String) {
                                 String key=type+":"+event.optString("item_id","")+":"+event.optInt("output_index",0)+":"+event.optInt("content_index",event.optInt("summary_index",0));
@@ -19059,8 +21374,17 @@ public class GatewayServer extends NanoHTTPD {
                             if(terminal) finish("response.failed".equals(type)?502:200,"response.failed".equals(type)?"Upstream response failed":"");
                         }
                     } catch(Exception ex) {
-                        ended=true; terminal=false; if(semantic!=null) semantic.set(false); try { result=failure("Invalid or interrupted Responses stream"); } catch(Exception ignored) { finish(502,"Invalid or interrupted Responses stream"); throw new IOException(ex); }
+                        ended=true; terminal=false; if(semantic!=null) semantic.set(false);
+                        recordRowSseTerminal(row, false);
+                        if (ex instanceof IOException) {
+                            String sr = classifyStreamReason(ex);
+                            if (sr == null || sr.isEmpty()) sr = "premature_eof";
+                            recordRowFailureMeta(row, "read_response_body", FailureLayers.transportName(ex), sr);
+                        } else {
+                            recordRowFailureMeta(row, "read_response_body", "protocol", "conversion_validation_failed");
                         }
+                        try { result=failure("Invalid or interrupted Responses stream"); } catch(Exception ignored) { finish(502,"Invalid or interrupted Responses stream"); throw new IOException(ex); }
+                    }
                     if(ended && !terminal) finish(502,"Invalid or interrupted Responses stream");
                     if(closed)return false;
                     if(!result.isEmpty()) { bytes=result.getBytes(java.nio.charset.StandardCharsets.UTF_8); offset=0; return true; }
@@ -19071,9 +21395,26 @@ public class GatewayServer extends NanoHTTPD {
             public void onWriteStart(){writeStarted=true;}
             public void onWriteComplete(boolean success){
                 writeFinished=true;
+                deliveryConfirmed=true;
+                deliverySucceeded=success;
+                boolean upstreamCompletedOk = readComplete && completed && resultStatus == 200;
                 if(!success && resultStatus<400)finish(lifecycle.cancelledStatus(),"Native downstream write failed or cancelled");
                 else if(!readComplete && resultStatus<400)finish(502,"Incomplete native Responses delivery");
                 if(semantic!=null)semantic.set(success && readComplete && completed && resultStatus==200);
+                if (row != null) {
+                    if (upstreamCompletedOk && row.bridgeStatus.isEmpty()) row.bridgeStatus = "native";
+                    if (row.deliveryStatus.isEmpty() || "unknown".equals(row.deliveryStatus) || (!success && "delivered".equals(row.deliveryStatus))) {
+                        row.deliveryStatus = (success && upstreamCompletedOk) ? "delivered"
+                                : ((resultStatus == 499 || resultStatus == 504) ? "cancelled" : "failed");
+                    }
+                    if (!success && upstreamCompletedOk) {
+                        recordRowSseTerminal(row, true);
+                        String phase = "downstream_delivery";
+                        String tr = (resultStatus == 499 || resultStatus == 504) ? "cancelled" : "downstream";
+                        String reason = (resultStatus == 499 || resultStatus == 504) ? "downstream_cancelled" : "downstream_write_failed";
+                        recordRowFailureMeta(row, phase, tr, reason);
+                    }
+                }
                 lifecycle.complete(resultStatus,resultError,success && readComplete && resultStatus==200);release();
             }
             public void close() throws IOException {
@@ -19084,7 +21425,14 @@ public class GatewayServer extends NanoHTTPD {
                 }
                 release();
                 if(semantic!=null && !readComplete)semantic.set(false);
-                if(!writeStarted || writeFinished)lifecycle.complete(resultStatus,resultError,readComplete?null:Boolean.FALSE);
+                if(!writeStarted || writeFinished) {
+                    if (row != null && row.deliveryStatus.isEmpty()) {
+                        row.deliveryStatus = (deliveryConfirmed && deliverySucceeded && resultStatus == 200 && completed) ? "delivered"
+                                : ((resultStatus == 200 && completed && !writeStarted) ? "unknown"
+                                : (resultStatus == 499 || resultStatus == 504 ? "cancelled" : "failed"));
+                    }
+                    lifecycle.complete(resultStatus,resultError,(deliveryConfirmed && deliverySucceeded && readComplete)?Boolean.TRUE:(readComplete?null:Boolean.FALSE));
+                }
             }
         }
         InputStream processed=new NativeStream();
@@ -19096,21 +21444,61 @@ public class GatewayServer extends NanoHTTPD {
                                          ContextGuard.Result guard, HttpURLConnection conn) throws Exception {
         if(stream) return nativeResponsesStream(source,mask,guard,conn);
         BufferedReader reader=new BoundedSseReader(new InputStreamReader(source,java.nio.charset.StandardCharsets.UTF_8));
+        UsageLedger.Row row=U_ROW.get();
         JSONObject result=null; String line;
         try { while((line=reader.readLine())!=null) {
+            if(line.startsWith("event:")) {
+                String ev = line.substring(6).trim();
+                if (!ev.isEmpty()) recordRowSseEvent(row, ev);
+                continue;
+            }
             if(!line.startsWith("data:"))continue; String data=line.substring(5).trim();
-            if(data.isEmpty() || "[DONE]".equals(data))continue;
+            if(data.isEmpty())continue;
+            if("[DONE]".equals(data)) { if (row == null || row.sseTerminal == null) recordRowSseEvent(row, "[DONE]"); continue; }
             JSONObject event=new JSONObject(data); String type=event.optString("type");
-            if("response.failed".equals(type)||"error".equals(type))throw new IOException("Codex response failed");
+            if (!type.isEmpty()) recordRowSseEvent(row, type);
+            if("response.failed".equals(type)||"error".equals(type)) {
+                JSONObject respObj = event.optJSONObject("response");
+                if ("response.failed".equals(type) && !validTerminalResponsesObject("response.failed", respObj)) {
+                    if (row != null) { row.sseTerminal = Boolean.FALSE; row.bridgeStatus = "failed"; }
+                    recordRowFailureMeta(row, "read_response_body", "protocol", "conversion_validation_failed");
+                    throw new ProtocolResponseException();
+                }
+                boolean validTerm = "response.failed".equals(type);
+                recordRowSseTerminal(row, validTerm);
+                recordRowFailureMeta(row, "read_response_body", "http_rejection", "upstream_explicit_error");
+                if (row != null) {
+                    if (row.bridgeStatus.isEmpty()) row.bridgeStatus = validTerm ? "native" : "upstream_aborted";
+                    row.deliveryStatus = "failed";
+                    String eCode = extractSafeErrorCode(data, row.activeSecrets);
+                    if (!eCode.isEmpty()) row.upstreamErrorCode = eCode;
+                }
+                throw new IOException("Codex response failed: " + extractStreamErrorSummary(event.has("error") ? event.opt("error") : event, row == null ? null : row.activeSecrets));
+            }
             if("response.completed".equals(type)||"response.incomplete".equals(type)) {
                 result=event.optJSONObject("response");
-                if(result==null || !type.substring(9).equals(result.optString("status")))throw new IOException("invalid Codex terminal response");
+                if(!validTerminalResponsesObject(type, result)) {
+                    if (row != null) { row.sseTerminal = Boolean.FALSE; row.bridgeStatus = "failed"; row.deliveryStatus = "failed"; }
+                    recordRowFailureMeta(row, "read_response_body", "protocol", "conversion_validation_failed");
+                    throw new ProtocolResponseException();
+                }
+                recordRowSseTerminal(row, true);
                 break;
             }
         }
         } finally { try { reader.close(); } finally { if(conn!=null)conn.disconnect(); } }
-        if(result==null)throw new IOException("Codex stream ended before completion");
-        UsageLedger.Row row=U_ROW.get(); if(row!=null) absorbUsage(row,result.optJSONObject("usage"));
+        if(result==null) {
+            recordRowSseTerminal(row, false);
+            recordRowFailureMeta(row, "read_response_body", "eof", "premature_eof");
+            if (row != null) { if (row.bridgeStatus.isEmpty()) row.bridgeStatus = "upstream_aborted"; row.deliveryStatus = "failed"; }
+            throw new IOException("Codex stream ended before completion");
+        }
+        if(row!=null) {
+            absorbUsage(row,result.optJSONObject("usage"));
+            row.bridgeStatus = "native";
+            row.deliveryStatus = "unknown";
+            logGatewayOutcomeSummary(row);
+        }
         unmaskJson(result,mask);
         if(CLIENT_MODEL.get()!=null && result.has("model")) result.put("model",CLIENT_MODEL.get());
         Response resp=newFixedLengthResponse(Status.OK,"application/json; charset=UTF-8",result.toString()); addCorsHeaders(resp); applyGuardHeaders(resp,guard); return resp;
@@ -19231,7 +21619,7 @@ public class GatewayServer extends NanoHTTPD {
 
     private static String scrubUpstreamSecrets(String text, RouteTarget target) {
         if (text == null) return "";
-        if(target.customProvider!=null) {
+        if(target != null && target.customProvider!=null) {
             JSONObject headers=target.customProvider.optJSONObject("headers");
             if (headers != null) {
                 for(String name:headers.keySet()) {
@@ -19251,12 +21639,12 @@ public class GatewayServer extends NanoHTTPD {
                 }
             }
         }
-        if (target.apiKey != null && !target.apiKey.isEmpty()) text = text.replace(target.apiKey, "[REDACTED]");
-        if (target.commercialCandidates != null) for (CommercialKeyPool.Credential credential : target.commercialCandidates) {
+        if (target != null && target.apiKey != null && !target.apiKey.isEmpty()) text = text.replace(target.apiKey, "[REDACTED]");
+        if (target != null && target.commercialCandidates != null) for (CommercialKeyPool.Credential credential : target.commercialCandidates) {
             String secret = credential.secret();
             if (secret != null && !secret.isEmpty()) text = text.replace(secret, "[REDACTED]");
         }
-        return text;
+        return scrubDiagnosticText(text, null);
     }
 
     private static void addUpstreamRetryAfter(Attempt out, RouteTarget target) {
@@ -19438,7 +21826,10 @@ public class GatewayServer extends NanoHTTPD {
     private static void markResponsesSent(Attempt out) {
         out.sent = true;
         UsageLedger.Row row = U_ROW.get();
-        if (row != null) row.outboundAt = System.currentTimeMillis();
+        if (row != null) {
+            row.outboundAt = System.currentTimeMillis();
+            if (row.model != null && !row.model.isEmpty()) recordCallDispatched(row, row.model, 1);
+        }
         RequestDiagnostics.handoff(row);
     }
 
@@ -19476,6 +21867,8 @@ public class GatewayServer extends NanoHTTPD {
                                                 String requestedModel, PrivacyMasker.Session mask,
                                                 ContextGuard.Result guard, ContextGuard.Config cfg) {
         Attempt out=new Attempt(); HttpURLConnection conn=null; OutboundLimiter.Ticket ticket=null; RequestContext requestContext=REQUEST_CONTEXT.get();
+        attachRowSecrets(U_ROW.get(), target, null);
+        boolean readingResponseBody = false;
         try {
             conn=openInferenceConnection(target.baseUrl.replaceAll("/+$","")+"/responses", false);
             if(target.commercialCandidates!=null) conn.setInstanceFollowRedirects(false);
@@ -19502,8 +21895,11 @@ public class GatewayServer extends NanoHTTPD {
             if(customRedirect(out,target,code)) return out;
             if (requestContext != null) requestContext.check();
             out.status = code;
+            if (code > 0) recordCallReply(U_ROW.get(), code, conn.getHeaderField("Retry-After"), null);
             if (code < 200 || code >= 300) {
                 responsesUpstreamError(out, conn, code, mask, guard, target);
+                recordCallReply(U_ROW.get(), code, out.retryAfter, out.body);
+                recordRowFailureMeta(U_ROW.get(), "await_response_headers", "http_rejection", "upstream_explicit_error");
                 if (requestContext != null) requestContext.check();
                 return out;
             }
@@ -19511,9 +21907,15 @@ public class GatewayServer extends NanoHTTPD {
             ZhipuEnvelope.Result envelope=ZhipuEnvelope.inspect(conn,source,conn.getURL().toString());
             source=envelope.body;
             if (requestContext != null) requestContext.check();
-            if(envelope.adapted) { source.close(); out.retryAfter=conn.getHeaderField("Retry-After"); setEnvelopeError(out,target,envelope,mask,guard); return out; }
+            if(envelope.adapted) {
+                source.close(); out.retryAfter=conn.getHeaderField("Retry-After"); setEnvelopeError(out,target,envelope,mask,guard);
+                recordCallReply(U_ROW.get(), out.status, out.retryAfter, out.body);
+                recordRowFailureMeta(U_ROW.get(), "read_response_body", "http_rejection", "upstream_explicit_error");
+                return out;
+            }
+            readingResponseBody = true;
             if(stream) {
-                InputStream converted=ResponsesBridge.responsesStreamToChat(source,requestedModel);
+                InputStream converted=ResponsesBridge.responsesStreamToChat(source,requestedModel,responsesStreamObserver(U_ROW.get()));
                 // Reuse the common Chat response pipeline for middleware, privacy and accounting.
                 Response chat=streamForwardResponse(converted,mask,guard,conn,target.providerId);
                 if(wantsAnthropicOut()) {
@@ -19521,10 +21923,23 @@ public class GatewayServer extends NanoHTTPD {
                     out.response=newChunkedResponse(Status.OK,"text/event-stream",new CompletionForwardStream(anthropic,chat.getData())); addCorsHeaders(out.response); applyGuardHeaders(out.response,guard);
                 } else out.response=chat;
             } else {
-                JSONObject nativeReply=new JSONObject(readLimitedText(source, BoundedResponse.MAX_BYTES));
+                String rawReply = readLimitedText(source, BoundedResponse.MAX_BYTES);
                 if (requestContext != null) requestContext.check();
-                JSONObject reply=ResponsesBridge.responsesResponseToChat(nativeReply,requestedModel);
-                UsageLedger.Row row=U_ROW.get(); if(row!=null) absorbUsage(row,nativeReply.optJSONObject("usage"));
+                JSONObject nativeReply;
+                JSONObject reply;
+                try {
+                    nativeReply = new JSONObject(rawReply);
+                    reply = ResponsesBridge.responsesResponseToChat(nativeReply,requestedModel);
+                } catch (Exception invalid) {
+                    recordRowFailureMeta(U_ROW.get(), "read_response_body", "protocol", "conversion_validation_failed");
+                    throw new ProtocolResponseException();
+                }
+                UsageLedger.Row row=U_ROW.get();
+                if(row!=null) {
+                    absorbUsage(row,nativeReply.optJSONObject("usage"));
+                    row.bridgeStatus = "ok";
+                    row.deliveryStatus = "unknown";
+                }
                 unmaskJson(reply,mask);
                 JSONObject mw=configJson.optJSONObject("middleware");
                 JSONObject message=reply.getJSONArray("choices").getJSONObject(0).getJSONObject("message");
@@ -19544,13 +21959,21 @@ public class GatewayServer extends NanoHTTPD {
             out.ok=true; out.status=200; return out;
         } catch(ProtocolResponseException invalid) { return failedProtocolAttempt(out);
         } catch (ResponseBodyLimitException oversized) {
+            recordRowFailureMeta(U_ROW.get(), "read_response_body", "local_rejection", "conversion_validation_failed");
             return oversizedInferenceResponse(out);
-        } catch(OutboundRejected rejected) { out.localRejection=true; RequestDiagnostics.admissionRejected(U_ROW.get()); out.status=rejected.status; out.body=rejected.getMessage(); out.response=errorResponse(out.status,out.body); if(rejected.retryMillis>0) out.response.addHeader("Retry-After",Long.toString((rejected.retryMillis+999)/1000)); return out;
+        } catch(OutboundRejected rejected) {
+            recordRowFailureMeta(U_ROW.get(), "outbound_admission", "local_rejection", "admission_rejected");
+            out.localRejection=true; RequestDiagnostics.admissionRejected(U_ROW.get()); out.status=rejected.status; out.body=rejected.getMessage(); out.response=errorResponse(out.status,out.body); if(rejected.retryMillis>0) out.response.addHeader("Retry-After",Long.toString((rejected.retryMillis+999)/1000)); return out;
         } catch (Exception e) {
-            if (requestContext != null && requestContext.isCancelled()) return cancelledResponsesAttempt(out, requestContext);
+            if (requestContext != null && requestContext.isCancelled()) {
+                recordRowFailureMeta(U_ROW.get(), "downstream_delivery", "cancelled", "downstream_cancelled");
+                return cancelledResponsesAttempt(out, requestContext);
+            }
             out.status=target.commercialCandidates!=null ? 0 : 502;
             out.transportKind = FailureLayers.transportName(e);
-            out.body="Responses upstream failed"; out.response=errorResponse(502,out.body); return out;
+            String rph = readingResponseBody ? "read_response_body" : (out.sent ? "await_response_headers" : "open_connection");
+            recordRowFailureMeta(U_ROW.get(), rph, out.transportKind, classifyExceptionReason(e, rph));
+            out.body="Responses upstream failed [" + out.transportKind + "]"; out.response=errorResponse(502,out.body); return out;
         } finally {
             finishResponsesConnection(out, stream, conn, ticket, requestContext);
             out.failure=UpstreamFailure.classify(target.providerId,out.status,out.body,out.sent,false);
@@ -19558,7 +21981,9 @@ public class GatewayServer extends NanoHTTPD {
                     definiteUpstreamRejection(target.providerId,out.status,out.body));
             if(!out.ok && U_ROW.get()!=null) {
                 UsageLedger.Row row=U_ROW.get(); row.failureKind=out.failure.kind.name().toLowerCase(java.util.Locale.ROOT);
-                row.upstreamErrorCode=java.util.Arrays.asList("user_model_rate_limited","rate_limit","rate_limit_error","insufficient_quota","authentication_error","context_length_exceeded","overloaded_error","invalid_request_error").contains(out.failure.code)?out.failure.code:"";
+                recordRowFailureMeta(row, null, out.transportKind);
+                String known=java.util.Arrays.asList("user_model_rate_limited","rate_limit","rate_limit_error","insufficient_quota","authentication_error","context_length_exceeded","overloaded_error","invalid_request_error").contains(out.failure.code)?out.failure.code:"";
+                row.upstreamErrorCode=!known.isEmpty()?known:extractSafeErrorCode(out.body);
                 String retry=out.retryAfter; if(retry!=null && retry.length()<=128) row.upstreamRetryAfter=Long.toString(CommercialKeyPool.retryAfterDeadline(retry,0,0));
             }
         }
@@ -19568,6 +21993,8 @@ public class GatewayServer extends NanoHTTPD {
                                            PrivacyMasker.Session mask, ContextGuard.Result guard,
                                            ContextGuard.Config guardCfg) {
         Attempt out=new Attempt(); HttpURLConnection conn=null; OutboundLimiter.Ticket ticket=null; RequestContext requestContext=REQUEST_CONTEXT.get();
+        attachRowSecrets(U_ROW.get(), target, null);
+        boolean readingResponseBody = false;
         try {
             conn=openInferenceConnection(target.baseUrl.replaceAll("/+$","")+"/responses", false);
             if(target.commercialCandidates!=null) conn.setInstanceFollowRedirects(false);
@@ -19594,8 +22021,11 @@ public class GatewayServer extends NanoHTTPD {
             if(customRedirect(out,target,code)) return out;
             if (requestContext != null) requestContext.check();
             out.status = code;
+            if (code > 0) recordCallReply(U_ROW.get(), code, conn.getHeaderField("Retry-After"), null);
             if (code < 200 || code >= 300) {
                 responsesUpstreamError(out, conn, code, mask, guard, target);
+                recordCallReply(U_ROW.get(), code, out.retryAfter, out.body);
+                recordRowFailureMeta(U_ROW.get(), "await_response_headers", "http_rejection");
                 if (requestContext != null) requestContext.check();
                 return out;
             }
@@ -19603,25 +22033,44 @@ public class GatewayServer extends NanoHTTPD {
             ZhipuEnvelope.Result envelope=ZhipuEnvelope.inspect(conn,in,conn.getURL().toString());
             in=envelope.body;
             if (requestContext != null) requestContext.check();
-            if(envelope.adapted) { in.close(); out.retryAfter=conn.getHeaderField("Retry-After"); setEnvelopeError(out,target,envelope,mask,guard); return out; }
+            if(envelope.adapted) {
+                in.close(); out.retryAfter=conn.getHeaderField("Retry-After"); setEnvelopeError(out,target,envelope,mask,guard);
+                recordCallReply(U_ROW.get(), out.status, out.retryAfter, out.body);
+                recordRowFailureMeta(U_ROW.get(), "read_response_body", "http_rejection");
+                return out;
+            }
             if(stream) out.response=nativeResponsesStream(in,mask,guard,conn);
             else {
                 JSONObject response=new JSONObject(readLimitedText(in, BoundedResponse.MAX_BYTES));
                 if (requestContext != null) requestContext.check();
-                if(!"completed".equals(response.optString("status")) && !"incomplete".equals(response.optString("status"))) throw new IOException("invalid Responses status");
+                if((response.has("error") && !response.isNull("error"))
+                        || (!"completed".equals(response.optString("status")) && !"incomplete".equals(response.optString("status")))) {
+                    UsageLedger.Row errRow = U_ROW.get();
+                    if (errRow != null) { errRow.bridgeStatus = "failed"; errRow.deliveryStatus = "failed"; }
+                    recordRowFailureMeta(errRow, "read_response_body", "protocol", "conversion_validation_failed");
+                    throw new ProtocolResponseException();
+                }
                 out.affinitySemanticComplete="completed".equals(response.optString("status"));
-                UsageLedger.Row row=U_ROW.get(); if(row!=null) absorbUsage(row,response.optJSONObject("usage"));
+                UsageLedger.Row row=U_ROW.get(); if(row!=null) { absorbUsage(row,response.optJSONObject("usage")); row.bridgeStatus = "native"; row.deliveryStatus = "unknown"; }
                 unmaskJson(response,mask); if(CLIENT_MODEL.get()!=null && response.has("model")) response.put("model",CLIENT_MODEL.get()); out.response=newFixedLengthResponse(Status.OK,"application/json; charset=UTF-8",response.toString()); addCorsHeaders(out.response); applyGuardHeaders(out.response,guard);
             }
             out.ok=true; RESP_NATIVE_RESULT.set(Boolean.TRUE); return out;
         } catch (ResponseBodyLimitException oversized) {
+            recordRowFailureMeta(U_ROW.get(), "read_response_body", "local_rejection", "conversion_validation_failed");
             return oversizedInferenceResponse(out);
-        } catch(OutboundRejected rejected) { out.localRejection=true; RequestDiagnostics.admissionRejected(U_ROW.get()); out.status=rejected.status; out.body=rejected.getMessage(); out.response=errorResponse(out.status,out.body); if(rejected.retryMillis>0) out.response.addHeader("Retry-After",Long.toString((rejected.retryMillis+999)/1000)); return out;
+        } catch(OutboundRejected rejected) {
+            recordRowFailureMeta(U_ROW.get(), "outbound_admission", "local_rejection", "admission_rejected");
+            out.localRejection=true; RequestDiagnostics.admissionRejected(U_ROW.get()); out.status=rejected.status; out.body=rejected.getMessage(); out.response=errorResponse(out.status,out.body); if(rejected.retryMillis>0) out.response.addHeader("Retry-After",Long.toString((rejected.retryMillis+999)/1000)); return out;
         } catch (Exception e) {
-            if (requestContext != null && requestContext.isCancelled()) return cancelledResponsesAttempt(out, requestContext);
+            if (requestContext != null && requestContext.isCancelled()) {
+                recordRowFailureMeta(U_ROW.get(), "downstream_delivery", "cancelled", "downstream_cancelled");
+                return cancelledResponsesAttempt(out, requestContext);
+            }
             out.status=target.commercialCandidates!=null ? 0 : 502;
             out.transportKind = FailureLayers.transportName(e);
-            out.body="Responses upstream failed"; out.response=errorResponse(502,out.body); return out;
+            String nph = out.sent ? "await_response_headers" : "open_connection";
+            recordRowFailureMeta(U_ROW.get(), nph, out.transportKind, classifyExceptionReason(e, nph));
+            out.body="Responses upstream failed [" + out.transportKind + "]"; out.response=errorResponse(502,out.body); return out;
         } finally {
             finishResponsesConnection(out, stream, conn, ticket, requestContext);
             out.failure=UpstreamFailure.classify(target.providerId,out.status,out.body,out.sent,false);
@@ -19629,7 +22078,9 @@ public class GatewayServer extends NanoHTTPD {
                     definiteUpstreamRejection(target.providerId,out.status,out.body));
             if(!out.ok && U_ROW.get()!=null) {
                 UsageLedger.Row row=U_ROW.get(); row.failureKind=out.failure.kind.name().toLowerCase(java.util.Locale.ROOT);
-                row.upstreamErrorCode=java.util.Arrays.asList("user_model_rate_limited","rate_limit","rate_limit_error","insufficient_quota","authentication_error","context_length_exceeded","overloaded_error","invalid_request_error").contains(out.failure.code)?out.failure.code:"";
+                recordRowFailureMeta(row, null, out.transportKind);
+                String known=java.util.Arrays.asList("user_model_rate_limited","rate_limit","rate_limit_error","insufficient_quota","authentication_error","context_length_exceeded","overloaded_error","invalid_request_error").contains(out.failure.code)?out.failure.code:"";
+                row.upstreamErrorCode=!known.isEmpty()?known:extractSafeErrorCode(out.body);
                 String retry=out.retryAfter; if(retry!=null && retry.length()<=128) row.upstreamRetryAfter=Long.toString(CommercialKeyPool.retryAfterDeadline(retry,0,0));
             }
         }
@@ -19647,6 +22098,7 @@ public class GatewayServer extends NanoHTTPD {
         Attempt out = new Attempt();
         out.providerId = target.providerId;
         out.modelRef = target.providerId + "/" + target.upstreamModel;
+        attachRowSecrets(U_ROW.get(), target, null);
         HttpURLConnection conn = null;
         boolean streamHandedOff = false;
         String codexPhase = "account_binding";
@@ -19672,6 +22124,7 @@ public class GatewayServer extends NanoHTTPD {
                 codexPhase = "credential_refresh";
                 CodexAuth.refreshToken(info, "proactive_expiry");
             }
+            attachRowSecrets(U_ROW.get(), target, info);
 
             codexPhase = "request_shape";
             String upstreamModel = target.upstreamModel != null ? target.upstreamModel : requestedModel;
@@ -19760,16 +22213,19 @@ public class GatewayServer extends NanoHTTPD {
             // Once writing starts, a partial write or missing response cannot prove non-execution.
             out.sent=true;
             out.stopFallback=true;
+            recordCallDispatched(U_ROW.get(), upstreamModel, 1);
             os.write(outboundWire.bytes);
             os.flush();
             os.close();
 
             codexPhase = "read_status";
             int statusCode = conn.getResponseCode();
+            if (statusCode > 0) recordCallReply(U_ROW.get(), statusCode, conn.getHeaderField("Retry-After"), null);
             if (statusCode == 401 && attempt < 1 && !info.refreshToken.isEmpty()) {
                 codexPhase = "refresh_after_401";
                 conn.disconnect();
                 CodexAuth.refreshToken(info, "unauthorized_recovery");
+                attachRowSecrets(U_ROW.get(), target, info);
                 if (attempt < 1) {
                     return forwardCodex(target, payload, clientWantsStream, requestedModel, maskSession, guardResult, attempt + 1);
                 }
@@ -19784,7 +22240,9 @@ public class GatewayServer extends NanoHTTPD {
             boolean okStatus = statusCode >= 200 && statusCode < 400;
             InputStream is = okStatus ? conn.getInputStream() : conn.getErrorStream();
             if (!okStatus) {
-                String errBody = readLimitedText(is, INFERENCE_ERROR_MAX_BYTES);
+                String rawErrBody = readLimitedText(is, INFERENCE_ERROR_MAX_BYTES);
+                String errBody = scrubDiagnosticText(scrubUpstreamSecrets(rawErrBody, target),
+                        U_ROW.get() == null ? null : U_ROW.get().activeSecrets);
                 boolean confirmedRejection=definiteUpstreamRejection("codex",statusCode,errBody);
                 if (errBody.contains("<html") || errBody.contains("<HTML")) {
                     try {
@@ -19800,6 +22258,13 @@ public class GatewayServer extends NanoHTTPD {
                 out.status = statusCode;
                 out.ok = false;
                 out.body = errBody;
+                recordCallReply(U_ROW.get(), statusCode, out.retryAfter, errBody);
+                recordRowFailureMeta(U_ROW.get(), "await_response_headers", statusCode <= 0 ? "no_http_status" : "http_rejection",
+                        statusCode <= 0 ? "no_http_status" : "upstream_explicit_error");
+                if (U_ROW.get() != null) {
+                    String safeCode = extractSafeErrorCode(errBody, U_ROW.get().activeSecrets);
+                    if (!safeCode.isEmpty()) U_ROW.get().upstreamErrorCode = safeCode;
+                }
                 // Only a complete structured rejection proves that another target is safe.
                 out.stopFallback=!confirmedRejection;
                 Response.IStatus codexStatus=Status.lookup(statusCode);
@@ -19820,6 +22285,7 @@ public class GatewayServer extends NanoHTTPD {
 
             out.ok = true;
             out.status = 200;
+            recordCallReply(U_ROW.get(), statusCode, null, null);
 
             codexPhase = "decode_response";
             if (nativeResponses) {
@@ -19835,27 +22301,77 @@ public class GatewayServer extends NanoHTTPD {
                 return out;
             } else {
                 BufferedReader reader = new BoundedSseReader(new InputStreamReader(is, java.nio.charset.StandardCharsets.UTF_8));
+                UsageLedger.Row codexUsage = U_ROW.get();
                 JSONObject completed = null;
                 String line;
                 while ((line = reader.readLine()) != null) {
+                    if (line.startsWith("event:")) {
+                        String evName = line.substring(6).trim();
+                        if (!evName.isEmpty()) recordRowSseEvent(codexUsage, evName);
+                        continue;
+                    }
                     if (!line.startsWith("data:")) continue;
                     String data = line.substring(5).trim();
-                    if (data.isEmpty() || "[DONE]".equals(data)) continue;
+                    if (data.isEmpty()) continue;
+                    if ("[DONE]".equals(data)) {
+                        if (codexUsage == null || codexUsage.sseTerminal == null) recordRowSseEvent(codexUsage, "[DONE]");
+                        continue;
+                    }
                     JSONObject event = new JSONObject(data);
                     String eventType = event.optString("type");
+                    if (!eventType.isEmpty()) recordRowSseEvent(codexUsage, eventType);
                     if ("response.completed".equals(eventType) || "response.incomplete".equals(eventType)) {
                         JSONObject terminal = event.optJSONObject("response");
-                        if (completed != null || terminal == null || !eventType.substring(9).equals(terminal.optString("status")))
-                            throw new IOException("Invalid Codex response terminal status");
+                        if (completed != null || !validTerminalResponsesObject(eventType, terminal)) {
+                            if (codexUsage != null) { codexUsage.sseTerminal = Boolean.FALSE; codexUsage.bridgeStatus = "failed"; codexUsage.deliveryStatus = "failed"; }
+                            recordRowFailureMeta(codexUsage, "read_response_body", "protocol", "conversion_validation_failed");
+                            throw new ProtocolResponseException();
+                        }
+                        recordRowSseTerminal(codexUsage, true);
                         completed = terminal;
                     }
-                    if ("response.failed".equals(eventType) || "error".equals(eventType)) throw new IOException("Codex response failed: " + event.opt("error"));
+                    if ("response.failed".equals(eventType) || "error".equals(eventType)) {
+                        JSONObject respObj = event.optJSONObject("response");
+                        if ("response.failed".equals(eventType) && !validTerminalResponsesObject("response.failed", respObj)) {
+                            if (codexUsage != null) { codexUsage.sseTerminal = Boolean.FALSE; codexUsage.bridgeStatus = "failed"; codexUsage.deliveryStatus = "failed"; }
+                            recordRowFailureMeta(codexUsage, "read_response_body", "protocol", "conversion_validation_failed");
+                            throw new ProtocolResponseException();
+                        }
+                        boolean validTerm = "response.failed".equals(eventType);
+                        recordRowSseTerminal(codexUsage, validTerm);
+                        recordRowFailureMeta(codexUsage, "read_response_body", "http_rejection", "upstream_explicit_error");
+                        if (codexUsage != null) {
+                            codexUsage.bridgeStatus = "upstream_aborted";
+                            codexUsage.deliveryStatus = "failed";
+                            String eCode = extractSafeErrorCode(data, codexUsage.activeSecrets);
+                            if (!eCode.isEmpty()) codexUsage.upstreamErrorCode = eCode;
+                        }
+                        String safeErr = extractStreamErrorSummary(event.has("error") ? event.opt("error") : event,
+                                codexUsage == null ? null : codexUsage.activeSecrets);
+                        throw new IOException("Codex response failed: " + safeErr);
+                    }
                 }
                 reader.close();
-                if (completed == null) throw new IOException("Codex stream ended before completion");
-                JSONObject sim = ResponsesBridge.responsesResponseToChat(completed, requestedModel);
-                UsageLedger.Row codexUsage = U_ROW.get();
-                if (codexUsage != null) absorbUsage(codexUsage, sim.optJSONObject("usage"));
+                if (completed == null) {
+                    recordRowSseTerminal(codexUsage, false);
+                    recordRowFailureMeta(codexUsage, "read_response_body", "eof", "premature_eof");
+                    if (codexUsage != null) { codexUsage.bridgeStatus = "upstream_aborted"; codexUsage.deliveryStatus = "failed"; }
+                    throw new IOException("Codex stream ended before completion");
+                }
+                JSONObject sim;
+                try {
+                    sim = ResponsesBridge.responsesResponseToChat(completed, requestedModel);
+                } catch (Exception invalid) {
+                    if (codexUsage != null) { codexUsage.bridgeStatus = "failed"; codexUsage.deliveryStatus = "failed"; }
+                    recordRowFailureMeta(codexUsage, "read_response_body", "protocol", "conversion_validation_failed");
+                    throw new ProtocolResponseException();
+                }
+                if (codexUsage != null) {
+                    absorbUsage(codexUsage, sim.optJSONObject("usage"));
+                    codexUsage.bridgeStatus = "ok";
+                    codexUsage.deliveryStatus = "unknown";
+                    logGatewayOutcomeSummary(codexUsage);
+                }
                 unmaskJson(sim, maskSession);
                 String content = extractReplyText(sim);
 
@@ -19894,12 +22410,54 @@ public class GatewayServer extends NanoHTTPD {
             return oversizedInferenceResponse(out);
         } catch (ProtocolResponseException invalid) {
             return failedProtocolAttempt(out);
+        } catch (CodexAuth.RefreshFailure rf) {
+            try { if (conn != null) conn.disconnect(); } catch (Throwable ignored) {}
+            if(conn!=null && REQUEST_CONTEXT.get()!=null) REQUEST_CONTEXT.get().detach(conn);
+            out.ok = false;
+            UsageLedger.Row cRow = U_ROW.get();
+            if (rf.signInGone) {
+                out.status = 401;
+                out.transportKind = "auth_expired";
+                recordRowFailureMeta(cRow, codexPhase, "auth_expired", "codex_sign_in_gone");
+                if (cRow != null) {
+                    if (!rf.errorCode.isEmpty()) cRow.upstreamErrorCode = rf.errorCode;
+                    if (cRow.bridgeStatus.isEmpty()) cRow.bridgeStatus = "failed";
+                    if (cRow.deliveryStatus.isEmpty()) cRow.deliveryStatus = "failed";
+                }
+                out.body = "Codex 登录态已失效，请重新登录 [" + codexPhase + "]" + (rf.errorCode.isEmpty() ? "" : " (" + rf.errorCode + ")");
+            } else {
+                out.status = 502;
+                out.transportKind = FailureLayers.transportName(rf);
+                recordRowFailureMeta(cRow, codexPhase, out.transportKind, "codex_refresh_failed");
+                if (cRow != null) {
+                    if (!rf.errorCode.isEmpty()) cRow.upstreamErrorCode = rf.errorCode;
+                    if (cRow.bridgeStatus.isEmpty()) cRow.bridgeStatus = "upstream_aborted";
+                    if (cRow.deliveryStatus.isEmpty()) cRow.deliveryStatus = "failed";
+                }
+                out.body = "Codex upstream failed [" + codexPhase + "] (" + codexFailureTypes(rf) + ")";
+            }
+            try { android.util.Log.w("Magpie", out.body); } catch(Throwable ignored) {}
+            out.response = errorResponse(out.status, out.body);
+            return out;
         } catch (Exception e) {
             try { if (conn != null) conn.disconnect(); } catch (Throwable ignored) {}
             if(conn!=null && REQUEST_CONTEXT.get()!=null) REQUEST_CONTEXT.get().detach(conn);
             out.ok = false;
             out.status = 502;
-            out.body = "Codex upstream failed [" + codexPhase + "] (" + codexFailureTypes(e) + ")";
+            out.transportKind = FailureLayers.transportName(e);
+            String mappedPhase = ("decode_response".equals(codexPhase) || "read_response".equals(codexPhase))
+                    ? "read_response_body"
+                    : ("read_status".equals(codexPhase) ? "await_response_headers" : codexPhase);
+            if ("read_response_body".equals(mappedPhase)) recordRowSseTerminal(U_ROW.get(), false);
+            String reason = classifyExceptionReason(e, mappedPhase);
+            if ("read_response_body".equals(mappedPhase) && reason.isEmpty()) reason = "premature_eof";
+            UsageLedger.Row cRow = U_ROW.get();
+            recordRowFailureMeta(cRow, mappedPhase, out.transportKind, reason);
+            if (cRow != null) {
+                if (cRow.bridgeStatus.isEmpty()) cRow.bridgeStatus = "conversion_validation_failed".equals(reason) ? "failed" : "upstream_aborted";
+                if (cRow.deliveryStatus.isEmpty()) cRow.deliveryStatus = "failed";
+            }
+            out.body = "Codex upstream failed [" + mappedPhase + "] (" + codexFailureTypes(e) + ")";
             try { android.util.Log.w("Magpie",out.body); } catch(Throwable ignored) {}
             out.response = errorResponse(502, out.body);
             return out;
@@ -19907,6 +22465,13 @@ public class GatewayServer extends NanoHTTPD {
             if(!streamHandedOff && conn!=null) try { conn.disconnect(); } catch(Throwable ignored) {}
             if(!streamHandedOff && conn!=null && REQUEST_CONTEXT.get()!=null) REQUEST_CONTEXT.get().detach(conn);
         }
+    }
+
+    private Response codexRefreshErrorResponse(CodexAuth.RefreshFailure rf) {
+        if (rf != null && rf.signInGone) {
+            return errorResponse(401, "Codex 登录态已失效，请重新登录" + (rf.errorCode.isEmpty() ? "" : " (" + rf.errorCode + ")"));
+        }
+        return errorResponse(502, "Codex credential refresh failed");
     }
 
     /** Diagnostic types only: no exception messages, account IDs, URLs, keys or request bodies. */
@@ -19922,7 +22487,7 @@ public class GatewayServer extends NanoHTTPD {
     }
 
     private InputStream convertResponsesToOpenAiStream(final InputStream responsesIs, final String model) {
-        return ResponsesBridge.responsesStreamToChat(responsesIs, model);
+        return ResponsesBridge.responsesStreamToChat(responsesIs, model, responsesStreamObserver(U_ROW.get()));
     }
 
     // Snapshot and commit under the gateway config lock; no network is performed under it.
@@ -19952,7 +22517,13 @@ public class GatewayServer extends NanoHTTPD {
                 synchronizeAccountKeyMirrors(copy,"codex");
                 // Only credentials and their owned mirrors change: preserve the same commit verdict.
                 JSONObject nextExpected = new JSONObject(target.toString());
-                AtomicConfigFile.write(configFile, copy.toString(2));
+                try {
+                    writeConfigFileGuarded(copy);
+                } catch (ConfigRecoveryBlockedException recoveryBlocked) {
+                    publishConfig(copy);
+                    expected[0] = nextExpected;
+                    return;
+                }
                 publishConfig(copy);
                 expected[0] = nextExpected;
             }
@@ -20182,6 +22753,7 @@ public class GatewayServer extends NanoHTTPD {
         Attempt out = new Attempt();
         out.providerId = target.providerId;
         out.modelRef = target.providerId + "/" + target.upstreamModel;
+        attachRowSecrets(U_ROW.get(), target, null);
         try {
             JSONObject acc = target.account;
             if (acc == null) {
@@ -20320,6 +22892,8 @@ public class GatewayServer extends NanoHTTPD {
                 }
                 errBody = AntigravityProtocol.safeError(scrubUpstreamSecrets(errBody, target), acc);
                 if(evidence!=null)evidence.reply(statusCode,upstreamWait,errBody);
+                recordCallReply(U_ROW.get(), statusCode, upstreamWait, errBody);
+                recordRowFailureMeta(U_ROW.get(), "await_response_headers", "http_rejection", "upstream_explicit_error");
                 out.body = errBody;
                 Status st = Status.lookup(statusCode) != null ? Status.lookup(statusCode) : Status.INTERNAL_ERROR;
                 Response r = newFixedLengthResponse(st, "application/json; charset=UTF-8", errBody);
@@ -20337,6 +22911,7 @@ public class GatewayServer extends NanoHTTPD {
 
             out.ok = true;
             out.status = 200;
+            recordCallReply(U_ROW.get(), statusCode, null, null);
 
             if (clientWantsStream) {
                 InputStream openAiStream = AntigravityClient.toOpenAiStream(resp.body, requestedModel,
@@ -20373,7 +22948,6 @@ public class GatewayServer extends NanoHTTPD {
             JSONObject usageObj = sim.optJSONObject("usage");
             if (usageObj != null) {
                 absorbUsage(U_ROW.get(),usageObj);
-                totalTokens.addAndGet(usageObj.optInt("total_tokens", 0));
             }
 
             if (wantsAnthropicOut()) {
@@ -20395,6 +22969,8 @@ public class GatewayServer extends NanoHTTPD {
             logException("forwardAntigravity",e);
             out.ok = false;
             out.status = 502;
+            out.transportKind = FailureLayers.transportName(e);
+            recordRowFailureMeta(U_ROW.get(), out.sent ? "read_response_body" : "open_connection", out.transportKind, classifyExceptionReason(e, out.sent ? "read_response_body" : "open_connection"));
             out.body = "Antigravity upstream failed: " + scrubUpstreamSecrets(e.getMessage(),target);
             out.response = errorResponse(502, out.body);
             return out;

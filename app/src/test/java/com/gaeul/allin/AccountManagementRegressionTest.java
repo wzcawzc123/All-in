@@ -82,7 +82,48 @@ public final class AccountManagementRegressionTest {
             before=Files.readAllBytes(f.file.toPath());Reply again=f.call("remove",new JSONObject().put("id","all"));check(again.status==200&&!again.body.optBoolean("removed")&&again.body.optInt("removedCount")==0,"repeated clear is no-op");check(Arrays.equals(before,Files.readAllBytes(f.file.toPath())),"repeated clear does not save");
         }
     }
+    static void accountEnabledToggle(String id)throws Exception {
+        try(Fixture f=new Fixture(id)) {
+            JSONObject view=f.view();String token=view.getJSONObject("providerStateTokens").getString(id);
+            check(f.call("enabled",new JSONObject().put("id","one").put("enabled",false).put("expectedStateToken","stale-token")).status==409,id+" stale state rejected on account toggle");
+            Reply disableOne=f.call("enabled",new JSONObject().put("id","one").put("enabled",false).put("expectedStateToken",token));
+            check(disableOne.status==200&&disableOne.body.optBoolean("ok")&&!disableOne.body.optBoolean("enabled",true)&&!disableOne.body.optString("stateToken","").isEmpty(),id+" disable account succeeds");
+            check(!disableOne.body.toString().contains("synthetic-access")&&!disableOne.body.toString().contains("synthetic-refresh"),id+" toggle reply contains no credential");
+            JSONObject pool=f.pool();
+            JSONObject acc1=pool.getJSONArray("accounts").getJSONObject(0);
+            check(!AccountGenerations.enabled(acc1)&&!acc1.optBoolean("enabled",true),id+" account one marked disabled");
+            check(AccountPoolPolicy.routingAccounts(pool).size()==("codex".equals(id)?0:1),id+" disabled account excluded from routing");
+            Set<String> k=keys(pool);
+            check(!k.contains("synthetic-access-one")&&k.contains("synthetic-independent"),id+" mirror removed while independent keys retained");
+            check(find(f.disk(),id).similar(pool),id+" disable persisted to disk");
+            check(f.call("enabled",new JSONObject().put("id","one").put("enabled",true).put("expectedStateToken",token)).status==409,id+" consumed token rejected");
+            // Re-enable legacy off=true account ("two") using fresh stateToken
+            String fresh=disableOne.body.getString("stateToken");
+            Reply enableTwo=f.call("enabled",new JSONObject().put("id","two").put("enabled",true).put("expectedStateToken",fresh));
+            check(enableTwo.status==200&&enableTwo.body.optBoolean("ok")&&enableTwo.body.optBoolean("enabled",false),id+" legacy off account re-enabled");
+            JSONObject acc2=f.pool().getJSONArray("accounts").getJSONObject(1);
+            check(AccountGenerations.enabled(acc2)&&!acc2.has("off"),id+" legacy off flag cleared on enable");
+            check(AccountPoolPolicy.routingAccounts(f.pool()).size()==("codex".equals(id)?1:2),id+" re-enabled account restored to routing");
+            check(keys(f.pool()).contains("synthetic-access-two"),id+" re-enabled mirror restored");
+        }
+    }
+    static void accountEnabledValidation()throws Exception {
+        try(Fixture f=new Fixture("catpaw")) {
+            byte[] before=Files.readAllBytes(f.file.toPath());
+            check(new Reply(f.server.serve(RoutingSetupOfflineTest.request("127.0.0.1","/api/auth/catpaw/enabled","GET","",null))).status==405,"GET /enabled rejected");
+            for(String bad:new String[]{"{}","bad-json","{\"id\":\"\",\"enabled\":false}","{\"id\":\"one\",\"enabled\":\"false\"}","{\"id\":\"one\",\"enabled\":true,\"extra\":1}"})
+                check(new Reply(f.server.serve(RoutingSetupOfflineTest.request("127.0.0.1","/api/auth/catpaw/enabled","POST",bad,null))).status==400,"invalid toggle body rejected: "+bad);
+            check(f.call("enabled",new JSONObject().put("id","missing").put("enabled",false)).status==404,"missing account rejected");
+            check(new Reply(f.server.serve(RoutingSetupOfflineTest.request("127.0.0.1","/api/auth/no-such-prov/enabled","POST",new JSONObject().put("id","one").put("enabled",false).toString(),null))).status==404,"missing provider rejected");
+            check(Arrays.equals(before,Files.readAllBytes(f.file.toPath())),"invalid toggle writes nothing to disk");
+            GatewayServer.setConfigWriteHookForTests(()->{throw new IllegalStateException("synthetic save failure");});
+            try{check(f.call("enabled",new JSONObject().put("id","one").put("enabled",false)).status==500,"failed save reported on toggle");}
+            finally{GatewayServer.setConfigWriteHookForTests(null);}
+            check(Arrays.equals(before,Files.readAllBytes(f.file.toPath())),"failed toggle changes neither disk nor memory");
+            check(AccountGenerations.enabled(f.pool().getJSONArray("accounts").getJSONObject(0)),"account still enabled after failed save");
+        }
+    }
     interface Test {void run()throws Exception;}
     static int run(String name,Test test){try{test.run();System.out.println("PASS "+name);return 0;}catch(Throwable e){System.out.println("FAIL "+name+": "+e.getClass().getSimpleName()+" "+e.getMessage());return 1;}}
-    public static void main(String[] args)throws Exception{int failures=0;boolean names=args.length>0&&"labels".equals(args[0]);if(!names)for(String p:PROVIDERS){failures+=run(p+" single",()->remove(p,false));failures+=run(p+" all",()->remove(p,true));}if(!names)for(String p:new String[]{"antigravity","minimax-code","trae-cn","deepseek_web"})failures+=run(p+" failures",()->failures(p));if(args.length==0||names){failures+=run("labels",AccountManagementRegressionTest::label);failures+=run("state protection",AccountManagementRegressionTest::stateProtection);}if(!names)for(String p:new String[]{"antigravity","github-copilot","workbuddy","workbuddy-ai"})failures+=run(p+" refresh then delete",()->refreshThenRemove(p));System.out.println("AccountManagementRegressionTest checks="+checks+" failures="+failures);if(failures>0)throw new AssertionError(failures+" account management scenarios failed");}
+    public static void main(String[] args)throws Exception{int failures=0;boolean names=args.length>0&&"labels".equals(args[0]);if(!names)for(String p:PROVIDERS){failures+=run(p+" single",()->remove(p,false));failures+=run(p+" all",()->remove(p,true));failures+=run(p+" toggle",()->accountEnabledToggle(p));}if(!names)for(String p:new String[]{"antigravity","minimax-code","trae-cn","deepseek_web"})failures+=run(p+" failures",()->failures(p));if(args.length==0||names){failures+=run("labels",AccountManagementRegressionTest::label);failures+=run("state protection",AccountManagementRegressionTest::stateProtection);failures+=run("toggle validation",AccountManagementRegressionTest::accountEnabledValidation);}if(!names)for(String p:new String[]{"antigravity","github-copilot","workbuddy","workbuddy-ai"})failures+=run(p+" refresh then delete",()->refreshThenRemove(p));System.out.println("AccountManagementRegressionTest checks="+checks+" failures="+failures);if(failures>0)throw new AssertionError(failures+" account management scenarios failed");}
 }

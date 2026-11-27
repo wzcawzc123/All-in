@@ -16,6 +16,7 @@ final class NativeAnthropicStream extends InputStream implements fi.iki.elonen.A
     interface Listener {
         void onEvent(JSONObject event);
         void onComplete(boolean success);
+        default void onFailure(String lastEvent, String reason, Throwable cause) {}
     }
     private static final int MAX_FRAME = 4 * 1024 * 1024;
     private static final byte[] ERROR = ("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"upstream_error\",\"message\":\"Invalid or incomplete upstream stream\"}}\n\n").getBytes(StandardCharsets.UTF_8);
@@ -31,6 +32,9 @@ final class NativeAnthropicStream extends InputStream implements fi.iki.elonen.A
     private int position;
     private volatile boolean closed;
     private boolean finished, completed, started, stopReason;
+    private volatile String lastEvent = "";
+    private volatile String failureReason = "";
+    private volatile Throwable failureCause;
     private boolean waitForDelivery, deliveryConfirmed, cleanupSucceeded;
     private final byte[] inputBuffer = new byte[8192];
     private int inputPosition, inputLimit;
@@ -53,16 +57,30 @@ final class NativeAnthropicStream extends InputStream implements fi.iki.elonen.A
         this.upstream = upstream; this.session = session; this.listener = listener; this.closeAction = closeAction;
     }
     private boolean masking() { return session != null && session.placeholderToReal != null && !session.placeholderToReal.isEmpty(); }
+    synchronized boolean isDeliveryConfirmed() { return deliveryConfirmed; }
+    synchronized boolean isUpstreamCompleted() { return finished && stopReason && position >= output.length && !"upstream_explicit_error".equals(failureReason); }
     void requireDeliveryConfirmation() { synchronized (this) { if (completed) throw new IllegalStateException("stream already completed"); waitForDelivery = true; } }
     @Override public synchronized void onWriteComplete(boolean success) {
-        if (!success || (closed && !cleanupSucceeded)) { complete(false); return; }
+        if (!success || (closed && !cleanupSucceeded)) {
+            if (!success && finished && stopReason && position >= output.length
+                    && (failureReason == null || failureReason.isEmpty())) {
+                failureReason = "downstream_write_failed";
+            }
+            complete(false);
+            return;
+        }
         deliveryConfirmed = true;
         if (finished && stopReason && position >= output.length) complete(true);
     }
     private synchronized void complete(boolean success) {
         if (completed || (success && waitForDelivery && !deliveryConfirmed)) return;
         completed = true;
-        if (listener != null) try { listener.onComplete(success); } catch (RuntimeException ignored) { }
+        if (listener != null) {
+            if (!success) {
+                try { listener.onFailure(lastEvent, failureReason, failureCause); } catch (RuntimeException ignored) { }
+            }
+            try { listener.onComplete(success); } catch (RuntimeException ignored) { }
+        }
     }
     @Override public void close() throws IOException {
         synchronized (this) { if (closed) return; closed = true; }
@@ -78,7 +96,14 @@ final class NativeAnthropicStream extends InputStream implements fi.iki.elonen.A
             if (!(cleanupSucceeded && success && waitForDelivery && !deliveryConfirmed)) complete(success);
         }
     }
-    private void fail() { output = ERROR; position = 0; finished = true; stopReason = false; complete(false); }
+    private void fail() { fail("", null); }
+    private void fail(String reason, Throwable cause) {
+        if (reason != null && !reason.isEmpty() && (this.failureReason == null || this.failureReason.isEmpty())) {
+            this.failureReason = reason;
+        }
+        if (cause != null && this.failureCause == null) this.failureCause = cause;
+        output = ERROR; position = 0; finished = true; stopReason = false; complete(false);
+    }
     private int nextByte() throws IOException {
         if (pushed >= 0) { int value = pushed; pushed = -1; return value; }
         if (inputPosition == inputLimit) {
@@ -150,6 +175,8 @@ final class NativeAnthropicStream extends InputStream implements fi.iki.elonen.A
         JSONObject obj = null;
         try { obj = new JSONObject(data.toString()); } catch (Exception ignored) { }
         String type = obj == null ? "" : obj.optString("type", "");
+        if (!type.isEmpty()) this.lastEvent = type;
+        else if (!event.isEmpty()) this.lastEvent = event;
         if (known(event) && (!event.equals(type) || obj == null)) throw new Exception();
         if (!known(type)) {
             hasToolOrRefusal = true;
@@ -162,6 +189,7 @@ final class NativeAnthropicStream extends InputStream implements fi.iki.elonen.A
         boolean changed = false;
         byte[] prefix = null;
         if ("error".equals(type)) {
+            this.failureReason = "upstream_explicit_error";
             finished = true; stopReason = false; complete(false);
         } else if ("ping".equals(type)) {
             // Ping may occur at any point.
@@ -265,8 +293,15 @@ final class NativeAnthropicStream extends InputStream implements fi.iki.elonen.A
         if (closed) throw new IOException("stream closed");
         if (position >= output.length) {
             if (finished) { complete(stopReason); return -1; }
-            try { byte[] f = frame(); if (f == null) fail(); else { output = process(f); position = 0; } }
-            catch (Exception e) { if (closed) throw new IOException("stream closed", e); fail(); }
+            try { byte[] f = frame(); if (f == null) fail("premature_eof", null); else { output = process(f); position = 0; } }
+            catch (IOException e) {
+                if (closed) throw new IOException("stream closed", e);
+                fail(GatewayServer.classifyStreamReason(e), e);
+            }
+            catch (Exception e) {
+                if (closed) throw new IOException("stream closed", e);
+                fail("conversion_validation_failed", e);
+            }
         }
         int n = Math.min(len, output.length - position); System.arraycopy(output, position, b, off, n); position += n;
         if (finished && position == output.length) complete(stopReason);

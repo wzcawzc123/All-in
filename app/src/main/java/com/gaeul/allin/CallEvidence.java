@@ -110,5 +110,5 @@ final class CallEvidence {
         }
         synchronized Snapshot snapshot(){if(frozen==null)frozen=Snapshot.parse(facts);return frozen;}
     }
-    static void freeze(UsageLedger.Row row){if(row!=null&&row.callEvidence==null&&row.callObservation!=null)row.callEvidence=row.callObservation.snapshot();}
+    static void freeze(UsageLedger.Row row){if(row==null)return;if(row.callEvidence==null&&row.callObservation!=null)row.callEvidence=row.callObservation.snapshot();row.callObservation=null;}
 }

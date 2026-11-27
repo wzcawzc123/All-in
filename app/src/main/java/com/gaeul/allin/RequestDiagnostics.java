@@ -273,11 +273,18 @@ public final class RequestDiagnostics {
         return new Snapshot(row.req,row.isAttempt()?row.prov:null,row.isAttempt()?row.model:null,null,null,null,null,null,null,null);
     }
     static void freeze(UsageLedger.Row row) {
-        if(row==null || row.diagnostics!=null) return;
+        if(row==null) return;
+        if(row.diagnostics!=null) {
+            row.diagnosticObservation=null;
+            return;
+        }
         Observation o=row.diagnosticObservation;
         if(o==null) { row.diagnostics=unobserved(row); return; }
         synchronized(o) {
-            if(row.diagnostics!=null) return;
+            if(row.diagnostics!=null) {
+                row.diagnosticObservation=null;
+                return;
+            }
             o.frozen=true;
             String execution=o.marker && o.logical!=null?o.logical.terminalExecution(o.attempts):o.executionState;
             String failure=o.marker && o.logical!=null?o.logical.terminalFailure():o.failureKind;
@@ -292,6 +299,7 @@ public final class RequestDiagnostics {
                     o.context==null?null:o.context.diagnosticResponsePhase(),execution,o.deliveryConfirmed,
                     o.context==null || o.context.quirks==null?null:o.context.quirks.ruleVersion, o.workbuddyHarness, o.workbuddyCompatibility, o.zcodeGift);
         }
+        row.diagnosticObservation=null;
     }
     public static JSONObject json(UsageLedger.Row row) { return (row.diagnostics==null?unobserved(row):row.diagnostics).json(); }
 }

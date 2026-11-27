@@ -45,7 +45,9 @@ public class UsageLedger {
     private static final String DIR = "usage";
     /** 内存里保留的天数（更早的只留在文件里） */
     private static final int MEMORY_DAYS = 90;
-    static final int MAX_RETAINED_ROWS=2048, MAX_PENDING_ROWS=512;
+    static final int MAX_RETAINED_ROWS=2048, MAX_PENDING_ROWS=512, MAX_PENDING_PATCHES=512, MAX_PATCH_CACHE=4096, MAX_PATCH_BUCKET_DEPTH=8;
+    static int patchCacheLimit = MAX_PATCH_CACHE;
+    static int patchBucketDepthLimit = MAX_PATCH_BUCKET_DEPTH;
     static final long MAX_RETAINED_BYTES=4L*1024*1024, MAX_PENDING_BYTES=1024L*1024;
     static long retainedBytes,pendingBytes,droppedPendingRows,cacheEvictions;
     static long maxFileBytes=32L*1024*1024; // Test threshold; production uses 32 MiB.
@@ -71,6 +73,7 @@ public class UsageLedger {
     static Runnable rebuildSnapshotHook;
     private static List<Row> rebuildDelta;
     private static final List<Row> unpersisted = new ArrayList<Row>();
+    private static final Map<String, DeliveryPatch> unpersistedPatches = new LinkedHashMap<String, DeliveryPatch>();
     private static long generation;
 
     private static final class HeatCounts {
@@ -154,14 +157,27 @@ public class UsageLedger {
         public transient boolean cacheInputExcludesCache, cacheInputStyleKnown;
         public transient RecentUsageScheduler.Lease recentUsageLease;
         public transient RecentUsageScheduler.Lease accountRoutingLease;
+        public transient GatewayServer liveServer;
+        public transient java.util.concurrent.atomic.AtomicBoolean entryCounted;
+        public transient boolean liveSynced;
         /** Bounded transport metadata, never prompt/header/credential material. */
         public long outboundAt, queuedMs;
         WorkBuddyFailure workBuddyFailure;
         public String failureKind="", upstreamErrorCode="", upstreamRetryAfter="";
+        public String failurePhase="", transportKind="";
+        public int upstreamHttpStatus;
+        public String lastSseEvent="";
+        public Boolean sseTerminal;
+        public String failureReason="";
+        public String bridgeStatus="";
+        public String deliveryStatus="";
+        public transient boolean upstreamSseObserved;
+        transient boolean ledgerPersisted;
         public RequestDiagnostics.Snapshot diagnostics;
         public CallEvidence.Snapshot callEvidence;
         transient CallEvidence.Builder callObservation;
         transient RequestDiagnostics.Observation diagnosticObservation;
+        transient java.util.List<String> activeSecrets;
         public boolean isLegacy() { return requestId == null || requestId.isEmpty(); }
         public boolean isTerminal() { return isLegacy() || terminal; }
         public boolean isAttempt() { return isLegacy() || attempt > 0; }
@@ -189,6 +205,76 @@ public class UsageLedger {
         public boolean failed() {
             return status >= 400 || (err != null && !err.isEmpty());
         }
+
+        public String effectiveFailurePhase() {
+            if (failurePhase != null && !failurePhase.isEmpty()) return failurePhase;
+            return workBuddyFailure != null ? workBuddyFailure.phaseName() : "";
+        }
+
+        public String effectiveFailureCause() {
+            if (transportKind != null && !transportKind.isEmpty()) return transportKind;
+            return workBuddyFailure != null ? workBuddyFailure.causeName() : "";
+        }
+
+        public int effectiveUpstreamHttpStatus() {
+            if (upstreamHttpStatus > 0) return upstreamHttpStatus;
+            return callEvidence != null ? Math.max(0, callEvidence.json().optInt("upstreamStatus", 0)) : 0;
+        }
+
+        public String effectiveLastSseEvent() {
+            return lastSseEvent == null ? "" : lastSseEvent;
+        }
+
+        public String effectiveFailureReason() {
+            if (failureReason != null && !failureReason.isEmpty()) return failureReason;
+            if (!failed()) return "";
+            String tr = effectiveFailureCause();
+            String ph = effectiveFailurePhase();
+            String fk = failureKind == null ? "" : failureKind;
+            String errLower = err == null ? "" : err.toLowerCase(Locale.ROOT);
+            if ("tls".equals(tr)) return "tls_error";
+            if ("timeout".equals(tr)) return "open_connection".equals(ph) ? "connect_timeout" : "read_timeout";
+            if ("eof".equals(tr)) return "premature_eof";
+            if ("protocol".equals(tr)) return "conversion_validation_failed";
+            if ("http_rejection".equals(tr)) return "upstream_explicit_error";
+            if ("local_rejection".equals(tr)) {
+                if ("outbound_admission".equals(ph) || "admission".equals(fk)) {
+                    if (errLower.contains("unsupported") || errLower.contains("invalid") || errLower.contains("convert")) {
+                        return "conversion_validation_failed";
+                    }
+                    return "admission_rejected";
+                }
+                return "conversion_validation_failed";
+            }
+            if ("cancelled".equals(tr) || "cancelled".equals(fk)) return "downstream_cancelled";
+            if ("dns".equals(tr)) return "dns_error";
+            if ("refused".equals(tr)) return "connection_refused";
+            if ("reset".equals(tr)) return "connection_reset";
+            if ("network".equals(tr)) return "network_error";
+            if ("no_http_status".equals(tr)) return "no_http_status";
+            if (sseTerminal == Boolean.FALSE) {
+                if (errLower.contains("invalid") || errLower.contains("unsupported") || errLower.contains("convert")) {
+                    return "conversion_validation_failed";
+                }
+                if ((errLower.contains("error") || errLower.contains("failed")) && !errLower.contains("before") && !errLower.contains("incomplete")) {
+                    return "upstream_explicit_error";
+                }
+                return "premature_eof";
+            }
+            if (errLower.contains("timed out") || errLower.contains("timeout") || "deadline".equals(fk)) return "read_timeout";
+            if (errLower.contains("ssl") || errLower.contains("tls") || errLower.contains("certificate")) return "tls_error";
+            if (errLower.contains("invalid") || errLower.contains("unsupported") || errLower.contains("cannot convert")) return "conversion_validation_failed";
+            if (effectiveUpstreamHttpStatus() >= 400 || (status >= 400 && status != 499 && status != 502 && status != 503 && status != 504)) {
+                return "upstream_explicit_error";
+            }
+            return "";
+        }
+
+        public boolean isReadTimeout() { return "read_timeout".equals(effectiveFailureReason()); }
+        public boolean isTlsError() { return "tls_error".equals(effectiveFailureReason()); }
+        public boolean isPrematureEof() { return "premature_eof".equals(effectiveFailureReason()); }
+        public boolean isUpstreamExplicitError() { return "upstream_explicit_error".equals(effectiveFailureReason()); }
+        public boolean isConversionValidationFailed() { return "conversion_validation_failed".equals(effectiveFailureReason()); }
 
         public long tokens() {
             return (long) in + out;
@@ -343,12 +429,12 @@ public class UsageLedger {
     public static void init(File filesDir) {
         synchronized(REBUILD_LOCK) {
             synchronized(LOCK) {
-                closeWriter();baseDir=new File(filesDir,DIR);DAYS.clear();unpersisted.clear();fileRanges.clear();
+                closeWriter();baseDir=new File(filesDir,DIR);DAYS.clear();unpersisted.clear();unpersistedPatches.clear();fileRanges.clear();
                 heatDays.clear();lostHours.clear();retainedBytes=pendingBytes=0;
                 droppedPendingRows=cacheEvictions=aggregateOverflowRows=0;gapsDirty=gapStateUncertain=false;
                 firstTimestamp=Long.MAX_VALUE;invalidLines=readErrors=persistenceErrors=uncertainWrites=0;
                 if(!baseDir.exists()&&!baseDir.mkdirs())persistenceErrors++;
-                loadGaps();generation++;initializing=false;LOCK.notifyAll();
+                loadGaps();generation++;ledgerMayHavePatches=true;initializing=false;LOCK.notifyAll();
             }
             // Deterministic init concurrency seam: records may arrive here, never counted twice.
             Runnable hook=rebuildSnapshotHook;if(hook!=null)hook.run();
@@ -405,23 +491,283 @@ public class UsageLedger {
     // Only cache clean, completed scans of immutable (rotated) files.
     private static final Map<File, LedgerRange> fileRanges = new LinkedHashMap<>();
     private static final int MAX_FILE_RANGES = 256;
+    private static volatile boolean ledgerMayHavePatches = true;
     private static final class LedgerRange {
         final long length, modified, first, last;
-        LedgerRange(long length, long modified, long first, long last) {
-            this.length = length; this.modified = modified; this.first = first; this.last = last;
+        final boolean hasPatches;
+        LedgerRange(long length, long modified, long first, long last, boolean hasPatches) {
+            this.length = length; this.modified = modified; this.first = first; this.last = last; this.hasPatches = hasPatches;
         }
         boolean matches(long length, long modified) { return this.length == length && this.modified == modified; }
     }
 
-    private static long visitRows(long from,long through,RowVisitor visitor) {
+    private static final class DeliveryPatch {
+        final String requestId;
+        final int attempt;
+        final long t;
+        final String deliveryStatus;
+        final int status;
+        final String err;
+        final String failurePhase;
+        final String transportKind;
+        final String failureReason;
+        final String bridgeStatus;
+        DeliveryPatch(String requestId, int attempt, long t, String deliveryStatus, int status,
+                      String err, String failurePhase, String transportKind, String failureReason) {
+            this(requestId, attempt, t, deliveryStatus, status, err, failurePhase, transportKind, failureReason, "");
+        }
+        DeliveryPatch(String requestId, int attempt, long t, String deliveryStatus, int status,
+                      String err, String failurePhase, String transportKind, String failureReason, String bridgeStatus) {
+            this.requestId = requestId;
+            this.attempt = attempt;
+            this.t = t;
+            this.deliveryStatus = deliveryStatus == null ? "" : deliveryStatus;
+            this.status = status;
+            this.err = err == null ? "" : err;
+            this.failurePhase = failurePhase == null ? "" : failurePhase;
+            this.transportKind = transportKind == null ? "" : transportKind;
+            this.failureReason = failureReason == null ? "" : failureReason;
+            this.bridgeStatus = bridgeStatus == null ? "" : bridgeStatus;
+        }
+        String key() { return requestId + "#" + attempt; }
+        void apply(Row r) {
+            if (r == null) return;
+            boolean delivered = "delivered".equals(deliveryStatus);
+            boolean conversionPatch = "conversion".equals(failurePhase) || "failed".equals(bridgeStatus);
+            boolean errorDeliveryOnly = status == 0 && "upstream_aborted".equals(bridgeStatus)
+                    && failurePhase.isEmpty() && transportKind.isEmpty() && failureReason.isEmpty();
+            if (delivered && !conversionPatch && !errorDeliveryOnly && r.failed()) return;
+            if (!deliveryStatus.isEmpty()) r.deliveryStatus = deliveryStatus;
+            if (!bridgeStatus.isEmpty() && (r.bridgeStatus == null || r.bridgeStatus.isEmpty()
+                    || (!errorDeliveryOnly && ("ok".equals(r.bridgeStatus) || "failed".equals(bridgeStatus))))) {
+                r.bridgeStatus = bridgeStatus;
+            }
+            if (!delivered || conversionPatch) {
+                if (status >= 400 && (r.status < 400 || conversionPatch)) r.status = status;
+                if (!err.isEmpty() && (r.err == null || r.err.isEmpty())) r.err = err;
+                String existingPhase = r.effectiveFailurePhase();
+                String existingCause = r.effectiveFailureCause();
+                String existingReason = r.effectiveFailureReason();
+                boolean upstreamAlreadyFailed = r.failed() && !"downstream_delivery".equals(existingPhase)
+                        && (!existingPhase.isEmpty() || !existingCause.isEmpty() || !existingReason.isEmpty()
+                        || r.effectiveUpstreamHttpStatus() >= 400);
+                boolean patchIsDownstream = "downstream_delivery".equals(failurePhase);
+                boolean canUpgradeDownstream = "downstream_delivery".equals(existingPhase) && !patchIsDownstream;
+                if (!failurePhase.isEmpty() && (!patchIsDownstream || !upstreamAlreadyFailed)
+                        && (existingPhase.isEmpty() || canUpgradeDownstream)) {
+                    r.failurePhase = failurePhase;
+                }
+                if (!transportKind.isEmpty() && (!patchIsDownstream || !upstreamAlreadyFailed)
+                        && (existingCause.isEmpty() || canUpgradeDownstream)) {
+                    r.transportKind = transportKind;
+                }
+                if (!failureReason.isEmpty() && (!patchIsDownstream || !upstreamAlreadyFailed)
+                        && (existingReason.isEmpty() || canUpgradeDownstream)) {
+                    r.failureReason = failureReason;
+                }
+            }
+        }
+    }
+
+    private static DeliveryPatch parseDeliveryPatch(String line) {
+        if (line == null || !line.startsWith("{") || !line.contains("\"_patch\"")) return null;
+        try {
+            JSONObject o = new JSONObject(line);
+            if (!"delivery".equals(o.optString("_patch"))) return null;
+            String reqId = o.optString("requestId", "");
+            int attempt = o.optInt("attempt", -1);
+            if (reqId.isEmpty() || attempt < 0) return null;
+            return new DeliveryPatch(reqId, attempt, o.optLong("t", 0L),
+                    o.optString("deliveryStatus", ""), o.optInt("st", 0),
+                    o.optString("err", ""), o.optString("failurePhase", ""),
+                    o.optString("transportKind", ""), o.optString("failureReason", ""),
+                    o.optString("bridgeStatus", ""));
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static String toDeliveryPatchJson(DeliveryPatch p) {
+        JSONObject o = new JSONObject();
+        try {
+            o.put("_patch", "delivery");
+            o.put("requestId", p.requestId);
+            o.put("attempt", p.attempt);
+            if (p.t > 0) o.put("t", p.t);
+            if (!p.deliveryStatus.isEmpty()) o.put("deliveryStatus", shorten(p.deliveryStatus, 32));
+            if (p.status >= 400) o.put("st", p.status);
+            if (!p.err.isEmpty()) o.put("err", shorten(p.err, 256));
+            if (!p.failurePhase.isEmpty()) o.put("failurePhase", shorten(p.failurePhase, 48));
+            if (!p.transportKind.isEmpty()) o.put("transportKind", shorten(p.transportKind, 48));
+            if (!p.failureReason.isEmpty()) o.put("failureReason", shorten(p.failureReason, 64));
+            if (!p.bridgeStatus.isEmpty()) o.put("bridgeStatus", shorten(p.bridgeStatus, 32));
+        } catch (Exception ignored) { }
+        return o.toString();
+    }
+
+    private static final int APPEND_OK = 0;
+    private static final int APPEND_FAILED_ROLLED_BACK = 1;
+    private static final int APPEND_FAILED_UNCERTAIN = 2;
+
+    private static boolean appendRawLine(String line) {
+        return appendRawLineResult(line) != APPEND_FAILED_ROLLED_BACK;
+    }
+
+    private static int appendRawLineResult(String line) {
+        long before=-1;
+        try {
+            if(writer==null||!monthKey(System.currentTimeMillis()).equals(currentMonth)||currentFile.length()>=maxFileBytes)openWriter();
+            if(writer==null)throw new IOException("Ledger writer unavailable");
+            if(gapsDirty)saveGaps();
+            before=currentFile.length();
+            if(line.length()>512*1024)throw new IOException("Ledger row size limit");
+            writer.write(line);writer.write("\n");writer.flush();return APPEND_OK;
+        } catch(Exception failure) {
+            persistenceErrors++;closeWriter();boolean rolledBack=false;
+            if(before>=0&&currentFile!=null)try{if(rollbackHook!=null)rolledBack=rollbackHook.rollback(currentFile,before);else try(RandomAccessFile file=new RandomAccessFile(currentFile,"rw")){file.setLength(before);rolledBack=file.length()==before;}}catch(Exception ignored){}
+            if(before>=0&&!rolledBack){uncertainWrites++;return APPEND_FAILED_UNCERTAIN;}return APPEND_FAILED_ROLLED_BACK;
+        }
+    }
+
+    private static File[] sortLedgerFiles(File[] found) {
+        if (found == null) return new File[0];
+        List<File> list = new ArrayList<>();
+        for (File f : found) {
+            if (f != null && f.getName().startsWith("ledger-") && f.getName().endsWith(".jsonl")) list.add(f);
+        }
+        list.sort((a, b) -> {
+            String na = a.getName(), nb = b.getName();
+            String ma = na.length() >= 13 ? na.substring(7, 13) : na;
+            String mb = nb.length() >= 13 ? nb.substring(7, 13) : nb;
+            int mc = ma.compareTo(mb);
+            if (mc != 0) return mc;
+            return Integer.compare(fileSequence(na), fileSequence(nb));
+        });
+        return list.toArray(new File[0]);
+    }
+
+    private static int fileSequence(String name) {
+        int dash = name.indexOf('-', 7);
+        if (dash < 0) return 0;
+        try { return Integer.parseInt(name.substring(dash + 1, name.length() - 6)); }
+        catch (NumberFormatException ignored) { return 0; }
+    }
+
+    private static final class BucketFilter {
+        final int mod;
+        final int rem;
+        final int salt;
+        final BucketFilter parent;
+        BucketFilter(int mod, int rem, int salt, BucketFilter parent) {
+            this.mod = mod; this.rem = rem; this.salt = salt; this.parent = parent;
+        }
+        boolean matches(String key) {
+            if (parent != null && !parent.matches(key)) return false;
+            if (mod <= 1) return true;
+            int h = salt == 0 ? key.hashCode() : mixHash(key, salt);
+            return (h & 0x7fffffff) % mod == rem;
+        }
+    }
+
+    private static int mixHash(String s, int salt) {
+        int h = 0x811c9dc5 ^ (salt * 0x9e3779b9);
+        for (int i = 0; i < s.length(); i++) {
+            h ^= s.charAt(i);
+            h *= 0x01000193;
+        }
+        h ^= (h >>> 16);
+        return h;
+    }
+
+    private static final class PatchScanResult {
+        Map<String, DeliveryPatch> patches;
+        boolean anyFileHasPatches;
+        boolean overflowed;
+        int inWindowLines;
+    }
+
+    private static PatchScanResult scanPatches(File[] files, long[] lengths, long[] modified, LedgerRange[] ranges,
+                                             List<DeliveryPatch> pendingPatches, long from, long through,
+                                             BucketFilter filter, boolean checkDisk) {
+        PatchScanResult res = new PatchScanResult();
+        if (checkDisk) {
+            for (int i = 0; i < files.length; i++) {
+                File f = files[i];
+                if (!f.getName().startsWith("ledger-") || !f.getName().endsWith(".jsonl")) continue;
+                LedgerRange known = ranges[i];
+                if (known != null && known.matches(lengths[i], modified[i]) && !known.hasPatches) continue;
+                final long prefix = lengths[i];
+                try (InputStream raw = new FileInputStream(f);
+                     InputStream bounded = new java.io.FilterInputStream(raw) {
+                         long left = prefix;
+                         public int read() throws IOException { if (left <= 0) return -1; int n = in.read(); if (n < 0) throw new EOFException("Ledger file shortened"); left--; return n; }
+                         public int read(byte[] b, int off, int len) throws IOException { if (len == 0) return 0; if (left <= 0) return -1; int n = in.read(b, off, (int) Math.min(left, len)); if (n < 0) throw new EOFException("Ledger file shortened"); left -= n; return n; }
+                     };
+                     BoundedSseReader reader = new BoundedSseReader(new InputStreamReader(bounded, "UTF-8"), 512 * 1024)) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        DeliveryPatch patch = parseDeliveryPatch(line.trim());
+                        if (patch == null) continue;
+                        res.anyFileHasPatches = true;
+                        if (patch.t > 0 && (patch.t < from || patch.t > through)) continue;
+                        String key = patch.key();
+                        if (filter != null && !filter.matches(key)) continue;
+                        res.inWindowLines++;
+                        if (res.overflowed) continue;
+                        if (res.patches == null) res.patches = new LinkedHashMap<>();
+                        if (res.patches.size() >= Math.max(1, patchCacheLimit) && !res.patches.containsKey(key)) {
+                            res.overflowed = true;
+                            res.patches = null;
+                            continue;
+                        }
+                        res.patches.put(key, patch);
+                    }
+                } catch (Exception ignored) { }
+            }
+        }
+        if (pendingPatches != null && !pendingPatches.isEmpty()) {
+            for (DeliveryPatch patch : pendingPatches) {
+                if (patch == null) continue;
+                if (patch.t > 0 && (patch.t < from || patch.t > through)) continue;
+                String key = patch.key();
+                if (filter != null && !filter.matches(key)) continue;
+                res.inWindowLines++;
+                if (res.overflowed) continue;
+                if (res.patches == null) res.patches = new LinkedHashMap<>();
+                if (res.patches.size() >= Math.max(1, patchCacheLimit) && !res.patches.containsKey(key)) {
+                    res.overflowed = true;
+                    res.patches = null;
+                    continue;
+                }
+                res.patches.put(key, patch);
+            }
+        }
+        return res;
+    }
+
+    private static final class VisitResult {
+        final long firstInTime;
+        final boolean patchBucketOverflow;
+        VisitResult(long firstInTime, boolean patchBucketOverflow) {
+            this.firstInTime = firstInTime;
+            this.patchBucketOverflow = patchBucketOverflow;
+        }
+    }
+
+    private static long visitRows(long from, long through, RowVisitor visitor) {
+        return visitRowsWithState(from, through, visitor).firstInTime;
+    }
+
+    private static VisitResult visitRowsWithState(long from, long through, RowVisitor visitor) {
         final File[] files;
         final long[] lengths, modified;
         final LedgerRange[] ranges;
         final List<Row> pending;
+        final List<DeliveryPatch> pendingPatches;
         final long scanGeneration;
+        final boolean checkPatches;
         synchronized (LOCK) {
-            File[] found = baseDir == null ? null : baseDir.listFiles();
-            files = found == null ? new File[0] : found;
+            files = sortLedgerFiles(baseDir == null ? null : baseDir.listFiles());
             lengths = new long[files.length];
             modified = new long[files.length];
             ranges = new LedgerRange[files.length];
@@ -432,43 +778,59 @@ public class UsageLedger {
                 if (!file.equals(currentFile)) ranges[i] = fileRanges.get(file);
             }
             pending = new ArrayList<>(unpersisted);
+            pendingPatches = unpersistedPatches.isEmpty() ? Collections.emptyList() : new ArrayList<>(unpersistedPatches.values());
             scanGeneration = generation;
+            checkPatches = ledgerMayHavePatches;
         }
-        long bad=0,errors=0,first=Long.MAX_VALUE,firstInTime=Long.MAX_VALUE;
-        for (int i = 0; i < files.length; i++) {
-            File f=files[i];if(!f.getName().startsWith("ledger-")||!f.getName().endsWith(".jsonl"))continue;
-            final long prefix=lengths[i];
-            LedgerRange known = ranges[i];
-            if (known != null && known.matches(prefix, modified[i]) && (known.last < from || known.first > through)) {
-                first = Math.min(first, known.first);
-                if (known.first <= through) firstInTime = Math.min(firstInTime, known.first);
-                continue;
-            }
-            long fileFirst = Long.MAX_VALUE, fileLast = Long.MIN_VALUE, badBefore = bad;
-            try(InputStream raw=new FileInputStream(f);InputStream bounded=new java.io.FilterInputStream(raw){long left=prefix;
-                public int read()throws java.io.IOException{if(left<=0)return -1;int n=in.read();if(n<0)throw new EOFException("Ledger file shortened");left--;return n;}
-                public int read(byte[] b,int off,int len)throws java.io.IOException{if(len==0)return 0;if(left<=0)return -1;int n=in.read(b,off,(int)Math.min(left,len));if(n<0)throw new EOFException("Ledger file shortened");left-=n;return n;}};
-                BoundedSseReader reader=new BoundedSseReader(new InputStreamReader(bounded,"UTF-8"),512*1024)){
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    Row r = parse(line.trim());
-                    if (r == null || r.t <= 0) { bad++; continue; }
-                    fileFirst = Math.min(fileFirst, r.t);
-                    if (r.t <= through) firstInTime = Math.min(firstInTime, r.t);
-                    fileLast = Math.max(fileLast, r.t);
-                    if (r.t >= from && r.t <= through) visitor.accept(r);
-                }
-                if (bad == badBefore) synchronized (LOCK) {
-                    if (generation == scanGeneration && !f.equals(currentFile) && f.length() == prefix && f.lastModified() == modified[i]) {
-                        if (fileRanges.size() >= MAX_FILE_RANGES && !fileRanges.containsKey(f))
-                            fileRanges.remove(fileRanges.keySet().iterator().next());
-                        fileRanges.put(f, new LedgerRange(prefix, modified[i], fileFirst, fileLast));
+
+        PatchScanResult initialScan = null;
+        int buckets = 1;
+        if (checkPatches || !pendingPatches.isEmpty()) {
+            initialScan = scanPatches(files, lengths, modified, ranges, pendingPatches, from, through, null, checkPatches);
+            if (!initialScan.anyFileHasPatches && pendingPatches.isEmpty()) {
+                synchronized (LOCK) {
+                    if (generation == scanGeneration && unpersisted.isEmpty() && unpersistedPatches.isEmpty()) {
+                        ledgerMayHavePatches = false;
                     }
                 }
-            } catch (Exception e) { errors++; }
-            first = Math.min(first, fileFirst);
+            }
+            if (initialScan.overflowed) {
+                int targetPerBucket = Math.max(1, Math.max(1, patchCacheLimit) / 2);
+                buckets = Math.max(2, (initialScan.inWindowLines + targetPerBucket - 1) / targetPerBucket);
+            }
+        }
+
+        long bad=0,errors=0,first=Long.MAX_VALUE,firstInTime=Long.MAX_VALUE;
+        boolean[] metadataDone = {false};
+        boolean[] patchOverflow = {false};
+        if (buckets == 1) {
+            long[] stats = visitFilesForBucket(files, lengths, modified, ranges, scanGeneration, from, through, visitor,
+                    initialScan == null ? null : initialScan.patches, null, true, new long[]{bad, errors, first, firstInTime});
+            if (stats != null) {
+                bad = stats[0]; errors = stats[1]; first = stats[2]; firstInTime = stats[3];
+            }
+            metadataDone[0] = true;
+        } else {
+            long[] stats = {bad, errors, first, firstInTime};
+            for (int bucket = 0; bucket < buckets; bucket++) {
+                BucketFilter filter = new BucketFilter(buckets, bucket, 0, null);
+                visitBucketNode(files, lengths, modified, ranges, scanGeneration, from, through, visitor,
+                        pendingPatches, checkPatches, filter, bucket == 0, 1, metadataDone, stats, patchOverflow);
+            }
+            bad = stats[0]; errors = stats[1]; first = stats[2]; firstInTime = stats[3];
+        }
+        Map<String, DeliveryPatch> pendingPatchMap = null;
+        if (!pendingPatches.isEmpty() && !pending.isEmpty()) {
+            pendingPatchMap = new LinkedHashMap<>();
+            for (DeliveryPatch p : pendingPatches) {
+                if (p != null) pendingPatchMap.put(p.key(), p);
+            }
         }
         for (Row r : pending) {
+            if (pendingPatchMap != null && r.requestId != null && !r.requestId.isEmpty()) {
+                DeliveryPatch p = pendingPatchMap.get(r.requestId + "#" + r.attempt);
+                if (p != null) p.apply(r);
+            }
             first = Math.min(first, r.t);
             if (r.t <= through) firstInTime = Math.min(firstInTime, r.t);
             if (r.t >= from && r.t <= through) visitor.accept(r);
@@ -478,9 +840,106 @@ public class UsageLedger {
                 invalidLines=bad;readErrors=errors;firstTimestamp=Math.min(firstTimestamp,first);
             }
         }
-        return firstInTime;
+        return new VisitResult(firstInTime, patchOverflow[0]);
     }
-    private static long estimate(Row r){if(r.ledgerEstimate>0)return r.ledgerEstimate;long n=768;for(String v:new String[]{r.prov,r.model,r.req,r.err,r.ep,r.session,r.requestId,r.credentialId,r.accountId,r.failureKind,r.upstreamErrorCode,r.upstreamRetryAfter})if(v!=null)n+=2L*v.length();if(r.diagnostics!=null)n+=2L*r.diagnostics.json().toString().length();if(r.callEvidence!=null)n+=2L*r.callEvidence.json().toString().length();r.ledgerEstimate=n;return n;}
+
+    private static void visitBucketNode(File[] files, long[] lengths, long[] modified, LedgerRange[] ranges,
+                                        long scanGeneration, long from, long through, RowVisitor visitor,
+                                        List<DeliveryPatch> pendingPatches, boolean checkPatches,
+                                        BucketFilter filter, boolean includeLegacy, int depth,
+                                        boolean[] metadataDone, long[] stats, boolean[] patchOverflow) {
+        PatchScanResult scan = scanPatches(files, lengths, modified, ranges, pendingPatches, from, through, filter, checkPatches);
+        if (scan.overflowed && depth <= Math.max(0, patchBucketDepthLimit)) {
+            int fanout = 4;
+            for (int sub = 0; sub < fanout; sub++) {
+                BucketFilter child = new BucketFilter(fanout, sub, depth, filter);
+                visitBucketNode(files, lengths, modified, ranges, scanGeneration, from, through, visitor,
+                        pendingPatches, checkPatches, child, includeLegacy && sub == 0, depth + 1, metadataDone, stats, patchOverflow);
+            }
+            return;
+        }
+        if (scan.overflowed) patchOverflow[0] = true;
+        boolean trackMeta = !metadataDone[0];
+        if (trackMeta) metadataDone[0] = true;
+        long[] res = visitFilesForBucket(files, lengths, modified, ranges, scanGeneration, from, through, visitor,
+                scan.patches, filter, includeLegacy, trackMeta ? stats : null);
+        if (trackMeta && res != null) {
+            System.arraycopy(res, 0, stats, 0, 4);
+        }
+    }
+
+    private static long[] visitFilesForBucket(File[] files, long[] lengths, long[] modified, LedgerRange[] ranges,
+                                              long scanGeneration, long from, long through, RowVisitor visitor,
+                                              Map<String, DeliveryPatch> patches, BucketFilter filter,
+                                              boolean includeLegacy, long[] outStats) {
+        long bad = outStats != null ? outStats[0] : 0;
+        long errors = outStats != null ? outStats[1] : 0;
+        long first = outStats != null ? outStats[2] : Long.MAX_VALUE;
+        long firstInTime = outStats != null ? outStats[3] : Long.MAX_VALUE;
+        boolean trackMetadata = outStats != null;
+        for (int i = 0; i < files.length; i++) {
+            File f = files[i];
+            if (!f.getName().startsWith("ledger-") || !f.getName().endsWith(".jsonl")) continue;
+            final long prefix = lengths[i];
+            LedgerRange known = ranges[i];
+            if (known != null && known.matches(prefix, modified[i]) && (known.last < from || known.first > through)) {
+                if (trackMetadata) {
+                    first = Math.min(first, known.first);
+                    if (known.first <= through) firstInTime = Math.min(firstInTime, known.first);
+                }
+                continue;
+            }
+            long fileFirst = Long.MAX_VALUE, fileLast = Long.MIN_VALUE, badBefore = bad;
+            boolean fileHasPatches = false;
+            try (InputStream raw = new FileInputStream(f);
+                 InputStream bounded = new java.io.FilterInputStream(raw) {
+                     long left = prefix;
+                     public int read() throws java.io.IOException { if (left <= 0) return -1; int n = in.read(); if (n < 0) throw new EOFException("Ledger file shortened"); left--; return n; }
+                     public int read(byte[] b, int off, int len) throws java.io.IOException { if (len == 0) return 0; if (left <= 0) return -1; int n = in.read(b, off, (int) Math.min(left, len)); if (n < 0) throw new EOFException("Ledger file shortened"); left -= n; return n; }
+                 };
+                 BoundedSseReader reader = new BoundedSseReader(new InputStreamReader(bounded, "UTF-8"), 512 * 1024)) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    String trimmed = line.trim();
+                    DeliveryPatch patch = parseDeliveryPatch(trimmed);
+                    if (patch != null) {
+                        fileHasPatches = true;
+                        if (trackMetadata && patch.t > 0) {
+                            fileFirst = Math.min(fileFirst, patch.t);
+                            fileLast = Math.max(fileLast, patch.t);
+                        }
+                        continue;
+                    }
+                    Row r = parse(trimmed);
+                    if (r == null || r.t <= 0) { if (trackMetadata) bad++; continue; }
+                    if (trackMetadata) {
+                        fileFirst = Math.min(fileFirst, r.t);
+                        if (r.t <= through) firstInTime = Math.min(firstInTime, r.t);
+                        fileLast = Math.max(fileLast, r.t);
+                    }
+                    if (r.t < from || r.t > through) continue;
+                    String rowKey = (r.requestId == null || r.requestId.isEmpty()) ? null : (r.requestId + "#" + r.attempt);
+                    boolean inBucket = filter == null ? true : (rowKey == null ? includeLegacy : filter.matches(rowKey));
+                    if (!inBucket) continue;
+                    if (patches != null && rowKey != null) {
+                        DeliveryPatch p = patches.get(rowKey);
+                        if (p != null) p.apply(r);
+                    }
+                    visitor.accept(r);
+                }
+                if (trackMetadata && bad == badBefore) synchronized (LOCK) {
+                    if (generation == scanGeneration && !f.equals(currentFile) && f.length() == prefix && f.lastModified() == modified[i]) {
+                        if (fileRanges.size() >= MAX_FILE_RANGES && !fileRanges.containsKey(f))
+                            fileRanges.remove(fileRanges.keySet().iterator().next());
+                        fileRanges.put(f, new LedgerRange(prefix, modified[i], fileFirst, fileLast, fileHasPatches));
+                    }
+                }
+            } catch (Exception e) { if (trackMetadata) errors++; }
+            if (trackMetadata) first = Math.min(first, fileFirst);
+        }
+        return trackMetadata ? new long[]{bad, errors, first, firstInTime} : null;
+    }
+    private static long estimate(Row r){if(r.ledgerEstimate>0)return r.ledgerEstimate;long n=768;for(String v:new String[]{r.prov,r.model,r.req,r.err,r.ep,r.session,r.requestId,r.credentialId,r.accountId,r.failureKind,r.upstreamErrorCode,r.upstreamRetryAfter,r.failurePhase,r.transportKind,r.lastSseEvent,r.failureReason})if(v!=null)n+=2L*v.length();if(r.diagnostics!=null)n+=2L*r.diagnostics.json().toString().length();if(r.callEvidence!=null)n+=2L*r.callEvidence.json().toString().length();r.ledgerEstimate=n;return n;}
     private static void retain(Row r){
         long cutoff=System.currentTimeMillis()-MEMORY_DAYS*86400000L;
         for(java.util.Iterator<Map.Entry<String,List<Row>>> it=DAYS.entrySet().iterator();it.hasNext();){List<Row> rows=it.next().getValue();for(java.util.Iterator<Row> q=rows.iterator();q.hasNext();){Row old=q.next();if(old.t<cutoff){retainedBytes-=estimate(old);q.remove();cacheEvictions++;}}if(rows.isEmpty())it.remove();}
@@ -524,16 +983,44 @@ public class UsageLedger {
         }catch(Exception bad){persistenceErrors++;gapStateUncertain=true;}
     }
     private static boolean append(Row r){
-        long before=-1;try{if(writer==null||!monthKey(System.currentTimeMillis()).equals(currentMonth)||currentFile.length()>=maxFileBytes)openWriter();if(writer==null)throw new IOException("Ledger writer unavailable");
-            if(gapsDirty)saveGaps();before=currentFile.length();String line=toJsonLine(r);if(line.length()>512*1024)throw new IOException("Ledger row size limit");writer.write(line);writer.write("\n");writer.flush();return true;
-        }catch(Exception failure){persistenceErrors++;closeWriter();boolean rolledBack=false;
-            if(before>=0&&currentFile!=null)try{if(rollbackHook!=null)rolledBack=rollbackHook.rollback(currentFile,before);else try(RandomAccessFile file=new RandomAccessFile(currentFile,"rw")){file.setLength(before);rolledBack=file.length()==before;}}catch(Exception ignored){}
-            if(before>=0&&!rolledBack){uncertainWrites++;return true;}return false;}
+        boolean ok = appendRawLine(toJsonLine(r));
+        if (ok) r.ledgerPersisted = true;
+        return ok;
     }
     private static String limitedKey(Map<?,?> map,String key){return map.containsKey(key)||map.size()<1024?key:"（其它：分组容量限制）";}
-    private static List<Row> newest(long from,long through,int limit){final java.util.PriorityQueue<Row> heap=new java.util.PriorityQueue<>(Math.max(1,limit),Comparator.comparingLong(r->r.t));
-        visitRows(from,through,r->{if(heap.size()<limit)heap.add(r);else if(r.t>heap.peek().t){heap.poll();heap.add(r);}});List<Row> out=new ArrayList<>(heap);out.sort((a,b)->Long.compare(b.t,a.t));return out;}
-    private static JSONObject storageState(){synchronized(LOCK){return new JSONObject().put("retainedRows",DAYS.values().stream().mapToInt(List::size).sum()).put("retainedBytes",retainedBytes).put("pendingRows",unpersisted.size()).put("pendingBytes",pendingBytes).put("droppedPendingRows",droppedPendingRows).put("aggregateOverflowRows",aggregateOverflowRows).put("cacheEvictions",cacheEvictions).put("complete",!gapStateUncertain&&droppedPendingRows==0&&uncertainWrites==0&&readErrors==0&&invalidLines==0);}}
+    private static final class FilteredRowsResult {
+        final List<Row> rows;
+        final boolean patchBucketOverflow;
+        FilteredRowsResult(List<Row> rows, boolean patchBucketOverflow) {
+            this.rows = rows;
+            this.patchBucketOverflow = patchBucketOverflow;
+        }
+    }
+    static final class QueryRows {
+        final JSONArray rows;
+        final boolean patchBucketOverflow;
+        QueryRows(JSONArray rows, boolean patchBucketOverflow) {
+            this.rows = rows;
+            this.patchBucketOverflow = patchBucketOverflow;
+        }
+    }
+    private static List<Row> newest(long from,long through,int limit){return newestFiltered(from,through,limit,false,null);}
+    private static FilteredRowsResult newestFilteredWithState(long from,long through,int limit,boolean failedOnly,String providerFilter){
+        final int cap=Math.max(1,limit);
+        final String provMatch=providerFilter==null?null:providerFilter.trim();
+        final java.util.PriorityQueue<Row> heap=new java.util.PriorityQueue<>(cap,Comparator.comparingLong(r->r.t));
+        VisitResult visit = visitRowsWithState(from,through,r->{
+            if(failedOnly && !r.failed())return;
+            if(provMatch!=null && !provMatch.isEmpty() && !provMatch.equalsIgnoreCase(r.prov))return;
+            if(heap.size()<cap)heap.add(r);else if(r.t>heap.peek().t){heap.poll();heap.add(r);}
+        });
+        List<Row> out=new ArrayList<>(heap);out.sort((a,b)->Long.compare(b.t,a.t));
+        return new FilteredRowsResult(out, visit.patchBucketOverflow);
+    }
+    private static List<Row> newestFiltered(long from,long through,int limit,boolean failedOnly,String providerFilter){
+        return newestFilteredWithState(from,through,limit,failedOnly,providerFilter).rows;
+    }
+    private static JSONObject storageState(){synchronized(LOCK){return new JSONObject().put("retainedRows",DAYS.values().stream().mapToInt(List::size).sum()).put("retainedBytes",retainedBytes).put("pendingRows",unpersisted.size()).put("pendingBytes",pendingBytes).put("pendingPatches",unpersistedPatches.size()).put("droppedPendingRows",droppedPendingRows).put("aggregateOverflowRows",aggregateOverflowRows).put("cacheEvictions",cacheEvictions).put("complete",!gapStateUncertain&&droppedPendingRows==0&&uncertainWrites==0&&readErrors==0&&invalidLines==0&&unpersisted.isEmpty()&&unpersistedPatches.isEmpty());}}
 
     private static List<Row> bucket(long t) {
         String k = dayKey(t);
@@ -551,6 +1038,11 @@ public class UsageLedger {
         if (r == null) return;
         RequestDiagnostics.freeze(r);
         CallEvidence.freeze(r);
+        r.diagnosticObservation = null;
+        r.callObservation = null;
+        r.err = scrubTextTokens(r.err);
+        r.upstreamErrorCode = scrubCodeTokens(r.upstreamErrorCode);
+        r.activeSecrets = null;
         if (r.recentUsageLease != null) r.recentUsageLease.complete(r);
         if (r.accountRoutingLease != null) r.accountRoutingLease.complete(r);
         if (r.t <= 0) r.t = System.currentTimeMillis();
@@ -568,12 +1060,119 @@ public class UsageLedger {
                 Row pending=unpersisted.get(0);if(!append(pending))break;
                 unpersisted.remove(0);pendingBytes-=estimate(pending);
             }
+            flushPendingPatchesLocked();
             if(!append(r))queue(r);retain(r);
+        }
+        // Notify owning gateway instance directly outside LOCK without touching global StatsHooks used by tests,
+        // and clear transient references immediately so static cache rows never pin server/request state.
+        GatewayServer srv = r.liveServer;
+        boolean shouldNotify = srv != null && !r.liveSynced;
+        if (shouldNotify) r.liveSynced = true;
+        try {
+            if (shouldNotify) srv.onLedgerRowRecorded(r);
+        } catch (Throwable ignored) {
+        } finally {
+            r.liveServer = null;
+            r.entryCounted = null;
         }
         // 顺带把老的实时计数器续上，老的 /api/quota 不至于变空
         try {
             StatsHooks.onRow(r);
         } catch (Throwable ignored) {
+        }
+    }
+
+    private static void queuePatchLocked(DeliveryPatch patch) {
+        if (patch == null || patch.requestId.isEmpty()) return;
+        String key = patch.key();
+        if (unpersistedPatches.containsKey(key)) {
+            unpersistedPatches.remove(key);
+        } else if (unpersistedPatches.size() >= MAX_PENDING_PATCHES) {
+            String oldest = unpersistedPatches.keySet().iterator().next();
+            unpersistedPatches.remove(oldest);
+            droppedPendingRows++;
+            gapStateUncertain = true;
+            gapsDirty = true;
+        }
+        unpersistedPatches.put(key, patch);
+    }
+
+    private static void flushPendingPatchesLocked() {
+        if (unpersistedPatches.isEmpty()) return;
+        java.util.Iterator<Map.Entry<String, DeliveryPatch>> it = unpersistedPatches.entrySet().iterator();
+        while (it.hasNext()) {
+            DeliveryPatch pending = it.next().getValue();
+            if (appendRawLineResult(toDeliveryPatchJson(pending)) != APPEND_OK) break;
+            it.remove();
+        }
+    }
+
+    /** Flushes any queued rows or delivery patches whose previous append failed. */
+    public static void flushPending() {
+        synchronized (LOCK) {
+            if (baseDir == null) return;
+            while (!unpersisted.isEmpty()) {
+                Row pending = unpersisted.get(0);
+                if (!append(pending)) break;
+                unpersisted.remove(0);
+                pendingBytes -= estimate(pending);
+            }
+            flushPendingPatchesLocked();
+        }
+    }
+
+    /** Settles delivery outcome for a row whose ledger record may already be frozen/persisted. */
+    public static void settleDelivery(Row r, boolean delivered, int finalStatus, String error,
+                                      String failurePhase, String transportKind, String failureReason) {
+        settleDelivery(r, delivered, finalStatus, error, failurePhase, transportKind, failureReason, "");
+    }
+
+    /** Settles delivery and optional conversion status for an already frozen/persisted row. */
+    public static void settleDelivery(Row r, boolean delivered, int finalStatus, String error,
+                                      String failurePhase, String transportKind, String failureReason, String bridgeStatus) {
+        if (r == null) return;
+        boolean conversionPatch = "conversion".equals(failurePhase) || "failed".equals(bridgeStatus);
+        String safeErr = (delivered && !conversionPatch) ? "" : scrubTextTokens(error == null ? "" : error);
+        String nextDelivery = delivered ? "delivered" : (finalStatus == 499 || finalStatus == 504 ? "cancelled" : "failed");
+        String phase = (delivered && !conversionPatch) ? "" : (failurePhase == null || failurePhase.isEmpty() ? "downstream_delivery" : failurePhase);
+        String tr = (delivered && !conversionPatch) ? "" : (transportKind == null || transportKind.isEmpty() ? (finalStatus == 499 || finalStatus == 504 ? "cancelled" : "downstream") : transportKind);
+        String reason = (delivered && !conversionPatch) ? "" : (failureReason == null || failureReason.isEmpty() ? (finalStatus == 499 || finalStatus == 504 ? "downstream_cancelled" : "downstream_write_failed") : failureReason);
+        String bStatus = bridgeStatus == null ? "" : bridgeStatus;
+        synchronized (LOCK) {
+            if (delivered && !conversionPatch && r.failed()) return;
+            DeliveryPatch patch = new DeliveryPatch(
+                    r.requestId == null ? "" : r.requestId, r.attempt, r.t,
+                    nextDelivery, (delivered && !conversionPatch) ? 0 : (finalStatus >= 400 ? finalStatus : 502),
+                    safeErr, phase, tr, reason, bStatus);
+            patch.apply(r);
+            if (r.ledgerPersisted && !patch.requestId.isEmpty()) {
+                ledgerMayHavePatches = true;
+                flushPendingPatchesLocked();
+                if (!unpersistedPatches.isEmpty() || appendRawLineResult(toDeliveryPatchJson(patch)) != APPEND_OK) {
+                    queuePatchLocked(patch);
+                }
+            }
+        }
+    }
+
+    /** Settles downstream SSE error delivery status for an already-failed row without altering failure attribution. */
+    public static void settleUpstreamErrorDelivery(Row r, boolean delivered) {
+        if (r == null) return;
+        String nextDelivery = delivered ? "delivered" : "failed";
+        String nextBridge = (r.bridgeStatus == null || r.bridgeStatus.isEmpty()) ? "upstream_aborted" : "";
+        synchronized (LOCK) {
+            DeliveryPatch patch = new DeliveryPatch(
+                    r.requestId == null ? "" : r.requestId, r.attempt, r.t,
+                    nextDelivery, 0, "", "", "", "",
+                    nextBridge.isEmpty() ? "upstream_aborted" : nextBridge);
+            patch.apply(r);
+            if (r.ledgerPersisted && !patch.requestId.isEmpty()) {
+                ledgerMayHavePatches = true;
+                flushPendingPatchesLocked();
+                if (!unpersistedPatches.isEmpty() || appendRawLineResult(toDeliveryPatchJson(patch)) != APPEND_OK) {
+                    queuePatchLocked(patch);
+                }
+            }
         }
     }
 
@@ -595,6 +1194,22 @@ public class UsageLedger {
         }
     }
 
+    static String scrubTextTokens(String s) {
+        if (s == null || s.isEmpty()) return s == null ? "" : s;
+        String out = s.replaceAll("(?i)(bearer\\s+)[A-Za-z0-9._~+/=-]{8,}", "$1[REDACTED]");
+        out = out.replaceAll("\\bsk-[A-Za-z0-9_-]{8,}", "[REDACTED]");
+        out = out.replaceAll("\\beyJ[A-Za-z0-9_-]{6,}\\.[A-Za-z0-9_-]{6,}(?:\\.[A-Za-z0-9_-]*)?", "[REDACTED]");
+        out = out.replaceAll("(?i)([?&](?:key|api_key|apikey|token|access_token|refresh_token|secret|password|auth)=)[^&\\s\"'<>]+", "$1[REDACTED]");
+        return out;
+    }
+
+    static String scrubCodeTokens(String c) {
+        if (c == null || c.isEmpty()) return "";
+        String scrubbed = scrubTextTokens(c).trim();
+        if (scrubbed.contains("[REDACTED]") || scrubbed.startsWith("sk-") || scrubbed.startsWith("eyJ")) return "";
+        return scrubbed;
+    }
+
     private static String toJsonLine(Row r) {
         JSONObject o = new JSONObject();
         try {
@@ -608,6 +1223,14 @@ public class UsageLedger {
                 o.put("usageSource", r.effectiveUsageSource());
                 o.put("outboundAt",r.outboundAt); o.put("queuedMs",r.queuedMs);
                 o.put("failureKind",r.failureKind); o.put("upstreamErrorCode",r.upstreamErrorCode); o.put("upstreamRetryAfter",r.upstreamRetryAfter);
+                if (r.failurePhase != null && !r.failurePhase.isEmpty()) o.put("failurePhase", r.failurePhase);
+                if (r.transportKind != null && !r.transportKind.isEmpty()) o.put("transportKind", r.transportKind);
+                if (r.upstreamHttpStatus > 0) o.put("upstreamHttpStatus", r.upstreamHttpStatus);
+                if (r.lastSseEvent != null && !r.lastSseEvent.isEmpty()) o.put("lastSseEvent", shorten(r.lastSseEvent, 64));
+                if (r.sseTerminal != null) o.put("sseTerminal", r.sseTerminal.booleanValue());
+                if (r.failureReason != null && !r.failureReason.isEmpty()) o.put("failureReason", shorten(r.failureReason, 64));
+                if (r.bridgeStatus != null && !r.bridgeStatus.isEmpty()) o.put("bridgeStatus", shorten(r.bridgeStatus, 32));
+                if (r.deliveryStatus != null && !r.deliveryStatus.isEmpty()) o.put("deliveryStatus", shorten(r.deliveryStatus, 32));
                 o.put("inputKnown", r.inputKnown); o.put("outputKnown", r.outputKnown);
                 if (r.cacheInputTokens >= 0 && !"partial".equals(r.cacheSource)) o.put("cacheInputTokens", r.cacheInputTokens);
                 o.put("cacheSource", r.cacheSource == null || r.cacheSource.isEmpty() ? "unknown" : r.cacheSource);
@@ -631,7 +1254,7 @@ public class UsageLedger {
             }
             o.put("ms", r.ms);
             o.put("st", r.status);
-            if (r.err != null && !r.err.isEmpty()) o.put("err", shorten(r.err, 200));
+            if (r.err != null && !r.err.isEmpty()) o.put("err", shorten(r.err, 512));
             if (r.tries > 1) o.put("tries", r.tries);
             if (r.ep != null && !r.ep.isEmpty()) o.put("ep", r.ep);
             if (r.session != null && !r.session.isEmpty()) o.put("sess", shorten(r.session, 80));
@@ -653,6 +1276,13 @@ public class UsageLedger {
             r.accountId = o.optString("accountId", "");
             r.outboundAt=o.optLong("outboundAt",0); r.queuedMs=o.optLong("queuedMs",0);
             r.failureKind=o.optString("failureKind",""); r.upstreamErrorCode=o.optString("upstreamErrorCode",""); r.upstreamRetryAfter=o.optString("upstreamRetryAfter","");
+            r.failurePhase=o.optString("failurePhase",""); r.transportKind=o.optString("transportKind","");
+            r.upstreamHttpStatus=o.optInt("upstreamHttpStatus",0);
+            r.lastSseEvent=o.optString("lastSseEvent","");
+            r.sseTerminal=(o.has("sseTerminal")&&!o.isNull("sseTerminal"))?Boolean.valueOf(o.optBoolean("sseTerminal")):null;
+            r.failureReason=o.optString("failureReason","");
+            r.bridgeStatus=o.optString("bridgeStatus","");
+            r.deliveryStatus=o.optString("deliveryStatus","");
             r.attempt = o.optInt("attempt", 1); r.terminal = o.optBoolean("terminal", true);
             r.inputKnown = o.optBoolean("inputKnown", false); r.outputKnown = o.optBoolean("outputKnown", false);
             r.cacheInputTokens = o.optLong("cacheInputTokens", -1);
@@ -717,7 +1347,7 @@ public class UsageLedger {
         Map<String, Integer> errCount = new LinkedHashMap<String, Integer>();
         final int[] rows = {0};
 
-        visitRows(from,now,r -> {
+        VisitResult visit = visitRowsWithState(from,now,r -> {
                     rows[0]++;
                     total.add(r);
                     String key = "model".equals(group)
@@ -761,10 +1391,11 @@ public class UsageLedger {
                         if (r.isTerminal()) hourReq[r.hour]++;
                     }
                     if (r.isAttempt() && r.failed()) {
-                        String why = r.status >= 400 ? ("HTTP " + r.status) : "连接失败";
+                        String provTag = (r.prov != null && !r.prov.isEmpty()) ? ("[" + r.prov + "] ") : "";
+                        String why = provTag + (r.status >= 400 ? ("HTTP " + r.status) : "连接失败");
                         if (r.err != null && !r.err.isEmpty()) {
                             String et = r.err;
-                            if (et.length() > 60) et = et.substring(0, 60) + "…";
+                            if (et.length() > 120) et = et.substring(0, 120) + "…";
                             why = why + " · " + et;
                         }
                         why=limitedKey(errCount,why);Integer c = errCount.get(why);
@@ -791,8 +1422,16 @@ public class UsageLedger {
             out.put("days", days);
             out.put("group", group);
             out.put("rows", rows[0]);
-            out.put("storage",storageState());
-            if(droppedPendingRows>0)out.put("warning","存储故障导致部分明细丢弃；仅保留有界时段汇总，完整性请查看 storage 诊断。");
+            JSONObject stObj = storageState();
+            if (visit.patchBucketOverflow) stObj.put("complete", false).put("patchBucketOverflow", true);
+            out.put("storage", stObj);
+            if (droppedPendingRows > 0 && visit.patchBucketOverflow) {
+                out.put("warning", "存储故障导致部分明细丢弃，且补丁分桶达到深度上限导致部分状态未完整应用；完整性请查看 storage 诊断。");
+            } else if (droppedPendingRows > 0) {
+                out.put("warning", "存储故障导致部分明细丢弃；仅保留有界时段汇总，完整性请查看 storage 诊断。");
+            } else if (visit.patchBucketOverflow) {
+                out.put("warning", "账本补丁分桶达到深度上限，本次查询部分记录的转换/交付状态可能不完整，完整性请查看 storage 诊断。");
+            }
             out.put("totals", total.toJson());
 
             JSONArray groups = new JSONArray();
@@ -857,7 +1496,8 @@ public class UsageLedger {
                 o.put("requestId", r.requestId); o.put("attempt", r.attempt); o.put("terminal", r.isTerminal());
                 o.put("credentialId", r.credentialId); o.put("usageSource", r.effectiveUsageSource());
                 o.put("accountId", r.accountId);
-                o.put("outboundAt",r.outboundAt); o.put("queuedMs",r.queuedMs); o.put("failureKind",r.failureKind); o.put("upstreamErrorCode",r.upstreamErrorCode); o.put("upstreamRetryAfter",r.upstreamRetryAfter);
+                o.put("outboundAt",r.outboundAt); o.put("queuedMs",r.queuedMs);
+                putFailureMetadata(o, r);
                 o.put("cacheSource", r.cacheSource); o.put("reasoningSource", r.reasoningSource);
                 o.put("cacheInputTokens", r.cacheInputTokens >= 0 && !"partial".equals(r.cacheSource) ? r.cacheInputTokens : JSONObject.NULL);
                 o.put("model", r.model);
@@ -934,19 +1574,39 @@ public class UsageLedger {
         Calendar start=Calendar.getInstance(zone,Locale.US);start.setTimeInMillis(now);start.set(Calendar.HOUR_OF_DAY,0);start.set(Calendar.MINUTE,0);start.set(Calendar.SECOND,0);start.set(Calendar.MILLISECOND,0);
         start.add(Calendar.DAY_OF_MONTH,-((start.get(Calendar.DAY_OF_WEEK)+5)%7)-52*7);
         final Map<String,HeatCounts> counts=new LinkedHashMap<>();
-        final long[] first={visitRows(start.getTimeInMillis(),now,r -> addHeat(counts,r,zone))};
+        VisitResult visit = visitRowsWithState(start.getTimeInMillis(), now, r -> addHeat(counts, r, zone));
+        final long[] first = {visit.firstInTime};
         synchronized(LOCK){for(LostBucket bucket:lostHours.values())if(bucket.min>=start.getTimeInMillis()&&bucket.max<=now){String k=dayKey(bucket.min,zone);HeatCounts c=counts.get(k);if(c==null){c=new HeatCounts();counts.put(k,c);}c.add(bucket.heat);first[0]=Math.min(first[0],bucket.min);}}
         JSONArray days=new JSONArray();HeatCounts total=new HeatCounts();String end=dayKey(now,zone);
         for(Calendar c=(Calendar)start.clone();;c.add(Calendar.DAY_OF_MONTH,1)){String date=dayKey(c.getTimeInMillis(),zone);if(date.compareTo(end)>0)break;HeatCounts count=counts.get(date);if(count==null)count=new HeatCounts();total.add(count);days.put(count.json().put("date",date));}
         JSONObject out=new JSONObject().put("ok",true).put("timezone",zone.getID()).put("start",dayKey(start.getTimeInMillis(),zone)).put("end",end).put("weeks",53).put("days",days).put("totals",total.json()).put("firstRecordedDate",first[0]==Long.MAX_VALUE?JSONObject.NULL:dayKey(first[0],zone));
         synchronized(LOCK){out.put("invalidLines",invalidLines).put("readErrors",readErrors).put("persistenceErrors",persistenceErrors).put("uncertainWrites",uncertainWrites);}
-        return out.put("storage",storageState()).put("generatedAt",now);
+        JSONObject stObj = storageState();
+        if (visit.patchBucketOverflow) {
+            stObj.put("complete", false).put("patchBucketOverflow", true);
+            out.put("warning", "账本补丁分桶达到深度上限，部分记录的转换/交付状态可能不完整");
+        }
+        return out.put("storage", stObj).put("generatedAt", now);
+    }
+
+    static boolean isInitialized() {
+        synchronized (LOCK) {
+            return baseDir != null;
+        }
+    }
+
+    /** Cumulative all-time totals [requests, tokens, failed] across retained and lost ledger buckets. */
+    public static long[] allTimeTotals() {
+        return totalsSince(0L);
     }
 
     /** 导出 CSV（给「导出 CSV」用） */
     /** 窗口内总量：[请求数, token, 失败数]；给 /api/quota 的 totals 用（计数器重启会归零） */
     public static long[] windowTotals(int days) {
-        long from = System.currentTimeMillis() - (long) days * 86400000L;
+        return totalsSince(System.currentTimeMillis() - (long) days * 86400000L);
+    }
+
+    private static long[] totalsSince(long from) {
         final long[] result={0,0,0};visitRows(from,Long.MAX_VALUE,r->{if(r.isTerminal()){result[0]++;if(r.failed())result[2]++;}if(r.countTokens())result[1]+=r.countedTokens();});synchronized(LOCK){for(LostBucket lost:lostHours.values())if(lost.min>=from){result[0]+=lost.totals.requests;result[1]+=lost.totals.tokens();result[2]+=lost.totals.failed;}}return result;
     }
 
@@ -1007,9 +1667,39 @@ public class UsageLedger {
         return out;
     }
 
-    /** /api/sessions：最近 N 条请求（面板「最近请求」用） */
+    private static void putFailureMetadata(JSONObject o, Row r) {
+        o.put("failureKind", r.failureKind == null ? "" : r.failureKind);
+        o.put("failurePhase", r.effectiveFailurePhase());
+        o.put("transportKind", r.effectiveFailureCause());
+        o.put("upstreamErrorCode", r.upstreamErrorCode == null ? "" : r.upstreamErrorCode);
+        o.put("upstreamRetryAfter", r.upstreamRetryAfter == null ? "" : r.upstreamRetryAfter);
+        o.put("requestedModel", r.req == null ? "" : r.req);
+        o.put("upstreamStatus", r.effectiveUpstreamHttpStatus());
+        o.put("lastSseEvent", r.effectiveLastSseEvent());
+        o.put("terminalSeen", r.sseTerminal == null ? JSONObject.NULL : r.sseTerminal);
+        o.put("failureReason", r.effectiveFailureReason());
+        o.put("readTimeout", r.isReadTimeout());
+        o.put("tlsError", r.isTlsError());
+        o.put("prematureEof", r.isPrematureEof());
+        o.put("upstreamExplicitError", r.isUpstreamExplicitError());
+        o.put("conversionValidationFailed", r.isConversionValidationFailed());
+        o.put("conversionStatus", r.bridgeStatus == null ? "" : r.bridgeStatus);
+        o.put("deliveryStatus", r.deliveryStatus == null ? "" : r.deliveryStatus);
+    }
+
+    /** /api/sessions：最近 N 条请求（面板「请求诊断记录」用，支持按失败状态与供应商过滤） */
     public static JSONArray recentRequests(int limit) {
-        List<Row> all = newest(Long.MIN_VALUE,Long.MAX_VALUE,Math.max(1,Math.min(1000,limit)));
+        return recentRequests(limit, false, null);
+    }
+
+    public static JSONArray recentRequests(int limit, boolean failedOnly, String providerFilter) {
+        return recentRequestsWithStatus(limit, failedOnly, providerFilter).rows;
+    }
+
+    static QueryRows recentRequestsWithStatus(int limit, boolean failedOnly, String providerFilter) {
+        int cap = Math.max(1, Math.min(1000, limit));
+        FilteredRowsResult res = newestFilteredWithState(Long.MIN_VALUE, Long.MAX_VALUE, cap, failedOnly, providerFilter);
+        List<Row> all = res.rows;
         JSONArray out = new JSONArray();
         for (int i = 0; i < all.size() && i < limit; i++) {
             Row r = all.get(i);
@@ -1022,24 +1712,30 @@ public class UsageLedger {
             o.put("model", r.model == null || r.model.isEmpty() ? r.req : r.model);
             o.put("provider", r.prov);
             o.put("accountId", r.accountId);
+            o.put("credentialId", r.credentialId);
             o.put("totalTokens", r.countedTokens());
             o.put("requestId", r.requestId); o.put("attempt", r.attempt); o.put("terminal", r.isTerminal());
+            o.put("tries", r.tries);
             o.put("usageSource", r.effectiveUsageSource());
             o.put("durationMs", r.ms);
+            if (r.ttft >= 0) o.put("ttft", r.ttft);
+            putFailureMetadata(o, r);
             if (r.err != null && !r.err.isEmpty()) o.put("error", r.err);
             out.put(o);
         }
-        return out;
+        return new QueryRows(out, res.patchBucketOverflow);
     }
 
     public static String csv(int days) {
         long from = System.currentTimeMillis() - (long) days * 86400000L;
         StringBuilder sb = new StringBuilder();
-        sb.append("time,provider,model,requested,input,output,cache_read,cache_write,reasoning,ttft_ms,decode_ms,ms,status,tries,error,request_id,credential_id,attempt,terminal,usage_source,cache_source,reasoning_source,counted_input,counted_output,request_count,attempt_count,attempt_failed,failure_phase,failure_cause\n");
+        sb.append("time,provider,model,requested,input,output,cache_read,cache_write,reasoning,ttft_ms,decode_ms,ms,status,tries,error,request_id,credential_id,attempt,terminal,usage_source,cache_source,reasoning_source,counted_input,counted_output,request_count,attempt_count,attempt_failed,failure_phase,failure_cause,failure_kind,upstream_error_code,upstream_status,last_sse_event,terminal_seen,failure_reason,read_timeout,tls_error,premature_eof,upstream_explicit_error,conversion_validation_failed,conversion_status,delivery_status\n");
         SimpleDateFormat f = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US);
-        List<Row> all = newest(from,Long.MAX_VALUE,1000);
+        FilteredRowsResult res = newestFilteredWithState(from, Long.MAX_VALUE, 1000, false, null);
+        List<Row> all = res.rows;
         all.sort(Comparator.comparingLong(r->r.t));
         for (Row r : all) {
+            int upStatus = r.effectiveUpstreamHttpStatus();
             sb.append(f.format(new Date(r.t))).append(',')
                     .append(csvEsc(r.prov)).append(',')
                     .append(csvEsc(r.model)).append(',')
@@ -1061,11 +1757,25 @@ public class UsageLedger {
                     .append(!r.effectiveInputKnown() ? "" : String.valueOf(r.countedInput())).append(',')
                     .append(!r.effectiveOutputKnown() ? "" : String.valueOf(r.countedOutput())).append(',')
                     .append(r.isTerminal() ? 1 : 0).append(',').append(r.isAttempt() ? 1 : 0).append(',').append(r.isAttempt() && r.failed() ? 1 : 0).append(',')
-                    .append(r.workBuddyFailure == null ? "" : r.workBuddyFailure.phaseName()).append(',')
-                    .append(r.workBuddyFailure == null ? "" : r.workBuddyFailure.causeName()).append('\n');
+                    .append(csvEsc(r.effectiveFailurePhase())).append(',')
+                    .append(csvEsc(r.effectiveFailureCause())).append(',')
+                    .append(csvEsc(r.failureKind)).append(',')
+                    .append(csvEsc(r.upstreamErrorCode)).append(',')
+                    .append(upStatus > 0 ? String.valueOf(upStatus) : "").append(',')
+                    .append(csvEsc(r.effectiveLastSseEvent())).append(',')
+                    .append(r.sseTerminal == null ? "" : String.valueOf(r.sseTerminal)).append(',')
+                    .append(csvEsc(r.effectiveFailureReason())).append(',')
+                    .append(r.isReadTimeout()).append(',')
+                    .append(r.isTlsError()).append(',')
+                    .append(r.isPrematureEof()).append(',')
+                    .append(r.isUpstreamExplicitError()).append(',')
+                    .append(r.isConversionValidationFailed()).append(',')
+                    .append(csvEsc(r.bridgeStatus)).append(',')
+                    .append(csvEsc(r.deliveryStatus)).append('\n');
         }
         if(all.size()==1000)sb.append("# Export limited to the latest 1000 rows; use paged history for older rows.").append((char)10);
         synchronized(LOCK){if(droppedPendingRows>0)sb.append("# Missing details after storage failure: ").append(droppedPendingRows).append("; aggregates retained within bounded coverage.").append((char)10);}
+        if(res.patchBucketOverflow)sb.append("# Incomplete patch resolution: patch bucket depth limit exceeded; delivery/conversion status on affected rows may be incomplete.").append((char)10);
         return sb.toString();
     }
 
