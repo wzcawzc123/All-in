@@ -11,6 +11,7 @@ import java.util.Map;
 final class WorkBuddyAllowance {
     static final String SUMMARY="/billing/meter/get-user-resource-summary";
     static final String ENTERPRISE="/billing/meter/get-enterprise-user-usage";
+    static final String ACCOUNTS="/v2/plugin/accounts";
     static final class Failure extends IOException {
         final String kind; final boolean invalidToken;
         Failure(String kind, boolean invalidToken) { super("WorkBuddy allowance "+kind); this.kind=kind; this.invalidToken=invalidToken; }
@@ -20,6 +21,80 @@ final class WorkBuddyAllowance {
         String key=a.optString("access",a.optString("token",""));
         return !"api".equals(a.optString("type")) && !key.startsWith("ck_") && !key.startsWith("pt_");
     }
+    private static boolean safeDisplay(String v) {
+        if (v == null) return false;
+        String s = v.trim();
+        if (s.isEmpty() || s.length() > 80) return false;
+        for (int i = 0; i < s.length(); i++) {
+            char ch = s.charAt(i);
+            if (ch < 32 || ch == 127) return false;
+        }
+        return true;
+    }
+
+    /** Best-effort read-only nickname lookup via /v2/plugin/accounts; never alters routing or credentials. */
+    static String fetchNickname(String provider, JSONObject a, WorkBuddyLogin.ConnectionFactory factory) {
+        if (a == null || !eligible(a)) return "";
+        String existing = a.optString("nickname", "").trim();
+        if (safeDisplay(existing)) return existing;
+        HttpURLConnection c = null;
+        try {
+            String key = a.optString("access", a.optString("token", ""));
+            if (key.isEmpty()) return "";
+            String url = WorkBuddyAuth.origin(provider) + ACCOUNTS;
+            Map<String, String> headers = WorkBuddyPolicy.catalogHeaders(provider, WorkBuddyAuth.origin(provider) + "/v3/config", key, a);
+            if (headers.isEmpty()) return "";
+            c = factory.open(url);
+            c.setInstanceFollowRedirects(false);
+            c.setRequestMethod("GET");
+            c.setConnectTimeout(4000);
+            c.setReadTimeout(4000);
+            for (Map.Entry<String, String> h : headers.entrySet()) c.setRequestProperty(h.getKey(), h.getValue());
+            int status = c.getResponseCode();
+            if (status < 200 || status >= 300) return "";
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            long deadline = System.nanoTime() + 4000000000L;
+            try (InputStream in = c.getInputStream()) {
+                byte[] buffer = new byte[4096];
+                int n;
+                while ((n = in.read(buffer)) != -1) {
+                    if (Thread.currentThread().isInterrupted() || bytes.size() + n > 262144 || System.nanoTime() > deadline) return "";
+                    bytes.write(buffer, 0, n);
+                }
+            }
+            JSONObject env = new JSONObject(new String(bytes.toByteArray(), StandardCharsets.UTF_8));
+            JSONObject data = env.optJSONObject("data");
+            JSONArray list = data != null ? data.optJSONArray("accounts") : env.optJSONArray("accounts");
+            if (list == null || list.length() == 0) return "";
+            String wantUid = a.optString("uid", "").trim();
+            String wantEnt = WorkBuddyLogin.enterpriseValue(a);
+            JSONObject matched = null;
+            for (int i = 0; i < list.length(); i++) {
+                JSONObject row = list.optJSONObject(i);
+                if (row == null) continue;
+                String rUid = row.optString("uid", "").trim();
+                String rEnt = row.optString("enterpriseId", "").trim();
+                if (!wantUid.isEmpty() && wantUid.equals(rUid)) {
+                    if (wantEnt.isEmpty() || wantEnt.equals(rEnt)) { matched = row; break; }
+                    if (matched == null) matched = row;
+                } else if (wantUid.isEmpty() && (row.optBoolean("lastLogin", false) || list.length() == 1)) {
+                    matched = row;
+                }
+            }
+            if (matched == null && list.length() == 1) matched = list.optJSONObject(0);
+            if (matched == null) return "";
+            String nick = matched.optString("nickname", "").trim();
+            if (safeDisplay(nick)) return nick;
+            String phone = matched.optString("phoneNumber", "").trim();
+            if (safeDisplay(phone)) return phone;
+            return "";
+        } catch (Exception ignored) {
+            return "";
+        } finally {
+            if (c != null) c.disconnect();
+        }
+    }
+
     static JSONObject fetch(String provider, JSONObject a, WorkBuddyLogin.ConnectionFactory factory) throws Exception {
         return fetch(provider,a,factory,false);
     }
@@ -42,7 +117,8 @@ final class WorkBuddyAllowance {
             int status=c.getResponseCode();
             if(status<200 || status>=300) {
                 String challenge=c.getHeaderField("WWW-Authenticate");
-                throw new Failure(status==401?"sign_in_required":"unavailable",status==401 && challenge!=null && challenge.toLowerCase(java.util.Locale.ROOT).contains("invalid_token"));
+                boolean invalidToken=status==401 && challenge!=null && challenge.toLowerCase(java.util.Locale.ROOT).contains("invalid_token");
+                throw new Failure(invalidToken?"sign_in_required":"unavailable",invalidToken);
             }
             ByteArrayOutputStream bytes=new ByteArrayOutputStream(); long deadline=System.nanoTime()+5000000000L;
             try(InputStream in=c.getInputStream()) {

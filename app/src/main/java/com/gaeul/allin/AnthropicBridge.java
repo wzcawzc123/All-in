@@ -647,6 +647,10 @@ final class AnthropicBridge {
     }
 
     static JSONObject responseToAnthropic(JSONObject openai, String model) {
+        return responseToAnthropic(openai, model, true);
+    }
+
+    static JSONObject responseToAnthropic(JSONObject openai, String model, boolean emitUnsignedThinking) {
         JSONObject out = new JSONObject();
         try {
             String id = openai.optString("id", "msg_" + System.currentTimeMillis());
@@ -676,7 +680,7 @@ final class AnthropicBridge {
                         if (!(rawReasoning instanceof String)) throw new IllegalArgumentException("Invalid reasoning_content");
                         reasoning = (String)rawReasoning;
                     }
-                    if (!reasoning.isEmpty()) {
+                    if (emitUnsignedThinking && !reasoning.isEmpty()) {
                         JSONObject th = new JSONObject();
                         th.put("type", "thinking");
                         th.put("thinking", reasoning);
@@ -718,6 +722,8 @@ final class AnthropicBridge {
                     }
                 }
             }
+            if (!emitUnsignedThinking && content.length() == 0)
+                throw new IllegalArgumentException("Upstream produced no text or tool calls");
             out.put("content", content);
             out.put("stop_reason", stopReasonOf(finish));
             out.put("stop_sequence", JSONObject.NULL);
@@ -800,6 +806,7 @@ final class AnthropicBridge {
     static final class StreamState {
         private final String model;
         private final String messageId;
+        private final boolean emitUnsignedThinking;
         private boolean started;
         private int nextIndex = 0;
         private int textIndex = -1;
@@ -829,7 +836,12 @@ final class AnthropicBridge {
         }
 
         StreamState(String model) {
+            this(model, true);
+        }
+
+        StreamState(String model, boolean emitUnsignedThinking) {
             this.model = model;
+            this.emitUnsignedThinking = emitUnsignedThinking;
             this.messageId = "msg_" + System.currentTimeMillis();
         }
 
@@ -909,7 +921,7 @@ final class AnthropicBridge {
                             // 不判 NULL 就会多出一个内容为 "null" 的文本块。
                             Object rawReason = delta.opt("reasoning_content");
                             String reasoning = deltaString(rawReason, "reasoning_content");
-                            if (!reasoning.isEmpty()) {
+                            if (emitUnsignedThinking && !reasoning.isEmpty()) {
                                 outs.addAll(thinkingDelta(reasoning));
                             }
                             Object rawText = delta.opt("content");
@@ -1084,6 +1096,8 @@ final class AnthropicBridge {
             if (closed) return outs;
             try {
                 if (!started || finish.isEmpty()) return onError("Upstream stream ended before a finish reason");
+                if (!emitUnsignedThinking && nextIndex == 0)
+                    return onError("Upstream produced no text or tool calls");
                 stopReasonOf(finish);
                 if (refusal && "stop".equals(finish)) finish = "content_filter";
                 java.util.Set<String> ids = new java.util.HashSet<String>();

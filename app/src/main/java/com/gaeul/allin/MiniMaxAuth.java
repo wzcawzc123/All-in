@@ -389,19 +389,101 @@ public class MiniMaxAuth {
         return result;
     }
 
-    /** 用 refresh_token 换新 access；返回 null 表示被登出（invalid_grant/400）或失败 */
-    public static SignIn refresh(String refreshToken) {
-        if (refreshToken == null || refreshToken.isEmpty()) return null;
+    /** Typed MiniMax OAuth refresh failure distinguishing provably unsent, explicit reject, and unknown outcome. */
+    static final class RefreshFailure extends java.io.IOException {
+        enum Kind { NOT_SENT, EXPLICIT_REJECT, OUTCOME_UNKNOWN }
+        final Kind kind;
+        final int httpStatus;
+        final String oauthError;
+        final boolean signedOut;
+
+        RefreshFailure(Kind kind, int httpStatus, String oauthError, String message, Throwable cause) {
+            super(message, cause);
+            this.kind = kind == null ? Kind.OUTCOME_UNKNOWN : kind;
+            this.httpStatus = httpStatus;
+            this.oauthError = oauthError == null ? "" : oauthError;
+            // Aligned with npm MiniMax 0.2.9: invalid_grant with HTTP 400 signs the account out.
+            this.signedOut = this.kind == Kind.EXPLICIT_REJECT
+                    && httpStatus == 400 && "invalid_grant".equalsIgnoreCase(this.oauthError);
+        }
+
+        boolean definitelyNotSent() { return kind == Kind.NOT_SENT; }
+
+        static RefreshFailure notSent(String message, Throwable cause) {
+            return new RefreshFailure(Kind.NOT_SENT, 0, "", message, cause);
+        }
+
+        static RefreshFailure explicitReject(int status, String oauthError, String message) {
+            return new RefreshFailure(Kind.EXPLICIT_REJECT, status, oauthError, message, null);
+        }
+
+        static RefreshFailure outcomeUnknown(int status, String message, Throwable cause) {
+            return new RefreshFailure(Kind.OUTCOME_UNKNOWN, status, "", message, cause);
+        }
+    }
+
+    /**
+     * One-shot refresh with strict send-boundary tracking:
+     * - Failures before writing the first request byte throw RefreshFailure(NOT_SENT).
+     * - Explicit OAuth error replies (e.g. HTTP 400 invalid_grant) throw RefreshFailure(EXPLICIT_REJECT).
+     * - Any transport/parse error after writing request bytes throws RefreshFailure(OUTCOME_UNKNOWN).
+     */
+    static SignIn refreshChecked(String refreshToken) throws RefreshFailure {
+        return refreshChecked(refreshToken, MiniMaxAuth::open);
+    }
+
+    static SignIn refreshChecked(String refreshToken, AllowanceConnectionFactory factory) throws RefreshFailure {
+        if (refreshToken == null || refreshToken.isEmpty()) {
+            throw RefreshFailure.notSent("MiniMax refresh token missing", null);
+        }
+        byte[] payload;
         try {
-            int[] code = new int[]{0};
-            String[] raw = new String[]{""};
-            JSONObject j = postForm(ACCOUNT + "/oauth2/token",
-                    form("grant_type", "refresh_token", "refresh_token", refreshToken,
-                            "client_id", CLIENT_ID, "scope", SCOPE, "audience", AUDIENCE),
-                    code, raw, true);
-            if (j == null) return null;
+            payload = form("grant_type", "refresh_token", "refresh_token", refreshToken,
+                    "client_id", CLIENT_ID, "scope", SCOPE, "audience", AUDIENCE).getBytes("UTF-8");
+        } catch (Exception e) {
+            throw RefreshFailure.notSent("MiniMax refresh form encoding failed", e);
+        }
+        HttpURLConnection conn = null;
+        boolean sent = false;
+        try {
+            conn = factory.open(ACCOUNT + "/oauth2/token");
+            conn.setInstanceFollowRedirects(false);
+            conn.setFixedLengthStreamingMode(payload.length);
+            conn.setRequestMethod("POST");
+            conn.setDoOutput(true);
+            conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
+            conn.setRequestProperty("Accept", "application/json");
+            OutputStream os = conn.getOutputStream();
+            // Connection + TLS handshake succeeded; mark sent right before writing the credential body.
+            sent = true;
+            os.write(payload);
+            os.flush();
+            os.close();
+
+            int status = conn.getResponseCode();
+            InputStream is = (status >= 200 && status < 400) ? conn.getInputStream() : conn.getErrorStream();
+            String raw = read(is);
+            JSONObject j = null;
+            try { j = new JSONObject(raw); } catch (Exception ignored) { }
+
+            if (status < 200 || status >= 300) {
+                String err = j == null ? "" : j.optString("error", "").trim();
+                if (!err.isEmpty() && status >= 400 && status < 500) {
+                    throw RefreshFailure.explicitReject(status, err, "MiniMax refresh rejected (" + status + " " + err + ")");
+                }
+                throw RefreshFailure.outcomeUnknown(status, "MiniMax refresh failed (HTTP " + status + ")", null);
+            }
+            if (j == null) {
+                throw RefreshFailure.outcomeUnknown(status, "MiniMax refresh returned non-JSON", null);
+            }
+            String err = j.optString("error", "").trim();
+            if (!err.isEmpty()) {
+                throw RefreshFailure.explicitReject(status, err, "MiniMax refresh rejected (" + err + ")");
+            }
             String access = j.optString("access_token", "");
-            if (access.isEmpty()) return null;
+            if (access.isEmpty()) {
+                throw RefreshFailure.outcomeUnknown(status, "MiniMax refresh missing access_token", null);
+            }
             long expiresIn = j.optLong("expires_in", 0L);
             SignIn si = new SignIn();
             si.access = access;
@@ -411,7 +493,23 @@ public class MiniMaxAuth {
                     ? System.currentTimeMillis() + expiresIn * 1000L
                     : System.currentTimeMillis() + 3600L * 1000L;
             return si;
+        } catch (RefreshFailure rf) {
+            throw rf;
         } catch (Exception e) {
+            if (!sent) {
+                throw RefreshFailure.notSent("MiniMax refresh failed before send", e);
+            }
+            throw RefreshFailure.outcomeUnknown(0, "MiniMax refresh outcome uncertain after send", e);
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
+    }
+
+    /** 用 refresh_token 换新 access；返回 null 表示被登出（invalid_grant/400）或失败 */
+    public static SignIn refresh(String refreshToken) {
+        try {
+            return refreshChecked(refreshToken);
+        } catch (RefreshFailure e) {
             return null;
         }
     }

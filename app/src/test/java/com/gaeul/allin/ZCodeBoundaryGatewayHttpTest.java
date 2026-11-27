@@ -322,6 +322,206 @@ public final class ZCodeBoundaryGatewayHttpTest {
         System.out.println("Responses Gift admission PASS");
     }
 
+    static void giftResponsesStreamProjectionDiagnostics() throws Exception {
+        java.nio.file.Path ledgerDir = java.nio.file.Files.createTempDirectory("zcode-gift-resp-proj-");
+        UsageLedger.init(ledgerDir.toFile());
+        final String[] upstreamMode = {"ok"};
+        try {
+            try (VendorPolicyGatewayHttpTest.Upstream up = new VendorPolicyGatewayHttpTest.Upstream((request, round) -> {
+                String mode = upstreamMode[0];
+                if ("ok".equals(mode)) {
+                    return new VendorPolicyGatewayHttpTest.Reply(200, "text/event-stream", ZCodeGiftUsageHttpTest.stream("full", true));
+                }
+                if ("dup_tool_id".equals(mode)) {
+                    String b0 = new JSONObject().put("type", "tool_use").put("id", "dup-call-1").put("name", "fixture_0").put("input", new JSONObject()).toString();
+                    String b1 = new JSONObject().put("type", "tool_use").put("id", "dup-call-1").put("name", "fixture_1").put("input", new JSONObject()).toString();
+                    String sse = ZCodeGiftUsageHttpTest.event("message_start", ",\"message\":{\"id\":\"m1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"" + ZCodeGiftUsageHttpTest.UPSTREAM + "\",\"content\":[],\"usage\":{\"input_tokens\":5}}")
+                            + ZCodeGiftUsageHttpTest.event("content_block_start", ",\"index\":0,\"content_block\":" + b0)
+                            + ZCodeGiftUsageHttpTest.event("content_block_delta", ",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"x\\\":1}\"}")
+                            + ZCodeGiftUsageHttpTest.event("content_block_stop", ",\"index\":0")
+                            + ZCodeGiftUsageHttpTest.event("content_block_start", ",\"index\":1,\"content_block\":" + b1)
+                            + ZCodeGiftUsageHttpTest.event("content_block_delta", ",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"y\\\":2}\"}")
+                            + ZCodeGiftUsageHttpTest.event("content_block_stop", ",\"index\":1")
+                            + ZCodeGiftUsageHttpTest.event("message_delta", ",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":9}")
+                            + ZCodeGiftUsageHttpTest.event("message_stop", "");
+                    return new VendorPolicyGatewayHttpTest.Reply(200, "text/event-stream", sse);
+                }
+                if ("upstream_error".equals(mode)) {
+                    String sse = ZCodeGiftUsageHttpTest.event("message_start", ",\"message\":{\"id\":\"m2\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"" + ZCodeGiftUsageHttpTest.UPSTREAM + "\",\"content\":[]}")
+                            + "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"upstream gift busy\"}}\n\n";
+                    return new VendorPolicyGatewayHttpTest.Reply(200, "text/event-stream", sse);
+                }
+                if ("upstream_eof".equals(mode)) {
+                    return new VendorPolicyGatewayHttpTest.Reply(200, "text/event-stream", ZCodeGiftUsageHttpTest.stream("full", false));
+                }
+                throw new IllegalStateException("unknown mode " + mode);
+            })) {
+                ZCodeGift.resetBusyForTests(); ZCodeGift.resetCooldownForTests();
+                ZCodeGift.setFixtureBase("http://127.0.0.1:" + up.server.getLocalPort());
+                JSONObject cfg = ZCodeGiftUsageHttpTest.config(up.server.getLocalPort());
+                cfg.getJSONObject("server").put("authKey", "fixture-auth-8ch");
+                ZCodeGiftBusyGatewayHttpTest.Transport transport = new ZCodeGiftBusyGatewayHttpTest.Transport();
+                ZCodeGiftUsageHttpTest.Gateway g = new ZCodeGiftUsageHttpTest.Gateway(cfg, transport);
+                g.gateway.setVendorConnectionsForTests(url -> { throw new AssertionError("Gift must not call paid transport"); });
+                g.start(NanoHTTPD.SOCKET_READ_TIMEOUT, true);
+                try {
+                    int port = g.getListeningPort();
+                    String reqJson = responsesBody(true).toString();
+                    java.lang.reflect.Method sendM = NanoHTTPD.Response.class.getDeclaredMethod("send", OutputStream.class);
+                    sendM.setAccessible(true);
+
+                    // helper to fetch latest row by requestId
+                    java.util.function.Function<String, JSONObject> rowOf = rid -> {
+                        JSONArray arr = UsageLedger.recentRequests(30);
+                        for (int i = 0; i < arr.length(); i++) {
+                            JSONObject o = arr.getJSONObject(i);
+                            if (rid.equals(o.optString("requestId"))) return o;
+                        }
+                        throw new AssertionError("missing ledger row for " + rid);
+                    };
+
+                    // 1) Normal success -> response.completed, message_stop, terminalSeen=true, conversionStatus=ok, deliveryStatus=delivered
+                    upstreamMode[0] = "ok";
+                    NanoHTTPD.Response rOk = g.gateway.serve(ResponsesGatewayOfflineTest.session(reqJson, "fixture-auth-8ch", "/v1/responses"));
+                    String ridOk = rOk.getHeader("X-AllIn-Request-Id");
+                    ByteArrayOutputStream okOut = new ByteArrayOutputStream();
+                    sendM.invoke(rOk, okOut); rOk.close();
+                    String okBody = okOut.toString("UTF-8");
+                    check(okBody.contains("response.completed"), "Gift Resp ok missing response.completed: " + okBody);
+                    JSONObject rowOk = rowOf.apply(ridOk);
+                    check(rowOk.optInt("statusCode") == 200 && rowOk.optInt("upstreamStatus") == 200
+                            && "message_stop".equals(rowOk.optString("lastSseEvent"))
+                            && Boolean.TRUE.equals(rowOk.opt("terminalSeen"))
+                            && "ok".equals(rowOk.optString("conversionStatus"))
+                            && "delivered".equals(rowOk.optString("deliveryStatus")),
+                            "Gift Resp ok ledger mismatch: " + rowOk);
+
+                    // 2a) Native Messages ended normally (message_stop), final Responses projection failed, response.failed delivered
+                    upstreamMode[0] = "dup_tool_id";
+                    NanoHTTPD.Response rProj = g.gateway.serve(ResponsesGatewayOfflineTest.session(reqJson, "fixture-auth-8ch", "/v1/responses"));
+                    String ridProj = rProj.getHeader("X-AllIn-Request-Id");
+                    ByteArrayOutputStream projOut = new ByteArrayOutputStream();
+                    sendM.invoke(rProj, projOut); rProj.close();
+                    String projBody = projOut.toString("UTF-8");
+                    check(projBody.contains("response.failed") && !projBody.contains("response.completed"),
+                            "Gift Resp proj fail must emit response.failed: " + projBody);
+                    JSONObject rowProj = rowOf.apply(ridProj);
+                    check(rowProj.optInt("statusCode") == 502 && rowProj.optInt("upstreamStatus") == 200
+                            && "message_stop".equals(rowProj.optString("lastSseEvent"))
+                            && Boolean.TRUE.equals(rowProj.opt("terminalSeen"))
+                            && "failed".equals(rowProj.optString("conversionStatus"))
+                            && "conversion".equals(rowProj.optString("failurePhase"))
+                            && "conversion_validation_failed".equals(rowProj.optString("failureReason"))
+                            && Boolean.TRUE.equals(rowProj.optBoolean("conversionValidationFailed"))
+                            && "delivered".equals(rowProj.optString("deliveryStatus")),
+                            "Gift Resp proj fail (response.failed delivered) mismatch: " + rowProj);
+
+                    // 2b) Projection failed AND downstream write of response.failed fails -> deliveryStatus=failed, conversion attribution retained
+                    NanoHTTPD.Response rProjDrop = g.gateway.serve(ResponsesGatewayOfflineTest.session(reqJson, "fixture-auth-8ch", "/v1/responses"));
+                    String ridProjDrop = rProjDrop.getHeader("X-AllIn-Request-Id");
+                    OutputStream failingProjOut = new OutputStream() {
+                        final ByteArrayOutputStream seen = new ByteArrayOutputStream();
+                        @Override public void write(int b) throws IOException { write(new byte[]{(byte) b}, 0, 1); }
+                        @Override public void write(byte[] b, int off, int len) throws IOException {
+                            seen.write(b, off, len);
+                            if (seen.toString("UTF-8").contains("response.failed")) throw new IOException("client dropped response.failed");
+                        }
+                    };
+                    try { sendM.invoke(rProjDrop, failingProjOut); } catch (Exception ignored) {}
+                    rProjDrop.close();
+                    JSONObject rowProjDrop = rowOf.apply(ridProjDrop);
+                    check(rowProjDrop.optInt("statusCode") == 502
+                            && "message_stop".equals(rowProjDrop.optString("lastSseEvent"))
+                            && Boolean.TRUE.equals(rowProjDrop.opt("terminalSeen"))
+                            && "failed".equals(rowProjDrop.optString("conversionStatus"))
+                            && "conversion".equals(rowProjDrop.optString("failurePhase"))
+                            && "conversion_validation_failed".equals(rowProjDrop.optString("failureReason"))
+                            && "failed".equals(rowProjDrop.optString("deliveryStatus")),
+                            "Gift Resp proj fail + write drop mismatch: " + rowProjDrop);
+
+                    // 3a) Upstream failed first (event: error before message_stop) -> preserves upstream attribution, NOT overwritten as conversion failure
+                    upstreamMode[0] = "upstream_error";
+                    NanoHTTPD.Response rUpErr = g.gateway.serve(ResponsesGatewayOfflineTest.session(reqJson, "fixture-auth-8ch", "/v1/responses"));
+                    String ridUpErr = rUpErr.getHeader("X-AllIn-Request-Id");
+                    ByteArrayOutputStream upErrOut = new ByteArrayOutputStream();
+                    sendM.invoke(rUpErr, upErrOut); rUpErr.close();
+                    check(upErrOut.toString("UTF-8").contains("response.failed"), "Gift Resp upstream error must emit response.failed");
+                    JSONObject rowUpErr = rowOf.apply(ridUpErr);
+                    check(rowUpErr.optInt("statusCode") == 502
+                            && !Boolean.TRUE.equals(rowUpErr.opt("terminalSeen"))
+                            && "read_response_body".equals(rowUpErr.optString("failurePhase"))
+                            && "upstream_explicit_error".equals(rowUpErr.optString("failureReason"))
+                            && "upstream_aborted".equals(rowUpErr.optString("conversionStatus"))
+                            && "delivered".equals(rowUpErr.optString("deliveryStatus")),
+                            "Gift Resp upstream explicit error mismatch: " + rowUpErr);
+
+                    // 3b) Upstream failed first (premature EOF before message_stop) -> preserves premature_eof, NOT conversion failure
+                    upstreamMode[0] = "upstream_eof";
+                    NanoHTTPD.Response rUpEof = g.gateway.serve(ResponsesGatewayOfflineTest.session(reqJson, "fixture-auth-8ch", "/v1/responses"));
+                    String ridUpEof = rUpEof.getHeader("X-AllIn-Request-Id");
+                    ByteArrayOutputStream upEofOut = new ByteArrayOutputStream();
+                    sendM.invoke(rUpEof, upEofOut); rUpEof.close();
+                    check(upEofOut.toString("UTF-8").contains("response.failed"), "Gift Resp upstream EOF must emit response.failed");
+                    JSONObject rowUpEof = rowOf.apply(ridUpEof);
+                    check(rowUpEof.optInt("statusCode") == 502
+                            && !Boolean.TRUE.equals(rowUpEof.opt("terminalSeen"))
+                            && "read_response_body".equals(rowUpEof.optString("failurePhase"))
+                            && "premature_eof".equals(rowUpEof.optString("failureReason"))
+                            && "upstream_aborted".equals(rowUpEof.optString("conversionStatus"))
+                            && "delivered".equals(rowUpEof.optString("deliveryStatus")),
+                            "Gift Resp upstream premature EOF mismatch: " + rowUpEof);
+
+                    // 4) Native Messages ok + projection ok, downstream final frame write fails -> downstream_delivery, NOT delivered
+                    upstreamMode[0] = "ok";
+                    NanoHTTPD.Response rDownFail = g.gateway.serve(ResponsesGatewayOfflineTest.session(reqJson, "fixture-auth-8ch", "/v1/responses"));
+                    String ridDownFail = rDownFail.getHeader("X-AllIn-Request-Id");
+                    OutputStream failingCompletedOut = new OutputStream() {
+                        final ByteArrayOutputStream seen = new ByteArrayOutputStream();
+                        @Override public void write(int b) throws IOException { write(new byte[]{(byte) b}, 0, 1); }
+                        @Override public void write(byte[] b, int off, int len) throws IOException {
+                            seen.write(b, off, len);
+                            if (seen.toString("UTF-8").contains("response.completed")) throw new IOException("client dropped final completed frame");
+                        }
+                    };
+                    try { sendM.invoke(rDownFail, failingCompletedOut); } catch (Exception ignored) {}
+                    rDownFail.close();
+                    JSONObject rowDownFail = rowOf.apply(ridDownFail);
+                    check("message_stop".equals(rowDownFail.optString("lastSseEvent"))
+                            && Boolean.TRUE.equals(rowDownFail.opt("terminalSeen"))
+                            && "ok".equals(rowDownFail.optString("conversionStatus"))
+                            && "downstream_delivery".equals(rowDownFail.optString("failurePhase"))
+                            && !"delivered".equals(rowDownFail.optString("deliveryStatus")),
+                            "Gift Resp downstream write fail mismatch: " + rowDownFail);
+
+                    // Verify persisted ledger + reload keeps exact values across all scenarios
+                    String csv = UsageLedger.csv(1);
+                    check(csv.contains(ridProj) && csv.contains("conversion_validation_failed"), "CSV missing Gift projection failure");
+                    UsageLedger.init(ledgerDir.toFile());
+                    JSONObject reloadedProj = rowOf.apply(ridProj);
+                    check("failed".equals(reloadedProj.optString("conversionStatus"))
+                            && "conversion_validation_failed".equals(reloadedProj.optString("failureReason"))
+                            && "delivered".equals(reloadedProj.optString("deliveryStatus")),
+                            "Reloaded Gift projection failure mismatch: " + reloadedProj);
+                    JSONObject reloadedUpErr = rowOf.apply(ridUpErr);
+                    check("upstream_explicit_error".equals(reloadedUpErr.optString("failureReason"))
+                            && "upstream_aborted".equals(reloadedUpErr.optString("conversionStatus"))
+                            && "delivered".equals(reloadedUpErr.optString("deliveryStatus")),
+                            "Reloaded Gift upstream error mismatch: " + reloadedUpErr);
+                    check(up.requests.size() == 6 && transport.opens.get() == 6,
+                            "expected exact 6 single-send Gift attempts without replay: up=" + up.requests.size() + " opens=" + transport.opens.get());
+                } finally { g.stop(); ZCodeGift.setFixtureBase(null); ZCodeGift.resetBusyForTests(); ZCodeGift.resetCooldownForTests(); }
+            }
+        } finally {
+            GatewayStreamReadOfflineTest.closeLedger();
+            try (java.util.stream.Stream<java.nio.file.Path> paths = java.nio.file.Files.walk(ledgerDir)) {
+                for (java.nio.file.Path p : (Iterable<java.nio.file.Path>) paths.sorted(Comparator.reverseOrder())::iterator) {
+                    java.nio.file.Files.deleteIfExists(p);
+                }
+            }
+        }
+        System.out.println("ZCode Gift streaming Responses ledger projection diagnostics PASS (all 6 scenarios)");
+    }
+
     public static void main(String[] args) throws Exception {
         personalProjectAndList();
         checkNoPlanUntilConfirmedActive();
@@ -331,6 +531,7 @@ public final class ZCodeBoundaryGatewayHttpTest {
         giftResponsesAdmission();
         giftResponsesToolRoundTrip(false, 1);
         giftResponsesToolRoundTrip(true, 35);
+        giftResponsesStreamProjectionDiagnostics();
         List<String> failures = new ArrayList<>();
         for (boolean gift : new boolean[]{true, false}) for (String path : new String[]{"/v1/chat/completions", "/v1/messages", "/v1/responses"})
             for (boolean stream : new boolean[]{false, true}) for (boolean truncated : new boolean[]{false, true}) {

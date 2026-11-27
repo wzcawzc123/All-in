@@ -241,7 +241,8 @@ public final class RaccoonRefreshServiceOfflineTest {
                 new RaccoonRefreshService(new AccountTokenCoordinator(), transport).ensureFresh(store.id, store);
                 throw new AssertionError("HTTP " + status + " should fail");
             } catch (RaccoonAccountService.Failure expected) {
-                check(expected.expired == (status < 500), "HTTP status expiry classification " + status);
+                // HTTP 429 is rate limiting, not expired sign-in; only explicit 400/401 auth errors mark expired.
+                check(expected.expired == (status == 400 || status == 401), "HTTP status expiry classification " + status);
                 check(expected.getMessage().contains("refresh token is invalid"), "vendor details surfaced");
             }
             check(transport.calls == 1 && store.value.optString("access").equals("old"), "failure did not persist candidate");
@@ -421,7 +422,7 @@ public final class RaccoonRefreshServiceOfflineTest {
                     "HTTP " + status + " was received, so it is an executed failure, got " + thrown);
             check(!(thrown instanceof RaccoonRefreshSend.Failure), "HTTP " + status + " must not look like a send failure");
             check(!RaccoonRefreshSend.releasesReservation(thrown), "HTTP " + status + " never releases the reservation");
-            check(((RaccoonAccountService.Failure) thrown).expired == (status < 500),
+            check(((RaccoonAccountService.Failure) thrown).expired == (status == 400 || status == 401),
                     "HTTP " + status + " keeps its sign-in classification");
             check(transport.calls == 1 && "refresh-kept".equals(store.value.optString("refresh")),
                     "HTTP " + status + " left the stored value in place");

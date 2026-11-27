@@ -70,9 +70,11 @@ final class WorkBuddyAuth {
     }
     static void applyIdentity(JSONObject account,JSONObject identity)throws IOException {
         WorkBuddyLogin.enterpriseValue(identity);
-        for(String key:new String[]{"uid","enterpriseId","enterpriseName","email"}){
+        for(String key:new String[]{"uid","enterpriseId","enterpriseName","email","nickname"}){
             String value=text(identity,key);if(!value.isEmpty()){if(!safe(value))throw new IOException("Invalid WorkBuddy identity");account.put(key,value);}
         }
+        String phone=text(identity,"phoneNumber");
+        if(!phone.isEmpty() && safe(phone) && account.optString("phone","").isEmpty()) account.put("phone",phone);
         if(account.optString("uid","").isEmpty()){String id=text(identity,"userId");if(!id.isEmpty()&&safe(id))account.put("uid",id);}
     }
     static JSONObject refreshCandidate(String provider,JSONObject account)throws Exception {

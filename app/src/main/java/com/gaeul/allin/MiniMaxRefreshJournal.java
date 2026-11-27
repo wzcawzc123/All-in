@@ -191,4 +191,18 @@ class MiniMaxRefreshJournal {
             r.completed=true; write(records); return true;
         });
     }
+    /**
+     * Revoke ONLY this ticket's pending fence when the transport proved zero request bytes were sent.
+     * Never removes a spent (completed) record or a fence owned by another attempt.
+     */
+    boolean abandonUnsent(Ticket ticket) throws IOException {
+        if(ticket==null) return false;
+        return locked((key,records)-> {
+            Record r=records.get(ticket.fingerprint);
+            if(r==null || r.completed || !r.owner.equals(ticket.owner) || !r.account.equals(ticket.account)) return false;
+            records.remove(ticket.fingerprint);
+            write(records);
+            return true;
+        });
+    }
 }

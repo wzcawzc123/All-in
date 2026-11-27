@@ -31,6 +31,7 @@ public class MainActivity extends Activity {
     private WebView webView;
     private final Handler panelRefreshHandler = new Handler(Looper.getMainLooper());
     private int statusBarInsetPx;
+    private int navBarInsetPx;
     private final BridgeStreamOwner bridgeStreams = new BridgeStreamOwner();
     private final java.util.concurrent.ThreadPoolExecutor bridgeExecutor = new java.util.concurrent.ThreadPoolExecutor(
             0, 16, 30L, java.util.concurrent.TimeUnit.SECONDS,
@@ -104,13 +105,32 @@ public class MainActivity extends Activity {
         webView.setOnApplyWindowInsetsListener((view, insets) -> {
             WindowInsets rootInsets = view.getRootWindowInsets();
             WindowInsets systemInsets = rootInsets != null ? rootInsets : insets;
-            int top = Math.max(systemInsets.getStableInsetTop(), systemInsets.getSystemWindowInsetTop());
-            if (Build.VERSION.SDK_INT >= 28 && systemInsets.getDisplayCutout() != null) {
-                top = Math.max(top, systemInsets.getDisplayCutout().getSafeInsetTop());
+            int top;
+            int bottom;
+            int imeBottom;
+            if (Build.VERSION.SDK_INT >= 30) {
+                android.graphics.Insets topInsets = systemInsets.getInsets(
+                        WindowInsets.Type.statusBars() | WindowInsets.Type.displayCutout());
+                android.graphics.Insets navInsets = systemInsets.getInsets(WindowInsets.Type.navigationBars());
+                android.graphics.Insets imeInsets = systemInsets.getInsets(WindowInsets.Type.ime());
+                top = topInsets.top;
+                bottom = navInsets.bottom;
+                imeBottom = imeInsets.bottom;
+            } else {
+                top = Math.max(systemInsets.getStableInsetTop(), systemInsets.getSystemWindowInsetTop());
+                if (Build.VERSION.SDK_INT >= 28 && systemInsets.getDisplayCutout() != null) {
+                    top = Math.max(top, systemInsets.getDisplayCutout().getSafeInsetTop());
+                }
+                bottom = systemInsets.getStableInsetBottom();
+                imeBottom = Math.max(0, systemInsets.getSystemWindowInsetBottom() - bottom);
             }
             statusBarInsetPx = top;
+            navBarInsetPx = imeBottom > 0 ? 0 : bottom;
+            if (view.getPaddingBottom() != imeBottom) {
+                view.setPadding(0, 0, 0, imeBottom);
+            }
             updateWebStatusBarInset();
-            return view.onApplyWindowInsets(insets);
+            return Build.VERSION.SDK_INT >= 30 ? WindowInsets.CONSUMED : insets.consumeSystemWindowInsets();
         });
 
         webView.setFocusable(true);
@@ -407,20 +427,25 @@ public class MainActivity extends Activity {
         if (webView == null) return;
         if (!bridgeAllowed() && !"file:///android_asset/licenses.html".equals(currentPageUrl)) return;
         float density = webView.getResources().getDisplayMetrics().density;
-        int insetDp = (int) Math.ceil(statusBarInsetPx / density);
-        webView.evaluateJavascript("document.documentElement.style.setProperty('--native-status-bar-inset','"
-                + insetDp + "px')", null);
+        int topDp = (int) Math.ceil(statusBarInsetPx / density);
+        int bottomDp = (int) Math.ceil(navBarInsetPx / density);
+        webView.evaluateJavascript(
+                "document.documentElement.style.setProperty('--native-status-bar-inset','" + topDp + "px');"
+                + "document.documentElement.style.setProperty('--native-nav-bar-inset','" + bottomDp + "px');",
+                null);
     }
 
     private void applySystemBarsInternal(boolean dark) {
         Window window = getWindow();
-        int background = dark ? android.graphics.Color.BLACK : android.graphics.Color.WHITE;
-        window.clearFlags(WindowManager.LayoutParams.FLAG_TRANSLUCENT_STATUS);
+        int background = dark ? android.graphics.Color.BLACK : 0xFFF4F4F7;
+        window.clearFlags(WindowManager.LayoutParams.FLAG_TRANSLUCENT_STATUS
+                | WindowManager.LayoutParams.FLAG_TRANSLUCENT_NAVIGATION);
         window.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS);
         window.setStatusBarColor(android.graphics.Color.TRANSPARENT);
-        window.setNavigationBarColor(background);
+        window.setNavigationBarColor(android.graphics.Color.TRANSPARENT);
         if (Build.VERSION.SDK_INT >= 29) {
             window.setStatusBarContrastEnforced(false);
+            window.setNavigationBarContrastEnforced(false);
         }
         if (Build.VERSION.SDK_INT >= 28) {
             WindowManager.LayoutParams attributes = window.getAttributes();
@@ -429,14 +454,25 @@ public class MainActivity extends Activity {
         }
         window.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(background));
 
-        // Extend the WebView under the status bar, keeping the bottom navigation area reserved.
+        // Full edge-to-edge: ensure DecorView is installed before touching WindowInsetsController.
         View decor = window.getDecorView();
-        int flags = View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_STABLE;
+        if (Build.VERSION.SDK_INT >= 30) {
+            window.setDecorFitsSystemWindows(false);
+            android.view.WindowInsetsController controller = decor != null ? decor.getWindowInsetsController() : null;
+            if (controller != null) {
+                int mask = android.view.WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
+                        | android.view.WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
+                controller.setSystemBarsAppearance(dark ? 0 : mask, mask);
+            }
+        }
+        int flags = View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                | View.SYSTEM_UI_FLAG_LAYOUT_STABLE;
         if (!dark) {
             flags |= View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
             if (Build.VERSION.SDK_INT >= 26) flags |= View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
         }
-        decor.setSystemUiVisibility(flags);
+        if (decor != null) decor.setSystemUiVisibility(flags);
     }
 
     /** ETA 的主 Activity（显式启动用） */

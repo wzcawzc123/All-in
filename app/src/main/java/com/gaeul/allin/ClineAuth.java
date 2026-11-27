@@ -87,7 +87,9 @@ public class ClineAuth {
     };
 
     public static HttpURLConnection openHttp(String urlStr) throws Exception {
-        return NetworkPolicy.openHttp(urlStr);
+        HttpURLConnection conn = NetworkPolicy.openHttp(urlStr);
+        if (conn != null) conn.setInstanceFollowRedirects(false);
+        return conn;
     }
 
     public static Map<String, String> clientHeaders(String taskId) {

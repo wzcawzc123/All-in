@@ -43,6 +43,9 @@ const scripts=[
   "tests/dashboard-model-names.cjs",
   "tests/dashboard-model-billing.cjs",
   "tests/dashboard-routing-audit.cjs",
+  "tests/dashboard-routing-v3-strategies.cjs",
+  "tests/dashboard-routing-save-queue.cjs",
+  "tests/dashboard-diagnostics-ui.cjs",
   "tests/dashboard-exposed.cjs",
   "tests/dashboard-background.cjs",
   "tests/dashboard-background-experiment.cjs",
@@ -69,7 +72,8 @@ const scripts=[
   "tests/dashboard-workbuddy-harness.cjs",
   "tests/trae-login-recovery.cjs",
   "scripts/beta-dashboard-xss.cjs",
-  "tests/dashboard-legacy-key-migration.cjs"
+  "tests/dashboard-legacy-key-migration.cjs",
+  "tests/dashboard-provider-cards-buttons.cjs"
 ];
 const build=path.join(root,'build');fs.mkdirSync(build,{recursive:true});
 const temporary=fs.mkdtempSync(path.join(build,'dashboard-regression-'));

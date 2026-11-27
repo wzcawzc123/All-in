@@ -53,7 +53,7 @@ public class MiniMaxIntegrationHttpTest {
             case "getMethod": return NanoHTTPD.Method.POST;
             case "getHeaders": return headers;
             case "getInputStream": return in;
-            case "getRemoteIpAddress": return "192.0.2.1";
+            case "getRemoteIpAddress": return "127.0.0.1";
             case "getParameters": return Collections.emptyMap();
             case "getParms": return Collections.emptyMap();
             default: return null;

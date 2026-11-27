@@ -15,8 +15,8 @@ android {
         applicationId 'com.gaeul.allin'
         minSdk 24
         targetSdk 34
-        versionCode 133
-        versionName '1.2.125-test'
+        versionCode 166
+        versionName '1.2.158-test'
         testInstrumentationRunner 'com.gaeul.allin.RepairInstrumentation'
     }
 
@@ -366,6 +366,8 @@ def offlineTestMains = [
         'com.gaeul.allin.ZCodeGiftModelsOfflineTest',
         'com.gaeul.allin.ZCodeGiftDecimalUnitsHttpTest',
         'com.gaeul.allin.CodeReviewFixesOfflineTest',
+        'com.gaeul.allin.WorkBuddyAutoTaskTest',
+        'com.gaeul.allin.AccountAuthHardeningTest',
 ]
 
 def mainClassesDir = provider { tasks.named('compileReleaseJavaWithJavac', JavaCompile).get().destinationDirectory.get() }
@@ -513,7 +515,7 @@ tasks.register('patienceRoutingHttpTests', JavaExec) {
 tasks.named('streamingHttpTests') { dependsOn 'patienceRoutingHttpTests' }
 
 // Protocol contract and diagnostic loopback regressions share the existing local HTTP gate.
-['ProtocolDiagnosticsHttpTest', 'ToolContractFailoverHttpTest', 'SessionAffinityHttpTest', 'AccountConversationHttpTest', 'WorkBuddyConversationHttpTest', 'WorkBuddyHistoryHttpTest', 'ProviderQuirksHttpTest', 'QuirksGatewayHttpTest', 'MiniMaxIntegrationHttpTest', 'IngressBodyHttpTest', 'IngressGatewayHttpTest', 'ImageGatewayHttpTest'].each { name ->
+['ProtocolDiagnosticsHttpTest', 'ToolContractFailoverHttpTest', 'SessionAffinityHttpTest', 'AccountConversationHttpTest', 'WorkBuddyConversationHttpTest', 'WorkBuddyHistoryHttpTest', 'ProviderQuirksHttpTest', 'QuirksGatewayHttpTest', 'MiniMaxIntegrationHttpTest', 'IngressBodyHttpTest', 'IngressGatewayHttpTest', 'ImageGatewayHttpTest', 'LiveCountersPersistenceHttpTest', 'ErrorDiagnosticsEndToEndHttpTest', 'CodexDiagnosticsAndRedactionHttpTest'].each { name ->
     def taskName = name.substring(0, 1).toLowerCase() + name.substring(1)
     tasks.register(taskName, JavaExec) {
         dependsOn 'compileOfflineTests'

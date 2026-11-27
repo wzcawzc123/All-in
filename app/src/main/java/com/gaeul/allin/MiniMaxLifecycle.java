@@ -80,8 +80,14 @@ final class MiniMaxLifecycle {
         }
         Credentials next = null;
         boolean completed = false;
+        boolean provablyNotSent = false;
         try {
-            next = operation.run(old);
+            try {
+                next = operation.run(old);
+            } catch (MiniMaxAuth.RefreshFailure rf) {
+                if (rf.definitelyNotSent()) provablyNotSent = true;
+                throw rf;
+            }
             if (next == null) throw new Unavailable("refresh outcome unknown");
             synchronized (this) {
                 if (!live(observed.id,e)) throw new Unavailable("account invalidated during refresh");
@@ -96,9 +102,9 @@ final class MiniMaxLifecycle {
             }
         } finally {
             synchronized (this) {
-                // A refresh request may have consumed its one-use token even on exception.
-                // Preserve old durable state but quarantine it; never silently replay refresh.
-                if (!completed && live(observed.id,e)) e.poisoned=true;
+                // Only keep the entry unpoisoned when the transport proved zero request bytes were sent.
+                // Any post-send failure, explicit reject, or unknown error still quarantines the token.
+                if (!completed && !provablyNotSent && live(observed.id,e)) e.poisoned=true;
                 e.refreshing=false; notifyAll();
             }
         }

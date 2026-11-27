@@ -25,6 +25,23 @@ final class MiniMaxAllowance {
         JSONObject d = body.optJSONObject("data");
         return d == null ? body : d;
     }
+    private static String extractDisplayName(JSONObject u, String uid) {
+        if (u != null) {
+            for (String key : new String[]{"userEmail", "email", "userMail", "user_email", "phone", "mobile", "name", "userName", "user_name"}) {
+                String v = u.optString(key, "").trim();
+                if (!v.isEmpty() && v.length() <= 80 && !v.matches("(?s).*[\\x00-\\x1f\\x7f].*")) {
+                    if ("phone".equals(key) || "mobile".equals(key)) {
+                        String m = RaccoonAccountService.maskPhone(v);
+                        if (!m.isEmpty()) return m;
+                    } else {
+                        return v;
+                    }
+                }
+            }
+        }
+        return uid == null ? "" : uid;
+    }
+
     static JSONObject fetch(String access, String group, MiniMaxAuth.AllowanceConnectionFactory factory) throws Exception {
         if (access == null || access.isEmpty()) throw new IOException("MiniMax access unavailable");
         long now = System.currentTimeMillis();
@@ -34,6 +51,7 @@ final class MiniMaxAllowance {
         if (u == null) u = data(identity).optJSONObject("user_info");
         String uid = u == null ? "" : u.optString("realUserID", u.optString("real_user_id", ""));
         if (!uid.matches("[A-Za-z0-9_-]{1,128}")) throw new IOException("MiniMax account identity unavailable");
+        String displayName = extractDisplayName(u, uid);
         JSONArray details = new JSONArray();
         HashSet<String> pageBodies = new HashSet<>();
         int expected = -1;
@@ -70,6 +88,7 @@ final class MiniMaxAllowance {
                     } catch (java.io.InterruptedIOException e) { if (Thread.currentThread().isInterrupted()) throw e; }
                       catch (Exception ignored) { }
                 }
+                if (!displayName.isEmpty()) out.put("_displayName", displayName);
                 return out;
             }
             if (rows.length() == 0) throw new IOException("MiniMax credit page missing");

@@ -64,6 +64,11 @@ public final class TraeGatewayHttpTest {
                         :m.equals("error")?"event: output\ndata: {\"content\":\"partial\"}\n\nevent: error\ndata: {\"code\":1}\n\n"
                         :m.equals("tool")?"event: output\ndata: {\"tool_calls\":[{\"id\":\"call_fixture_123\",\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]}\n\n"+END
                         :"event: output\ndata: {\"content\":\"hello\"}\n\n";
+                if (m.equals("tool-thinking") || m.equals("thinking-only")) {
+                    text = "event: output\ndata: {\"reasoning_content\":\"qa-unsigned-thought\"}\n\n";
+                    if (m.equals("tool-thinking")) text += "event: output\ndata: {\"tool_calls\":[{\"id\":\"call_qa_replay\",\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"number\\\":7}\"}}]}\n\n";
+                    text += END;
+                }
                 if (m.startsWith("format-")) {
                     String content = m.startsWith("format-bad") ? "{\"id\":7}" : m.equals("format-prose") ? "not JSON"
                             : m.equals("format-length") ? "{\"id\":" : "```json\n{\"id\":\"work-12\",\"note\":\"<tool_call>literal</tool_call>\"}\n```";
@@ -153,6 +158,67 @@ public final class TraeGatewayHttpTest {
         r=post(g,"/v1/chat/completions",summary);check(r.status==200,"tool history without tools: "+r.status+" "+r.body);
         check(u.body.contains("<tool_call>")&&u.body.contains("Result of run (call call_fixture_123):"),"text form went upstream: "+u.body);
         u.mode="ok";
+    }
+    static JSONArray messagesBlocks(Result response, boolean stream) throws Exception {
+        if (!stream) return new JSONObject(response.body).getJSONArray("content");
+        JSONArray blocks = new JSONArray();
+        java.util.Map<Integer, StringBuilder> arguments = new java.util.HashMap<>();
+        for (String line : response.body.split("\n")) {
+            if (!line.startsWith("data: ")) continue;
+            JSONObject event = new JSONObject(line.substring(6));
+            if ("content_block_start".equals(event.optString("type"))) {
+                blocks.put(event.getInt("index"), event.getJSONObject("content_block"));
+            } else if ("content_block_delta".equals(event.optString("type"))) {
+                int index = event.getInt("index");
+                JSONObject delta = event.getJSONObject("delta"), block = blocks.getJSONObject(index);
+                if ("input_json_delta".equals(delta.optString("type")))
+                    arguments.computeIfAbsent(index, (key) -> new StringBuilder()).append(delta.getString("partial_json"));
+                else if ("thinking_delta".equals(delta.optString("type")))
+                    block.put("thinking", block.optString("thinking", "") + delta.getString("thinking"));
+            }
+        }
+        for (java.util.Map.Entry<Integer, StringBuilder> arg : arguments.entrySet())
+            blocks.getJSONObject(arg.getKey()).put("input", new JSONObject(arg.getValue().toString()));
+        return blocks;
+    }
+    static void replayMessagesTools(Gateway g, Upstream u) throws Exception {
+        for (boolean stream : new boolean[]{false, true}) {
+            JSONObject request = chat("trae-cn/fixture", stream).put("max_tokens", 256)
+                    .put("tools", new JSONArray().put(new JSONObject().put("name", "run")
+                            .put("input_schema", new JSONObject().put("type", "object"))));
+            u.mode = "tool-thinking";
+            int before = u.count.get();
+            Result first = post(g, "/v1/messages", request);
+            check(first.status == 200 && u.count.get() == before + 1, "first Messages request reaches upstream once");
+            check(stream ? first.body.contains("event: message_stop") : "tool_use".equals(new JSONObject(first.body).optString("stop_reason")), "tool turn ends correctly");
+            JSONArray blocks = messagesBlocks(first, stream);
+            JSONObject tool = null;
+            for (int i=0; i<blocks.length(); i++) if ("tool_use".equals(blocks.getJSONObject(i).optString("type"))) tool=blocks.getJSONObject(i);
+            check(tool != null && "call_qa_replay".equals(tool.optString("id")) && "run".equals(tool.optString("name")) && tool.getJSONObject("input").getInt("number") == 7, "tool identity and exact arguments survive");
+            request.getJSONArray("messages").put(new JSONObject().put("role", "assistant").put("content", blocks))
+                    .put(new JSONObject().put("role", "user").put("content", new JSONArray().put(new JSONObject()
+                            .put("type", "tool_result").put("tool_use_id", tool.getString("id")).put("content", "qa-tool-result-49"))));
+            u.mode = "ok";
+            Result second = post(g, "/v1/messages", request);
+            check(second.status == 200 && u.count.get() == before + 2 && second.body.contains("hello"), "unmodified Messages tool history must replay successfully, stream=" + stream + ", status=" + second.status);
+            check(stream ? second.body.contains("event: message_stop") : "end_turn".equals(new JSONObject(second.body).optString("stop_reason")), "tool result completes normally");
+            check(u.body.contains("call_qa_replay") && u.body.contains("qa-tool-result-49"), "tool ID and result reach Trae");
+            check(blocks.length() == 1 && !first.body.contains("qa-unsigned-thought"), "no unsigned thinking in replayable Messages");
+            JSONObject protectedRequest = new JSONObject(request.toString());
+            protectedRequest.getJSONArray("messages").getJSONObject(1).getJSONArray("content")
+                    .put(new JSONObject().put("type", "thinking").put("thinking", "foreign-native").put("signature", "signed-fixture"));
+            check(post(g, "/v1/messages", protectedRequest).status == 400 && u.count.get() == before + 2, "native-only signed history still fails closed on Trae");
+            u.mode = "thinking-only";
+            Result only = post(g, "/v1/messages", chat("trae-cn/fixture", stream).put("max_tokens", 256));
+            check(stream ? only.body.contains("event: error") && !only.body.contains("event: message_stop") : only.status == 502, "suppressed thought alone never becomes successful empty output");
+            u.mode = "tool-thinking";
+            JSONObject chatTool = chat("trae-cn/fixture", stream).put("tools", new JSONArray().put(new JSONObject().put("type", "function")
+                    .put("function", new JSONObject().put("name", "run").put("parameters", new JSONObject().put("type", "object")))));
+            Result unchanged = post(g, "/v1/chat/completions", chatTool);
+            check(unchanged.status == 200 && unchanged.body.contains("qa-unsigned-thought") && unchanged.body.contains("call_qa_replay"), "Chat still exposes reasoning and tools");
+        }
+        u.mode = "ok";
+        System.out.println("Trae Messages replay: JSON and SSE round trips, native protection and no empty success PASS");
     }
     static void structuredOutput(Gateway gateway, Upstream upstream) throws Exception {
         JSONObject simple = new JSONObject().put("type", "json_object");
@@ -471,7 +537,7 @@ public final class TraeGatewayHttpTest {
     }
     public static void main(String[] args) throws Exception {
         Path dir=Files.createTempDirectory("trae-gateway-http");UsageLedger.init(dir.toFile());GatewayManagementCredential.init(dir.toFile());
-        try(Upstream u=new Upstream();Upstream fallback=new Upstream()){if(args.length>0 && args[0].equals("--sessions")) sessions(dir,u,fallback); else if(args.length>0 && args[0].equals("--functions")) functions(dir,u,fallback); else if(args.length>0 && args[0].equals("--verdicts")) verdicts(dir,u,fallback); else if(args.length>0 && args[0].equals("--cancel")) cancel(dir,u,fallback); else {JSONObject cfg=config(fallback);try(Gateway g=new Gateway(cfg,dir,u)){successes(g,u);structuredOutput(g,u);failures(g,u,fallback);api(g,u,cfg);}u.mode="ok";sessions(dir,u,fallback);functions(dir,u,fallback);verdicts(dir,u,fallback);cancel(dir,u,fallback);}}
+        try(Upstream u=new Upstream();Upstream fallback=new Upstream()){if(args.length>0 && args[0].equals("--sessions")) sessions(dir,u,fallback); else if(args.length>0 && args[0].equals("--functions")) functions(dir,u,fallback); else if(args.length>0 && args[0].equals("--verdicts")) verdicts(dir,u,fallback); else if(args.length>0 && args[0].equals("--cancel")) cancel(dir,u,fallback); else {JSONObject cfg=config(fallback);try(Gateway g=new Gateway(cfg,dir,u)){successes(g,u);replayMessagesTools(g,u);structuredOutput(g,u);failures(g,u,fallback);api(g,u,cfg);}u.mode="ok";sessions(dir,u,fallback);functions(dir,u,fallback);verdicts(dir,u,fallback);cancel(dir,u,fallback);}}
         System.out.println("TraeGatewayHttpTest OK");
     }
 }

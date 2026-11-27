@@ -3872,6 +3872,165 @@ public final class GatewayReleaseHardeningOfflineTest {
         clineLostAnswerKeepsFenceAndNeverReplays();
         concurrentSavesPublishExactlyTheDurableState();
         statusExposesOperationalState();
+        lanRejectsWeakShortAuthKey();
+        endpointChangeRejectsOldSecretRefs();
+        recoveryProtectsDiskAndKeepsRotatedCredentialsInMemory();
         System.out.println("GatewayReleaseHardeningOfflineTest OK");
+    }
+
+    static void lanRejectsWeakShortAuthKey() throws Exception {
+        File dir = tempDir("hardening-weak-lan-");
+        File config = new File(dir, "config.json");
+        write(config, "{\"server\":{\"authKey\":\"abcde\"},\"setup\":{\"done\":true},"
+                + "\"providers\":[{\"id\":\"alpha\",\"protocol\":\"openai\",\"keys\":[\"synthetic\"],\"models\":[\"known\"]}]}");
+        GatewayServer srv = fixture(new JSONObject(read(config)), config);
+
+        Reply lanModels = call(srv, "192.0.2.9", "/v1/models", "GET", "", "abcde");
+        check(lanModels.status == 403 && "auth_key_too_short".equals(errorCode(lanModels.body)),
+                "#3 LAN /v1/models must block 5-char key with auth_key_too_short, got " + lanModels.status + " " + lanModels.body);
+
+        Reply lanChat = call(srv, "192.0.2.9", "/v1/chat/completions", "POST",
+                "{\"model\":\"alpha/known\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}", "abcde");
+        check(lanChat.status == 403 && "auth_key_too_short".equals(errorCode(lanChat.body)),
+                "#3 LAN /v1/chat/completions must block 5-char key, got " + lanChat.status);
+
+        Reply localModels = call(srv, "127.0.0.1", "/v1/models", "GET", "", "abcde");
+        check(localModels.status != 403, "#3 loopback migration path must stay open, got " + localModels.status);
+    }
+
+    static void endpointChangeRejectsOldSecretRefs() throws Exception {
+        File dir = tempDir("hardening-endpoint-ref-");
+        File config = new File(dir, "config.json");
+        JSONObject initConf = new JSONObject()
+                .put("setup", new JSONObject().put("done", true))
+                .put("server", new JSONObject().put("authKey", "fixture-strong-key"))
+                .put("providers", new JSONArray().put(new JSONObject()
+                        .put("id", "custom-1")
+                        .put("name", "CustomOne")
+                        .put("type", CustomProvider.TYPE)
+                        .put("protocol", "openai")
+                        .put("authMode", "bearer")
+                        .put("baseUrl", "https://orig.example/v1")
+                        .put("keys", new JSONArray().put("sk-real-secret-1"))
+                        .put("headers", new JSONObject())
+                        .put("models", new JSONArray().put("m1"))
+                        .put("enabled", true)));
+        write(config, initConf.toString(2));
+        GatewayServer srv = fixture(new JSONObject(read(config)), config);
+        Reply getCfg = call(srv, "127.0.0.1", "/api/config", "GET", "", null);
+        check(getCfg.status == 200, "expected /api/config 200, got " + getCfg.status + " " + getCfg.body);
+        JSONObject view = new JSONObject(getCfg.body);
+        String refKey = view.getJSONArray("providers").getJSONObject(0).getJSONArray("keys").getString(0);
+        check(refKey.startsWith("allin-secret-ref:"), "expected secret ref, got " + refKey);
+
+        JSONObject customProvider = view.getJSONArray("providers").getJSONObject(0);
+        String tok = (String) call(srv, "providerStateToken", new Class<?>[]{JSONObject.class},
+                ((JSONObject) field(srv, "configJson")).getJSONArray("providers").getJSONObject(0));
+        JSONObject mutatedDraft = new JSONObject(customProvider.toString());
+        mutatedDraft.put("baseUrl", "https://attacker.example/v1");
+        mutatedDraft.remove("modelMeta");
+        mutatedDraft.remove("type");
+        JSONObject mutBody = new JSONObject().put("action", "save").put("expectedStateToken", tok).put("provider", mutatedDraft);
+        Reply customRes = call(srv, "127.0.0.1", "/api/providers/custom", "POST", mutBody.toString(), null);
+        check(customRes.status == 400, "#4 custom provider baseUrl change with secret-ref MUST return 400, got " + customRes.status + " " + customRes.body);
+
+        JSONObject cfgBody = new JSONObject(view.toString());
+        cfgBody.put("expectedRevision", view.optString("revision"));
+        cfgBody.getJSONArray("providers").getJSONObject(0).put("baseUrl", "https://attacker.example/v1");
+        Reply cfgRes = call(srv, "127.0.0.1", "/api/config", "POST", cfgBody.toString(), null);
+        check(cfgRes.status == 400, "#4 /api/config baseUrl change with secret-ref MUST return 400, got " + cfgRes.status + " " + cfgRes.body);
+    }
+
+    static void recoveryProtectsDiskAndKeepsRotatedCredentialsInMemory() throws Exception {
+        File dir = tempDir("hardening-recovery-token-");
+        File config = new File(dir, "config.json");
+        String damagedDisk = "{corrupted-on-disk-must-remain-untouched";
+        write(config, damagedDisk);
+
+        long expired = System.currentTimeMillis() - 60_000L;
+        JSONObject wbAcc = new JSONObject()
+                .put("id", "wb-rec-1").put("type", "oauth")
+                .put("access", "wb-old-access").put("token", "wb-old-access")
+                .put("refresh", "wb-old-refresh-spent")
+                .put("expires", expired).put("enabled", true);
+        JSONObject codexAcc = new JSONObject()
+                .put("id", "cx-rec-1").put("source", "oauth").put("authMode", "chatgpt")
+                .put("access", "cx-old-access").put("token", "cx-old-access")
+                .put("refresh", "cx-old-refresh-spent").put("idToken", "jwt-old")
+                .put("expires", expired).put("enabled", true);
+        JSONObject memConf = new JSONObject()
+                .put("setup", new JSONObject().put("done", true))
+                .put("server", new JSONObject().put("authKey", "fixture-strong-key"))
+                .put("providers", new JSONArray()
+                        .put(new JSONObject().put("id", "workbuddy").put("protocol", "workbuddy").put("enabled", true)
+                                .put("models", new JSONArray().put("glm-5.3")).put("accounts", new JSONArray().put(wbAcc)))
+                        .put(new JSONObject().put("id", "codex").put("protocol", "codex").put("enabled", true)
+                                .put("models", new JSONArray().put("gpt-5")).put("accounts", new JSONArray().put(codexAcc))));
+        GatewayServer srv = fixture(memConf, config);
+        // Enter recovery mode keeping memory alive while durable config on disk is unreadable
+        call(srv, "enterConfigRecovery", new Class<?>[]{Exception.class, boolean.class},
+                new IOException("corrupt"), true);
+        check((Boolean) field(srv, "configRecoveryRequired"), "expected recovery flag set");
+
+        // 1) Non-refresh write (e.g. persistProviderCatalog) MUST be blocked and disk untouched
+        boolean catalogBlocked = false;
+        try {
+            call(srv, "persistProviderCatalog",
+                    new Class<?>[]{String.class, JSONObject.class, JSONArray.class, JSONObject.class},
+                    "workbuddy", memConf.getJSONArray("providers").getJSONObject(0),
+                    new JSONArray().put("glm-5.3"), new JSONObject());
+        } catch (java.lang.reflect.InvocationTargetException expected) {
+            catalogBlocked = expected.getCause() instanceof IOException;
+        }
+        check(catalogBlocked, "#5 catalog persist during recovery MUST fail closed");
+        check(damagedDisk.equals(read(config)), "#5 configFile must stay untouched after catalog block");
+
+        // 2) Simulated token refresh exchange occurred during/before recovery -> disk stays untouched,
+        //    rotated token retained in memory, old consumed refresh fenced and NOT re-consumed
+        final AtomicInteger wbRefreshes = new AtomicInteger(0);
+        setField(srv, "tokenRefreshForTests", (AccountTokenCoordinator.Refresher) (snap, force) -> {
+            wbRefreshes.incrementAndGet();
+            JSONObject next = new JSONObject(snap.toString());
+            next.put("access", "wb-new-access-rotated");
+            next.put("token", "wb-new-access-rotated");
+            next.put("refresh", "wb-new-refresh-rotated");
+            next.put("expires", System.currentTimeMillis() + 3600_000L);
+            return next;
+        });
+        JSONObject refreshedWb = (JSONObject) call(srv, "ensureStoredToken",
+                new Class<?>[]{String.class, JSONObject.class, String.class},
+                "workbuddy", wbAcc, null);
+        check("wb-new-access-rotated".equals(refreshedWb.optString("access"))
+                && "wb-new-refresh-rotated".equals(refreshedWb.optString("refresh")),
+                "#5 rotated credentials must be returned and kept in memory: " + refreshedWb);
+        check(damagedDisk.equals(read(config)), "#5 configFile MUST NOT be overwritten during recovery refresh!");
+        JSONObject memWb = ((JSONObject) field(srv, "configJson")).getJSONArray("providers")
+                .getJSONObject(0).getJSONArray("accounts").getJSONObject(0);
+        check("wb-new-access-rotated".equals(memWb.optString("access"))
+                && "wb-new-refresh-rotated".equals(memWb.optString("refresh")),
+                "#5 live memory MUST hold rotated token, not consumed old refresh: " + memWb);
+        Boolean oldSpent = (Boolean) call(srv, "refreshValueRecordedAsSpent",
+                new Class<?>[]{String.class, String.class}, "workbuddy", "wb-old-refresh-spent");
+        check(Boolean.TRUE.equals(oldSpent), "#5 consumed old refresh MUST remain fenced as spent!");
+        // Subsequent ensureStoredToken uses rotated access from memory without hitting upstream refresh again
+        call(srv, "ensureStoredToken",
+                new Class<?>[]{String.class, JSONObject.class, String.class},
+                "workbuddy", memWb, null);
+        check(wbRefreshes.get() == 1, "#5 must NOT trigger duplicate refresh after memory retention, got " + wbRefreshes.get());
+
+        // 3) Codex refreshCommit during recovery MUST preserve disk and update memory cleanly
+        CodexAuth.SignInInfo cxInfo = new CodexAuth.SignInInfo();
+        cxInfo.accessToken = "cx-old-access"; cxInfo.refreshToken = "cx-old-refresh-spent";
+        cxInfo.idToken = "jwt-old"; cxInfo.accountId = "cx-rec-1"; cxInfo.expiresAt = expired;
+        call(srv, "bindCodexPersistence", new Class<?>[]{JSONObject.class, CodexAuth.SignInInfo.class}, codexAcc, cxInfo);
+        CodexAuth.SignInInfo cxNext = new CodexAuth.SignInInfo();
+        cxNext.accessToken = "cx-new-access"; cxNext.refreshToken = "cx-new-refresh";
+        cxNext.idToken = "jwt-new"; cxNext.accountId = "cx-rec-1"; cxNext.expiresAt = System.currentTimeMillis() + 3600_000L;
+        CodexAuth.applyCommittedRefresh(cxInfo, cxNext);
+        check(damagedDisk.equals(read(config)), "#5 Codex refreshCommit MUST NOT overwrite configFile in recovery!");
+        JSONObject memCx = ((JSONObject) field(srv, "configJson")).getJSONArray("providers")
+                .getJSONObject(1).getJSONArray("accounts").getJSONObject(0);
+        check("cx-new-access".equals(memCx.optString("access")) && "cx-new-refresh".equals(memCx.optString("refresh")),
+                "#5 Codex rotated credentials must be retained in memory: " + memCx);
     }
 }

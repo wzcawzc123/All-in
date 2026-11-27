@@ -327,6 +327,70 @@ public class CodexAuth {
         return !"unauthorized_recovery".equals(reason)
                 || !java.util.Objects.equals(currentAccess, cachedAccess);
     }
+    /**
+     * Structured, redacted Codex refresh failure aligned with Magpie's codex_signin_gone.go.
+     * Distinguishes permanent sign-in-gone refusals from proxy bare 401 / 429 / 5xx / transport hiccups.
+     */
+    public static final class RefreshFailure extends IOException {
+        public final int httpStatus;
+        public final String errorCode;
+        public final String stage;
+        public final boolean signInGone;
+
+        RefreshFailure(int httpStatus, String errorCode, String stage, String message, Throwable cause) {
+            super(message, cause);
+            this.httpStatus = httpStatus;
+            this.errorCode = sanitizeErrorCode(errorCode);
+            this.stage = stage == null ? "unknown" : stage;
+            this.signInGone = isRefreshSignInGone(httpStatus, this.errorCode);
+        }
+
+        static String sanitizeErrorCode(String raw) {
+            if (raw == null) return "";
+            String s = raw.trim();
+            return s.matches("[A-Za-z0-9_.-]{1,64}") ? s : "";
+        }
+
+        /** Parses OpenAI OAuth token error code: "error" string, then error.code, then top-level code. */
+        static String parseErrorCode(String body) {
+            if (body == null || body.trim().isEmpty()) return "";
+            try {
+                JSONObject obj = new JSONObject(body);
+                Object err = obj.opt("error");
+                if (err instanceof String) {
+                    String s = sanitizeErrorCode((String) err);
+                    if (!s.isEmpty()) return s;
+                } else if (err instanceof JSONObject) {
+                    String s = sanitizeErrorCode(((JSONObject) err).optString("code", ""));
+                    if (!s.isEmpty()) return s;
+                }
+                return sanitizeErrorCode(obj.optString("code", ""));
+            } catch (Exception ignored) {
+                return "";
+            }
+        }
+
+        /**
+         * Exact parity with Magpie codex_signin_gone.go (codexRefreshGone):
+         * - refresh_token_expired / refresh_token_reused / refresh_token_invalidated -> true
+         * - HTTP 400 + invalid_grant -> true
+         * - HTTP 401 WITH a non-empty endpoint error code -> true
+         * - Bare HTTP 401 (no code, e.g. proxy page), 403, 429, 5xx, other 400 -> false
+         */
+        static boolean isRefreshSignInGone(int status, String code) {
+            String lc = code == null ? "" : code.toLowerCase(Locale.ROOT);
+            if ("refresh_token_expired".equals(lc)
+                    || "refresh_token_reused".equals(lc)
+                    || "refresh_token_invalidated".equals(lc)) {
+                return true;
+            }
+            if (status == 400 && "invalid_grant".equals(lc)) {
+                return true;
+            }
+            return status == 401 && !lc.isEmpty();
+        }
+    }
+
     /** Cache successful exchanges even if local commit fails, to permit safe retry. */
     public static void refreshToken(SignInInfo info, String reason) throws Exception {
         if (info == null || info.refreshToken == null || info.refreshToken.isEmpty())
@@ -347,10 +411,9 @@ public class CodexAuth {
             if (cached != null) cached.apply(candidate);
             else {
                 try { refreshTokenExchange(candidate, reason); }
+                catch (RefreshFailure rf) { throw rf; }
                 catch (Exception failure) {
-                    String message = failure.getMessage();
-                    if (message != null && message.matches("Codex 令牌刷新失败 \\(HTTP [0-9]{3}\\)")) throw new Exception(message);
-                    throw new Exception("Codex 令牌刷新失败：网络或响应错误");
+                    throw new RefreshFailure(0, "", "send_or_read", "Codex 令牌刷新失败：网络或响应错误", failure);
                 }
                 synchronized (REFRESH_RESULTS) {
                     REFRESH_RESULTS.put(key, new RefreshResult(candidate));
@@ -360,6 +423,8 @@ public class CodexAuth {
             applyCommittedRefresh(info, candidate);
         }
     }
+    static volatile CatalogConnectionFactory refreshConnectionFactoryForTests;
+
     private static void refreshTokenExchange(SignInInfo info, String reason) throws Exception {
         if (info.refreshToken == null || info.refreshToken.isEmpty()) {
             throw new IllegalStateException("无可用的 refresh_token，无法续期");
@@ -370,44 +435,67 @@ public class CodexAuth {
         body.put("refresh_token", info.refreshToken);
         body.put("refresh_reason", reason != null ? reason : "proactive_expiry");
 
-        HttpURLConnection conn = openHttp(TOKEN_URL);
-        conn.setRequestMethod("POST");
-        conn.setDoOutput(true);
-        conn.setConnectTimeout(15000);
-        conn.setReadTimeout(15000);
-        conn.setRequestProperty("Content-Type", "application/json");
-        conn.setRequestProperty("Accept", "application/json");
-        conn.setRequestProperty("originator", ORIGINATOR);
-        conn.setRequestProperty("User-Agent", USER_AGENT);
+        HttpURLConnection conn = null;
+        boolean sent = false;
+        try {
+            CatalogConnectionFactory testFactory = refreshConnectionFactoryForTests;
+            conn = testFactory != null ? testFactory.open(TOKEN_URL) : openHttp(TOKEN_URL);
+            conn.setRequestMethod("POST");
+            conn.setDoOutput(true);
+            conn.setConnectTimeout(15000);
+            conn.setReadTimeout(15000);
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setRequestProperty("Accept", "application/json");
+            conn.setRequestProperty("originator", ORIGINATOR);
+            conn.setRequestProperty("User-Agent", USER_AGENT);
 
-        OutputStream os = conn.getOutputStream();
-        os.write(body.toString().getBytes(StandardCharsets.UTF_8));
-        os.flush();
-        os.close();
+            OutputStream os = conn.getOutputStream();
+            sent = true;
+            os.write(body.toString().getBytes(StandardCharsets.UTF_8));
+            os.flush();
+            os.close();
 
-        int code = conn.getResponseCode();
-        InputStream is = (code >= 200 && code < 400) ? conn.getInputStream() : conn.getErrorStream();
-        ByteArrayOutputStream bos = new ByteArrayOutputStream();
-        byte[] buf = new byte[2048];
-        int n;
-        while ((n = is.read(buf)) != -1) bos.write(buf, 0, n);
-        is.close();
+            int code = conn.getResponseCode();
+            InputStream is = (code >= 200 && code < 400) ? conn.getInputStream() : conn.getErrorStream();
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            if (is != null) {
+                byte[] buf = new byte[2048];
+                int n;
+                while ((n = is.read(buf)) != -1 && bos.size() < 262144) bos.write(buf, 0, n);
+                is.close();
+            }
 
-        String resStr = bos.toString("UTF-8");
-        if (code != 200) {
-            throw new Exception("Codex 令牌刷新失败 (HTTP " + code + ")");
+            String resStr = bos.toString("UTF-8");
+            if (code != 200) {
+                String errCode = RefreshFailure.parseErrorCode(resStr);
+                String msg = errCode.isEmpty()
+                        ? ("Codex 令牌刷新失败 (HTTP " + code + ")")
+                        : ("Codex 令牌刷新失败 (HTTP " + code + ", " + errCode + ")");
+                throw new RefreshFailure(code, errCode, "http_status", msg, null);
+            }
+
+            JSONObject res;
+            try { res = new JSONObject(resStr); }
+            catch (Exception badJson) {
+                throw new RefreshFailure(code, "", "parse_response", "Codex 令牌刷新失败：响应非 JSON", badJson);
+            }
+            String newAcc = res.optString("access_token", "");
+            if (newAcc.isEmpty()) {
+                throw new RefreshFailure(code, "", "parse_response", "刷新响应中缺少 access_token", null);
+            }
+            info.accessToken = newAcc;
+            String newRef = res.optString("refresh_token", "");
+            if (!newRef.isEmpty()) info.refreshToken = newRef;
+            String newId = res.optString("id_token", "");
+            if (!newId.isEmpty()) info.idToken = newId;
+        } catch (RefreshFailure rf) {
+            throw rf;
+        } catch (Exception io) {
+            throw new RefreshFailure(0, "", sent ? "send_or_read" : "before_send",
+                    "Codex 令牌刷新失败：网络或响应错误", io);
+        } finally {
+            if (conn != null) conn.disconnect();
         }
-
-        JSONObject res = new JSONObject(resStr);
-        String newAcc = res.optString("access_token", "");
-        if (newAcc.isEmpty()) {
-            throw new Exception("刷新响应中缺少 access_token");
-        }
-        info.accessToken = newAcc;
-        String newRef = res.optString("refresh_token", "");
-        if (!newRef.isEmpty()) info.refreshToken = newRef;
-        String newId = res.optString("id_token", "");
-        if (!newId.isEmpty()) info.idToken = newId;
 
         info.lastRefresh = System.currentTimeMillis();
         JSONObject claims = decodeJwtPayload(!info.idToken.isEmpty() ? info.idToken : info.accessToken);

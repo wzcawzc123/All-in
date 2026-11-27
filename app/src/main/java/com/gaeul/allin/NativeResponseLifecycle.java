@@ -20,6 +20,7 @@ final class NativeResponseLifecycle {
     }
     static NativeResponseLifecycle begin(String provider,String requested,String model,String session,RequestContext context) {
         UsageLedger.Row row=new UsageLedger.Row();
+        GatewayServer.attachLiveStatsTarget(row, context);
         row.requestId=context==null?UUID.randomUUID().toString():context.requestId;
         row.prov=provider;row.req=requested==null?"":requested;row.model=model==null?"":model;
         row.session=session==null?"":session;row.ep="native";row.attempt=0;row.tries=0;
@@ -56,9 +57,24 @@ final class NativeResponseLifecycle {
         row.terminal=true;
         boolean ok=status>=200 && status<300 && row.err.isEmpty();
         String failure=status==499?"cancelled":status==504?"deadline":sent?"unknown_execution":"admission";
-        if(!ok)row.failureKind=failure;
+        if(!ok) {
+            row.failureKind=failure;
+            if(status==499 && (row.failureReason==null || row.failureReason.isEmpty())) row.failureReason="downstream_cancelled";
+            else if(status==504 && (row.failureReason==null || row.failureReason.isEmpty())) row.failureReason="read_timeout";
+            else if("Native downstream write failed or cancelled".equals(row.err) && (row.failureReason==null || row.failureReason.isEmpty())) {
+                row.failurePhase="downstream_delivery";
+                row.transportKind="downstream";
+                row.failureReason="downstream_write_failed";
+            }
+        }
+        if(row.bridgeStatus==null || row.bridgeStatus.isEmpty()) row.bridgeStatus=ok?"native":"upstream_aborted";
+        if(row.deliveryStatus==null || row.deliveryStatus.isEmpty()) {
+            row.deliveryStatus=!ok?(status==499||status==504?"cancelled":"failed")
+                    :(Boolean.TRUE.equals(delivered)?"delivered":(Boolean.FALSE.equals(delivered)?"failed":"unknown"));
+        }
         RequestDiagnostics.outcome(row,ok,!sent,failure,false);
         if(delivered!=null)RequestDiagnostics.nativeCompletion(row,delivered && ok);
+        GatewayServer.logGatewayOutcomeSummary(row);
         RequestDiagnostics.freeze(row);UsageLedger.record(row);
     }
     InputStream wrap(InputStream source,HttpURLConnection connection,int status) {
@@ -89,6 +105,7 @@ final class NativeResponseLifecycle {
             return n;
         }
         IOException readFailed(IOException failure){
+            if (row != null) GatewayServer.recordStreamThrowable(row, failure, clientCancelled());
             fail(clientCancelled()?499:context!=null && context.remainingMillis()==0?504:502,"Native response interrupted or incomplete");
             release();if(!writeStarted)finish(null);return failure;
         }

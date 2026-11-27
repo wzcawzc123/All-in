@@ -6,9 +6,7 @@ All In 在 Android 设备上运行 HTTP 服务。你在手机上配置供应商�
 
 [下载 APK](https://github.com/xunianooo/All-in/releases/latest) · [查看更新记录](https://github.com/xunianooo/All-in/releases) · [反馈问题](https://github.com/xunianooo/All-in/issues)
 
-当前发布版为 **All In 1.2.125-test（构建 133）**。[1.2.125-test 更新说明](docs/RELEASE_1.2.125-test.md)
-
-本次发布保留已验证原签 APK 的实际版本名 `1.2.125-test`，不修改或重打安装包。新增 zstd-jni / Zstandard 的版权与许可原文随本次源码归档提供，见[第三方许可说明](docs/THIRD_PARTY_NOTICES.md)。
+当前正式版为 **All In 1.2.116（构建 124）**。[1.2.116 更新说明](docs/RELEASE_1.2.116.md)
 
 > [!IMPORTANT]
 > **老用户升级后，请把「治理 → 网关上下文与超时 → 请求体上限」改成 `0`，再点击「保存网关设置」。**

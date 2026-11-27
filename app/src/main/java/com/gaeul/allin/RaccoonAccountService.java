@@ -56,6 +56,34 @@ public final class RaccoonAccountService {
         }
     }
 
+    static String maskPhone(String raw) {
+        if (raw == null) return "";
+        String s = raw.trim();
+        if (s.isEmpty() || s.length() > 40) return "";
+        for (int i = 0; i < s.length(); i++) {
+            char ch = s.charAt(i);
+            if (ch < 32 || ch == 127) return "";
+        }
+        if (s.contains("*")) return s;
+        String digits = s.replaceAll("\\D+", "");
+        if (digits.startsWith("0086") && digits.length() == 15) digits = digits.substring(4);
+        else if (digits.startsWith("86") && digits.length() == 13) digits = digits.substring(2);
+        if (digits.length() == 11) return digits.substring(0, 3) + "****" + digits.substring(7);
+        return "";
+    }
+
+    /** Best-effort read-only phone lookup via /api/web/auth/v1/user_info; returns masked phone or empty. */
+    String maskedPhone() {
+        try {
+            JSONObject body = get("GET", "/api/web/auth/v1/user_info", false);
+            if (body == null) return "";
+            String phone = body.optString("phone", body.optString("mobile", "")).trim();
+            return maskPhone(phone);
+        } catch (Exception ignored) {
+            return "";
+        }
+    }
+
     public long balance() throws IOException {
         return balanceDetail().available;
     }

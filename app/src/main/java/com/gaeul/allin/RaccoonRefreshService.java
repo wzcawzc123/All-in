@@ -127,7 +127,7 @@ public final class RaccoonRefreshService {
                     "Raccoon refresh response incomplete", null);
         JSONObject payload = response.body;
         if (response.status < 200 || response.status >= 300) {
-            boolean expired = response.status >= 400 && response.status < 500;
+            boolean expired = isHttpAuthExpired(response.status, payload);
             throw new RaccoonAccountService.Failure(errorMessage(payload, "HTTP " + response.status), expired);
         }
         if (payload == null)
@@ -150,6 +150,25 @@ public final class RaccoonRefreshService {
         candidate.put("expires", next.expiresAtMillis);
         candidate.put("lastRefresh", now);
         return candidate;
+    }
+
+    /**
+     * Only explicit auth failures mark the Raccoon refresh credential expired:
+     * - HTTP 429 (rate limit), 408 (timeout), 403/404, 5xx, and generic 400 are NOT expired.
+     * - HTTP 401 or upstream auth business codes (100002, 200001, 200003) or HTTP 400 invalid_grant are expired.
+     */
+    static boolean isHttpAuthExpired(int status, JSONObject payload) {
+        if (status == 429 || status == 408 || status >= 500) return false;
+        if (payload != null && payload.has("code") && !payload.isNull("code")) {
+            int biz = payload.optInt("code", -1);
+            if (biz == 100002 || biz == 200001 || biz == 200003) return true;
+        }
+        if (status == 401) return true;
+        if (status == 400 && payload != null) {
+            String err = payload.optString("error", "").trim().toLowerCase(java.util.Locale.ROOT);
+            if ("invalid_grant".equals(err) || "invalid_token".equals(err) || "expired_token".equals(err)) return true;
+        }
+        return false;
     }
 
     private static String errorMessage(JSONObject payload, String fallback) {

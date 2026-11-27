@@ -517,8 +517,14 @@ final class ResponsesBridge {
         return r;
     }
 
+    interface ProjectionCompletion extends fi.iki.elonen.AllInTrackedResponse.WriteCompletion {
+        boolean isProjectionFailed();
+        boolean isUpstreamIoFailed();
+        String projectionErrorMessage();
+    }
+
     static java.io.InputStream chatStreamToResponses(final java.io.InputStream source, final String model) {
-        class ConvertedStream extends java.io.InputStream implements fi.iki.elonen.AllInTrackedResponse.WriteCompletion {
+        class ConvertedStream extends java.io.InputStream implements ProjectionCompletion {
             final java.io.BufferedReader in = new BoundedSseReader(new java.io.InputStreamReader(source, java.nio.charset.StandardCharsets.UTF_8));
             final java.util.ArrayList<JSONObject> items = new java.util.ArrayList<JSONObject>();
             // Responses has no ID/name delta event. Keep Chat tools until finish
@@ -530,8 +536,8 @@ final class ResponsesBridge {
                 toolChars+=size;
             }
             final StringBuilder pending = new StringBuilder();
-            JSONObject response, usage, terminalRateError; int textIndex=-1, reasoningIndex=-1, refusalIndex=-1, sequence=0; String finish=null;
-            byte[] bytes=new byte[0]; int at=0; boolean ended=false, started=false;
+            JSONObject response, usage, terminalRateError; int textIndex=-1, reasoningIndex=-1, refusalIndex=-1, sequence=0; String finish=null, projectionError=null;
+            byte[] bytes=new byte[0]; int at=0; boolean ended=false, started=false, upstreamIoFailed=false, upstreamErrorSeen=false, projectionFailed=false;
             void event(String type, JSONObject value) throws Exception { value.put("type",type).put("sequence_number",sequence++); pending.append("event: ").append(type).append("\ndata: ").append(value.toString()).append("\n\n"); }
             void start() throws Exception {
                 if(started)return; started=true; response=responseEnvelope(model,new JSONArray(),"stop"); response.put("status","in_progress");
@@ -565,6 +571,7 @@ final class ResponsesBridge {
                 // "error": null is a legal carrier in Chat chunks; only a real
                 // error value may fail the stream.
                 if(chunk.has("error") && !chunk.isNull("error")) {
+                    upstreamErrorSeen = true;
                     JSONObject error=chunk.optJSONObject("error");
                     if(error!=null && "rate_limit_error".equals(error.optString("type"))) {
                         terminalRateError=new JSONObject();
@@ -634,20 +641,42 @@ final class ResponsesBridge {
                 while(at>=bytes.length) {
                     if(ended)return false;
                     try {
-                        start(); String line=in.readLine();
-                        if(line==null) { complete(); ended=true; }
+                        start();
+                        String line;
+                        try { line=in.readLine(); }
+                        catch (java.io.IOException readErr) { upstreamIoFailed = true; throw readErr; }
+                        if(line==null) {
+                            try { complete(); ended=true; }
+                            catch (Exception convErr) { projectionFailed = true; projectionError = convErr.getMessage(); throw convErr; }
+                        }
                         else {
                             String payload=dataPayload(line);
                             if("[DONE]".equals(payload)) {
                                 // Semantic DONE is not HTTP delivery completion. Drain the bounded
                                 // source to its verified EOF before publishing the converted terminal.
-                                String tail;while((tail=in.readLine())!=null){String extra=dataPayload(tail);if(extra!=null&&!extra.trim().isEmpty())throw new java.io.IOException("upstream stream has data after DONE");}
-                                complete(); ended=true;
+                                String tail;
+                                while(true) {
+                                    try { tail = in.readLine(); }
+                                    catch (java.io.IOException tailErr) { upstreamIoFailed = true; throw tailErr; }
+                                    if (tail == null) break;
+                                    String extra=dataPayload(tail);
+                                    if(extra!=null&&!extra.trim().isEmpty()) {
+                                        projectionFailed = true;
+                                        projectionError = "upstream stream has data after DONE";
+                                        throw new java.io.IOException(projectionError);
+                                    }
+                                }
+                                try { complete(); ended=true; }
+                                catch (Exception convErr) { projectionFailed = true; projectionError = convErr.getMessage(); throw convErr; }
                             }
-                            else if(payload!=null && !payload.isEmpty()) chunk(new JSONObject(payload));
+                            else if(payload!=null && !payload.isEmpty()) {
+                                try { chunk(new JSONObject(payload)); }
+                                catch (Exception convErr) { projectionFailed = true; projectionError = convErr.getMessage(); throw convErr; }
+                            }
                         }
                     } catch(Exception e) {
                         ended=true;
+                        if (!upstreamIoFailed && !upstreamErrorSeen && !projectionFailed) { projectionFailed = true; projectionError = e.getMessage(); }
                         try {
                             start();
                             JSONObject error = terminalRateError == null
@@ -664,6 +693,9 @@ final class ResponsesBridge {
             public int read(byte[] b,int off,int len) throws java.io.IOException { if(len==0)return 0; if(!fill())return -1; int n=Math.min(len,bytes.length-at); System.arraycopy(bytes,at,b,off,n); at+=n; return n; }
             public void onWriteStart(){if(source instanceof fi.iki.elonen.AllInTrackedResponse.WriteCompletion)((fi.iki.elonen.AllInTrackedResponse.WriteCompletion)source).onWriteStart();}
             public void onWriteComplete(boolean success){if(source instanceof fi.iki.elonen.AllInTrackedResponse.WriteCompletion)((fi.iki.elonen.AllInTrackedResponse.WriteCompletion)source).onWriteComplete(success&&ended&&response!=null&&!"failed".equals(response.optString("status")));}
+            public boolean isProjectionFailed() { return projectionFailed; }
+            public boolean isUpstreamIoFailed() { return upstreamIoFailed; }
+            public String projectionErrorMessage() { return projectionError == null ? "" : projectionError; }
             public void close() throws java.io.IOException { in.close(); }
         }
         return new ConvertedStream();
@@ -710,7 +742,18 @@ final class ResponsesBridge {
     static final int CHAT_STREAM_MAX_ENTRIES = 1024;
     private static final class ChatStreamLimit extends java.io.IOException { }
 
+    interface StreamObserver {
+        void onEvent(String eventType, JSONObject event);
+        void onTerminal(boolean completed, String eventType);
+        void onFailure(String reason, String lastEvent, Throwable cause, String rawError);
+    }
+
     static java.io.InputStream responsesStreamToChat(final java.io.InputStream source, final String model) {
+        return responsesStreamToChat(source, model, null);
+    }
+
+    static java.io.InputStream responsesStreamToChat(final java.io.InputStream source, final String model,
+                                                     final StreamObserver observer) {
         return new java.io.InputStream() {
             final java.io.BufferedReader in=new BoundedSseReader(new java.io.InputStreamReader(source,java.nio.charset.StandardCharsets.UTF_8));
             final java.util.Map<Integer,Integer> calls=new java.util.HashMap<>();
@@ -734,7 +777,7 @@ final class ResponsesBridge {
                 return snapshot.substring(length);
             }
 
-            String id="chatcmpl-"+java.util.UUID.randomUUID().toString().replace("-", ""); byte[] bytes=new byte[0]; int at=0; boolean ended=false, completed=false;
+            String id="chatcmpl-"+java.util.UUID.randomUUID().toString().replace("-", ""); byte[] bytes=new byte[0]; int at=0; boolean ended=false, completed=false, terminalEventSeen=false; String lastUpstreamEvent="";
             String chunk(JSONObject delta,Object finish,JSONObject usage) throws Exception { JSONObject choice=new JSONObject().put("index",0).put("delta",delta).put("finish_reason",finish==null?JSONObject.NULL:finish); JSONObject o=new JSONObject().put("id",id).put("object","chat.completion.chunk").put("created",System.currentTimeMillis()/1000).put("model",model).put("choices",new JSONArray().put(choice)); if(usage!=null)o.put("usage",usage); return "data: "+o.toString()+"\n\n"; }
             StringBuilder contentPart(String channel, int output, int part) throws ChatStreamLimit {
                 String key = channel + ":" + output + ":" + part;
@@ -829,8 +872,38 @@ final class ResponsesBridge {
             boolean fill() throws java.io.IOException {
                 while(at>=bytes.length) {
                     if(ended)return false; String result="";
-                    try { String line=in.readLine(); String payload=dataPayload(line); if(line==null || "[DONE]".equals(payload)) { ended=true; if(!completed) result="data: {\"error\":{\"message\":\"Responses stream ended before completion\"}}\n\n"; }
-                        else if(payload!=null && !payload.isEmpty()) { JSONObject event=new JSONObject(payload); String type=event.optString("type"); JSONObject delta=new JSONObject();
+                    try {
+                        String line=in.readLine();
+                        if (line != null && line.startsWith("event:")) {
+                            String ev = line.substring(6).trim();
+                            if (!ev.isEmpty()) {
+                                lastUpstreamEvent = ev;
+                                if (observer != null) observer.onEvent(ev, null);
+                            }
+                        }
+                        String payload=dataPayload(line);
+                        if(line==null || "[DONE]".equals(payload)) {
+                            if ("[DONE]".equals(payload) && !terminalEventSeen) {
+                                lastUpstreamEvent = "[DONE]";
+                                if (observer != null) observer.onEvent("[DONE]", null);
+                            }
+                            ended=true;
+                            if(!completed && !terminalEventSeen) {
+                                if (observer != null) {
+                                    observer.onTerminal(false, lastUpstreamEvent);
+                                    observer.onFailure("premature_eof", lastUpstreamEvent,
+                                            new java.io.EOFException("Responses stream ended before completion"),
+                                            "Responses stream ended before completion");
+                                }
+                                result="data: {\"error\":{\"message\":\"Responses stream ended before completion\"}}\n\n";
+                            }
+                        }
+                        else if(payload!=null && !payload.isEmpty()) {
+                            JSONObject event=new JSONObject(payload); String type=event.optString("type"); JSONObject delta=new JSONObject();
+                            if (!type.isEmpty()) {
+                                lastUpstreamEvent = type;
+                                if (observer != null) observer.onEvent(type, event);
+                            }
                             if("response.output_text.delta".equals(type) || "response.text.delta".equals(type)) { result=appendContent("content","content",event.optInt("output_index"),event.optInt("content_index"),event.optString("delta")); }
                             else if("response.refusal.delta".equals(type)) { result=appendContent("refusal","refusal",event.optInt("output_index"),event.optInt("content_index"),event.optString("delta")); }
                             else if("response.reasoning_summary_text.delta".equals(type)) { result=appendContent("reasoning_summary","reasoning_content",event.optInt("output_index"),event.optInt("summary_index"),event.optString("delta")); }
@@ -871,32 +944,72 @@ final class ResponsesBridge {
                                 terminal.append(chunk(delta, reason, usage == null ? null : chatUsage(usage)));
                                 terminal.append("data: [DONE]\n\n");
                                 result = terminal.toString();
+                                terminalEventSeen = true;
                                 completed = true;
                                 ended = true;
+                                if (observer != null) observer.onTerminal(true, type);
                             }
                             else if("response.failed".equals(type)||"error".equals(type)) {
+                                JSONObject terminal=event.optJSONObject("response");
+                                if ("response.failed".equals(type) && terminal != null && terminal.has("status") && !"failed".equals(terminal.optString("status"))) {
+                                    throw new java.io.IOException("invalid response.failed terminal status");
+                                }
                                 // A null error field must still surface one real error
                                 // object; falling back to the event body or to a fixed
                                 // message keeps clients from receiving "error":null.
                                 Object failure=event.opt("error");
                                 if(failure==null || failure==JSONObject.NULL || (failure instanceof String && ((String)failure).trim().isEmpty())) {
-                                    JSONObject terminal=event.optJSONObject("response"); Object nested=terminal==null?null:terminal.opt("error");
+                                    Object nested=terminal==null?null:terminal.opt("error");
                                     failure = nested==null || nested==JSONObject.NULL || (nested instanceof String && ((String)nested).trim().isEmpty()) ? null : nested;
                                 }
                                 JSONObject reported = failure instanceof JSONObject ? (JSONObject)failure
                                         : failure instanceof String ? new JSONObject().put("message",(String)failure)
                                         : event.has("message") || event.has("code") ? event
                                         : new JSONObject().put("code","upstream_stream_error").put("message","Responses stream failed");
-                                result="data: "+new JSONObject().put("error",reported).toString()+"\n\n"; ended=true;
+                                String rawErrPayload = new JSONObject().put("error", reported).toString();
+                                boolean validTerminal = "response.failed".equals(type);
+                                if (validTerminal) terminalEventSeen = true;
+                                if (observer != null) {
+                                    observer.onTerminal(validTerminal, type);
+                                    observer.onFailure("upstream_explicit_error", type, null, rawErrPayload);
+                                }
+                                result="data: "+rawErrPayload+"\n\n"; ended=true;
                             }
                         }
                     } catch (ChatStreamLimit limit) {
                         ended = true;
+                        if (observer != null) {
+                            observer.onTerminal(false, lastUpstreamEvent);
+                            observer.onFailure("conversion_validation_failed", lastUpstreamEvent, limit, "Responses stream exceeds the gateway aggregation limit");
+                        }
                         result = GatewayServer.openAiStreamError("Responses stream exceeds the gateway aggregation limit");
                     } catch (javax.net.ssl.SSLException tlsReadFailure) {
                         ended = true;
+                        if (observer != null) {
+                            observer.onTerminal(false, lastUpstreamEvent);
+                            observer.onFailure("tls_error", lastUpstreamEvent, tlsReadFailure, "Responses upstream TLS read failed before completion");
+                        }
                         result = GatewayServer.openAiStreamError("Responses upstream TLS read failed before completion");
-                    } catch(Exception ex) { ended=true; result="data: {\"error\":{\"message\":\"Invalid Responses stream\"}}\n\n"; }
+                    } catch (java.net.SocketTimeoutException timeoutFailure) {
+                        ended = true;
+                        if (observer != null) {
+                            observer.onTerminal(false, lastUpstreamEvent);
+                            observer.onFailure("read_timeout", lastUpstreamEvent, timeoutFailure, "Responses upstream timed out before completion");
+                        }
+                        result = GatewayServer.openAiStreamError("Responses upstream timed out before completion");
+                    } catch(Exception ex) {
+                        ended=true;
+                        String reason = GatewayServer.classifyStreamReason(ex);
+                        if (reason == null || reason.isEmpty()) reason = "conversion_validation_failed";
+                        if (observer != null) {
+                            observer.onTerminal(false, lastUpstreamEvent);
+                            observer.onFailure(reason, lastUpstreamEvent, ex, ex.getMessage());
+                        }
+                        result = "tls_error".equals(reason) ? GatewayServer.openAiStreamError("Responses upstream TLS read failed before completion")
+                                : ("read_timeout".equals(reason) ? GatewayServer.openAiStreamError("Responses upstream timed out before completion")
+                                : ("premature_eof".equals(reason) ? GatewayServer.openAiStreamError("Responses stream ended before completion")
+                                : "data: {\"error\":{\"message\":\"Invalid Responses stream\"}}\n\n"));
+                    }
                     if (ended) { content.clear(); calls.clear(); callIds.clear(); callNames.clear(); callArgs.clear(); }
                     if(!result.isEmpty()) {bytes=result.getBytes(java.nio.charset.StandardCharsets.UTF_8);at=0;return true;}
                 }return true;
