@@ -34,7 +34,9 @@ public final class DoubaoAuth {
     public static final String USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             + "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.7727.149 Safari/537.36 "
             + "SamanthaDoubao/2.37.16";
-    public static final int MAX_COOKIE = 8192;
+    // 豆包完整 Cookie 常带上域内其它产品的条目（飞书/lark、d_ticket 等），实测一份登录态可达 8.6KB；
+    // 这里只做防爆上限，真实有效性由下方 sessionid 与控制字符校验兜底。
+    public static final int MAX_COOKIE = 32768;
     public static final int MAX_BODY = 1048576;
 
     private DoubaoAuth() {}
