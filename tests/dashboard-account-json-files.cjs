@@ -19,7 +19,7 @@ ${code}
   buttons[0].click();buttons[1].click();check(calls[calls.length-2].action==='import'&&calls[calls.length-1].action==='export','native actions '+id);
   check(calls[calls.length-1].id===id,'correct provider '+id);
  }
- check(calls.length===40,'twenty implemented suppliers have both actions');
+ check(calls.length===42,'twenty-one implemented suppliers have both actions');
  const card=document.createElement('div');ensureAccountFileButtons(card,'agentmore');check(card.children.length===0,'placeholder not pretending support');
  ensureAccountFileButtons(document.querySelector('#legacy'),'antigravity');
  const legacy=document.querySelectorAll('#legacy button');check(legacy.length===3,'missing import added without duplicate export');

@@ -64,7 +64,7 @@ function runDom(html, budgetMs, screenshotPath) {
 const CARD_IDS = [
   'workbuddy', 'raccoon', 'workbuddy-ai', 'loomy', 'catpaw',
   'github-copilot', 'minimax-code', 'deepseek_web', 'zcode',
-  'qoder_cn', 'cline', 'codex', 'antigravity', 'trae-cn'
+  'qoder_cn', 'cline', 'codex', 'antigravity', 'trae-cn', 'doubao'
 ];
 
 const dashboardHtml = fs.readFileSync(
@@ -380,7 +380,7 @@ const driverScript = `<pre id="test-result" hidden>WAIT</pre>
       'light mode horizontal overflow: scrollWidth=' + document.documentElement.scrollWidth + ' innerWidth=' + window.innerWidth);
 
     const cards = Array.from(document.querySelectorAll('#all-providers-cards-container > .card[data-provider-id]'));
-    check(cards.length === 14, 'expected 14 static provider cards, got ' + cards.length);
+    check(cards.length === 15, 'expected 15 static provider cards, got ' + cards.length);
     const containerEl = document.getElementById('all-providers-cards-container');
     containerEl.style.maxWidth = '358px';
     await sleep(10);
@@ -516,7 +516,7 @@ const driverScript = `<pre id="test-result" hidden>WAIT</pre>
       closeAccountModal();
       await sleep(20);
     }
-    check(clickedButtonCount === 78, 'expected 78 static card buttons across 14 cards, checked ' + clickedButtonCount);
+    check(clickedButtonCount === 83, 'expected 83 static card buttons across 15 cards, checked ' + clickedButtonCount);
 
     // 4. Strictly test per-account enable/disable glass-switch in inline card pool + modal + 409 rollback + ⋯ menu
     // 4a. Inline toggle disable on catpaw acc-1 via real user click()
