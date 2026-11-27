@@ -91,7 +91,10 @@ public final class CodexFailureDiagnosticsOfflineTest {
                     "TLS truncation yields one failure without declaring the response complete");
             check(!result.body.contains(sensitiveMessage), "TLS exception details stay private");
             check(opened.get() == 1 && readsAfterMessage.get() == 1 && unused.requests.isEmpty(), "truncated request is not retried");
-            check(disconnected.get() > 0, "failed upstream connection released");
+            // XunE: disconnect 在响应交付后的异步回调(finishContext→cancel)里执行，客户端读完
+            // 字节时服务端可能还没跑完；1.2.158 加重记账后窗口变宽。有界等待仍能抓住真泄漏。
+            int waited=0; while(disconnected.get()==0 && waited<3000){Thread.sleep(50);waited+=50;}
+            check(disconnected.get() > 0, "failed upstream connection released (waited "+waited+"ms)");
             check(reported.equals("Responses upstream TLS read failed before completion"), "TLS read error classified: " + reported);
         }
     }
