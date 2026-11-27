@@ -41,7 +41,10 @@ public final class AccountRoutingHttpTest {
                     check(status==200&&text.contains("ok"),"request "+n+" completes: "+status+" "+text);
                 }
                 synchronized(up){check(up.hits.size()==4,"all four physical keys actually used");for(int count:up.hits.values())check(count==5,"equal known token loads distribute 5/5/5/5");}
-                check(gateway.gateway.activeForwardRequests()==0,"all request lifetimes released");
+                // XunE: gate.leave 在响应交付后的异步回调里执行，客户端读完字节时服务端可能
+                // 还没跑完 finishContext；上游 1.2.158 加重该路径后窗口变宽。有界等待仍能抓住真泄漏。
+                int waited=0; while(gateway.gateway.activeForwardRequests()!=0&&waited<3000){Thread.sleep(50);waited+=50;}
+                check(gateway.gateway.activeForwardRequests()==0,"all request lifetimes released (waited "+waited+"ms)");
             }
         }
         System.out.println("AccountRoutingHttpTest PASS: "+checks+" checks");
