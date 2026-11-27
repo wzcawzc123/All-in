@@ -17616,7 +17616,7 @@ public class GatewayServer extends NanoHTTPD {
                     }
                     attachFixedLengthDeliveryTracking(resp, giftRowDone, REQUEST_CONTEXT.get());
                     finishGiftUsage(200, "", true);
-                    return resp;
+                    return new ZCodeGiftAttempt(resp, ZCodeGiftAttempt.SERVED);
                 } catch (Exception projErr) {
                     String errMsg = "Invalid upstream Chat response: " + (projErr.getMessage() == null ? projErr.getClass().getSimpleName() : projErr.getMessage());
                     if (giftRowDone != null) {
@@ -17626,7 +17626,7 @@ public class GatewayServer extends NanoHTTPD {
                     }
                     RESP_PROJECTED_DONE.set(Boolean.TRUE);
                     finishGiftUsage(502, errMsg, true);
-                    return errorResponse(502, errMsg);
+                    return new ZCodeGiftAttempt(errorResponse(502, errMsg), ZCodeGiftAttempt.SERVED);
                 }
             }
             Response resp = newFixedLengthResponse(Status.OK, "application/json; charset=UTF-8", out.toString());
