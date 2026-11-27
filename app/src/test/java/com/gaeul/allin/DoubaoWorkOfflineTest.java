@@ -46,12 +46,12 @@ public final class DoubaoWorkOfflineTest {
     }
 
     private static void modelCatalog() {
-        require(DoubaoProtocol.models().size() == 14, "14 work-mode models");
+        require(DoubaoProtocol.models().size() == 16, "16 work-mode models");
         String[][] expected = {
                 {"auto", "9", "0"},
                 {"doubao-2.1-lite", "seed-lite-7b", "0.01"},
                 {"doubao-2.1-pro", "5", "0.65"},
-                {"deepseek-v4-flash", "person-deepseek-v4-1-flash-261017", "0.01"},
+                {"deepseek-v4.1-flash", "person-deepseek-v4-1-flash-261017", "0.01"},
                 {"glm-5.4", "person-glm-5-4", "0.80"},
                 {"qwen4-max", "person-qwen4-max", "0.47"},
                 {"kimi-k3.1-pro", "person-kimi-k3-1-pro-261111", "0.95"},
@@ -61,7 +61,9 @@ public final class DoubaoWorkOfflineTest {
                 {"glm-5.3-flash", "person-glm-5-3-flash-261111", "0.08"},
                 {"deepseek-v4-pro", "person-deepseek-v4-pro-ga-260813", "0.46"},
                 {"qwen3.8-max", "person-qwen3-8-max", "0.74"},
-                {"qwen3.8-flash", "person-qwen3-8-flash", "0.05"}
+                {"qwen3.8-flash", "person-qwen3-8-flash", "0.05"},
+                {"mimo-v2.6-pro", "person-mimo-v2-6-pro", "0.07"},
+                {"mimo-v2.6-flash", "person-mimo-v2-6-flash", "0.03"}
         };
         int index = 0;
         for (DoubaoProtocol.Model actual : DoubaoProtocol.models()) {
@@ -94,8 +96,9 @@ public final class DoubaoWorkOfflineTest {
         JSONArray history = new JSONArray().put(system).put(new JSONObject().put("role", "user").put("content", "你好"));
         String flat = DoubaoProtocol.flatten(history);
         require(flat.contains("你是助手") && flat.contains("[用户]"), "system message must survive flatten");
-        DoubaoProtocol.Model model = DoubaoProtocol.resolve("deepseek-v4-flash");
+        DoubaoProtocol.Model model = DoubaoProtocol.resolve("deepseek-v4.1-flash");
         require(model != null && model.key.startsWith("person-deepseek-v4"), "model key");
+        require(DoubaoProtocol.resolve("deepseek-v4-flash") == model, "legacy flash id aliases to v4.1");
         JSONObject body = DoubaoProtocol.build("你好，豆包", model, "", DoubaoProtocol.effort("high", model),
                 "abc123def456", "582478");
         JSONObject option = body.getJSONObject("option");

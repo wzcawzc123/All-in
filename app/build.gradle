@@ -155,6 +155,8 @@ def offlineTestMains = [
         'com.gaeul.allin.DoubaoWorkOfflineTest',
         'com.gaeul.allin.DoubaoCheckinOfflineTest',
         'com.gaeul.allin.DoubaoDualProviderOfflineTest',
+        'com.gaeul.allin.DoubaoMenuParityOfflineTest',
+        'com.gaeul.allin.DoubaoCatalogSyncHttpTest',
         'com.gaeul.allin.WorkBuddySignatureRetryPolicyOfflineTest',
         'com.gaeul.allin.WorkBuddyNativeAggregatorOfflineTest',
         'com.gaeul.allin.WorkBuddyNativeTransportOfflineTest',
@@ -420,6 +422,7 @@ def offlineTestTasks = offlineTestMains.collect { name ->
         if (simple == 'AntigravityCompatibilityOfflineTest') args rootProject.file('tests/fixtures/antigravity-protocol-0.2.1.json').absolutePath
         if (simple == 'AntigravityRequestParityOfflineTest') args rootProject.file('tests/fixtures/antigravity-request-oracle-0.2.1.json').absolutePath
         if (simple == 'ProviderStreamContractHttpTest') args rootProject.file('tests/fixtures/provider-stream-oracles-20261113.json').absolutePath
+        if (simple == 'DoubaoMenuParityOfflineTest') args rootProject.file('tests/fixtures/doubao-mode-list-20261127.json').absolutePath
         if (simple == 'ProviderUpstreamParityOfflineTest') args rootProject.file('tests/fixtures/provider-upstream-20261113.json').absolutePath, rootProject.file('tests/fixtures/antigravity-protocol-0.2.1.json').absolutePath
         if (simple == 'ZCodePromptParityOfflineTest') args rootProject.file('tests/fixtures/zcode-prompt-3.17.2.json').absolutePath
     }

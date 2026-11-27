@@ -86,7 +86,7 @@ curl -sS "$BASE_URL/chat/completions" \
 
 登录方式、模型和额度取决于账号与供应商。Loomy 支持手机验证码登录，也可使用已有会话凭据。部分适配依赖供应商网页或客户端协议，上游变更可能影响登录、模型同步或推理。面板也会显示尚未实现的占位入口，可用模型以实际同步结果为准。
 
-豆包保留两套并行入口：`doubao` 是工作模式，用账号在豆包客户端的额度/积分调用 14 个聚合模型（豆包、DeepSeek、Kimi、GLM、Qwen）；`doubao-web` 是网页版，走`/chat/completion`，只有快速、思考、专家三档。两套共用同一条 Cookie，但账号池、模型目录和路由相互独立。[豆包接入说明](docs/doubao-work-provider.md)
+豆包保留两套并行入口：`doubao` 是工作模式，用账号在豆包客户端的额度/积分调用 16 个聚合模型（豆包、DeepSeek、Kimi、GLM、Qwen、MiMo）；`doubao-web` 是网页版，走`/chat/completion`，只有快速、思考、专家三档。两套共用同一条 Cookie，但账号池、模型目录和路由相互独立。[豆包接入说明](docs/doubao-work-provider.md)
 
 - **多账号管理** · 同一供应商可以管理多个账号或 API Key，按账号启停，分别查看模型或额度。账号可在 Android 应用里用 JSON 文件迁移，整机配置另有密码加密备份。[账号迁移说明](docs/ACCOUNT_JSON_TRANSFER.md)
 - **自定义第三方API** · 可添加Chat Completions、Responses或Anthropic Messages文本上游，选择认证方式和自定义请求头，在同一菜单拉取、搜索并勾选模型入池。新候选默认不选中，后续同步不会自动新增入池模型。[自定义API说明](docs/CUSTOM_API_PROVIDERS.md)

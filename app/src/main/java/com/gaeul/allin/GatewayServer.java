@@ -4803,13 +4803,20 @@ public class GatewayServer extends NanoHTTPD {
      */
     private synchronized void migrateDoubaoCatalog() {
         JSONObject staged = new JSONObject(configJson.toString());
+        int version = staged.optInt("doubaoCatalogVersion", 0);
         // 只迁移一次：之后用户手动删改目录不再被启动流程覆盖。
-        if (staged.optInt("doubaoCatalogVersion", 0) >= 3) return;
+        if (version >= 4) return;
         try {
             byte[] bytes = readFileBytes(context.getAssets().open("default_config.json"));
             JSONObject defaults = new JSONObject(new String(bytes, "UTF-8"));
-            if (!migrateDoubaoCatalog(staged, defaults)) return;
-            staged.put("doubaoCatalogVersion", 3);
+            if (version < 3) {
+                if (!migrateDoubaoCatalog(staged, defaults)) return;
+            } else {
+                // v3 目录里 DeepSeek 轻量版的 id 少了一个点，按官方菜单改成
+                // deepseek-v4.1-flash；同时补上 v3 没有的 MiMo V2.6 两条。
+                migrateDoubaoV4(staged, defaults);
+            }
+            staged.put("doubaoCatalogVersion", 4);
             saveConfig(staged);
         } catch (Exception e) {
             logException("migrateDoubaoCatalog", e);
@@ -4859,6 +4866,70 @@ public class GatewayServer extends NanoHTTPD {
         }
         alignDoubaoProvider(currentWeb, defWeb);
         return true;
+    }
+
+    static boolean migrateDoubaoV4(JSONObject staged, JSONObject defaults) {
+        boolean changed = migrateDoubaoLegacyFlashId(staged);
+        JSONObject work = findProviderById(staged.optJSONArray("providers"), "doubao");
+        JSONObject defWork = findProviderById(defaults.optJSONArray("providers"), "doubao");
+        if (work == null || defWork == null || isDoubaoWebProvider(work)) return changed;
+        JSONArray models = work.optJSONArray("models");
+        if (models == null) { models = new JSONArray(); work.put("models", models); }
+        JSONObject meta = work.optJSONObject("modelMeta");
+        if (meta == null) { meta = new JSONObject(); work.put("modelMeta", meta); }
+        JSONObject defMeta = defWork.optJSONObject("modelMeta");
+        for (String id : new String[]{"mimo-v2.6-pro", "mimo-v2.6-flash"}) {
+            if (!containsModel(models, id)) {
+                models.put(id);
+                changed = true;
+            }
+            if (!meta.has(id) && defMeta != null && defMeta.optJSONObject(id) != null) {
+                meta.put(id, new JSONObject(defMeta.optJSONObject(id).toString()));
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    private static boolean containsModel(JSONArray models, String id) {
+        for (int i = 0; models != null && i < models.length(); i++) {
+            if (id.equals(models.optString(i, ""))) return true;
+        }
+        return false;
+    }
+
+    /**
+     * v3 的 DeepSeek 轻量版 id 是 deepseek-v4-flash，官方菜单实际叫 DeepSeek V4.1 Flash。
+     * 只把工作模式 provider 里的这一条换成 deepseek-v4.1-flash，并迁移对应的 modelMeta；
+     * 账号、Key 和其它手动模型都不动。旧 id 仍由 DoubaoProtocol.resolve 别名兼容。
+     */
+    static boolean migrateDoubaoLegacyFlashId(JSONObject staged) {
+        JSONObject work = findProviderById(staged.optJSONArray("providers"), "doubao");
+        if (work == null || isDoubaoWebProvider(work)) return false;
+        boolean changed = false;
+        JSONArray models = work.optJSONArray("models");
+        if (models != null) {
+            boolean hasNew = false;
+            for (int i = 0; i < models.length(); i++) {
+                if ("deepseek-v4.1-flash".equals(models.optString(i, ""))) { hasNew = true; break; }
+            }
+            for (int i = models.length() - 1; i >= 0; i--) {
+                if (!"deepseek-v4-flash".equals(models.optString(i, ""))) continue;
+                if (hasNew) models.remove(i);
+                else models.put(i, "deepseek-v4.1-flash");
+                changed = true;
+            }
+        }
+        JSONObject meta = work.optJSONObject("modelMeta");
+        if (meta != null && meta.has("deepseek-v4-flash")) {
+            JSONObject legacy = meta.optJSONObject("deepseek-v4-flash");
+            if (legacy != null && !meta.has("deepseek-v4.1-flash")) {
+                meta.put("deepseek-v4.1-flash", new JSONObject(legacy.toString()));
+            }
+            meta.remove("deepseek-v4-flash");
+            changed = true;
+        }
+        return changed;
     }
 
     private static boolean isDoubaoWebProvider(JSONObject provider) {
@@ -9582,6 +9653,17 @@ public class GatewayServer extends NanoHTTPD {
                                 m.put("id", fullId);
                                 m.put("object", "model");
                                 m.put("owned_by", CustomProvider.isCustom(p)?p.optString("name", "Custom API"):pid);
+                                // 客户端会优先显示 display_name；豆包客户端菜单叫“DeepSeek V4.1 Flash”，
+                                // 而网关 id 必须是 deepseek-v4.1-flash，两者在这里对齐展示名。
+                                if ("doubao".equals(p.optString("protocol")) || "doubao-web".equals(p.optString("protocol"))) {
+                                    JSONObject meta = p.optJSONObject("modelMeta");
+                                    JSONObject modelMeta = meta == null ? null : meta.optJSONObject(mName);
+                                    String display = modelMeta == null ? "" : modelMeta.optString("name", "").trim();
+                                    if (!display.isEmpty()) {
+                                        m.put("name", display);
+                                        m.put("display_name", display);
+                                    }
+                                }
                                 if (CustomProvider.isCustom(p)) {
                                     m.put("name",mName).put("display_name",mName).put("provider_name",p.optString("name"));
                                 } else if ("qoder".equals(p.optString("protocol"))) {

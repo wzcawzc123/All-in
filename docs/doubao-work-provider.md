@@ -8,7 +8,7 @@ All In 同时内置两条豆包入口，互不替代：
 
 | 供应商 ID | 名称 | 协议 | 模型 | 用途 |
 | --- | --- | --- | --- | --- |
-| `doubao` | 豆包工作模式（积分/额度池） | `doubao` | 14 个聚合模型 | 使用本人豆包账号的客户端积分/额度，调用豆包、DeepSeek、Kimi、GLM、Qwen |
+| `doubao` | 豆包工作模式（积分/额度池） | `doubao` | 16 个聚合模型 | 使用本人豆包账号的客户端积分/额度，调用豆包、DeepSeek、Kimi、GLM、Qwen、MiMo |
 | `doubao-web` | 豆包网页版（三档思考） | `doubao-web` | `doubao`、`doubao-think`、`doubao-expert` | 直连 `POST /chat/completion`，只走豆包网页对话的三档思考 |
 
 两套共用同一条 `www.doubao.com` Cookie，但各自维护账号池、模型目录、路由和签到记录。旧版只有一个 `doubao` 时，启动迁移会识别旧网页版并改名为 `doubao-web`，保留账号与密钥，再补一个空的 `doubao` 工作模式。
@@ -19,7 +19,7 @@ All In 同时内置两条豆包入口，互不替代：
 | --- | --- |
 | 登录 | 手机面板 WebView 打开 `www.doubao.com/chat/`，扫码或手机号登录后点「完成入池」；也可从桌面浏览器复制整条 Cookie 手动导入 |
 | 凭据 | `sessionid` 及同域 Cookie；没有 refresh，过期只能重新登录 |
-| 模型 | 2026-11-27 按本机豆包客户端 2.37.16 工作模式菜单校准为 14 项：自动、豆包 2.1 Lite/Pro、DeepSeek V4.1 Flash/V4 Pro、Kimi K3/K3.1 Pro/K3.1 Pro 高速、GLM 5.4/5.3/5.3 Flash、Qwen 4 Max/Qwen 3.8 Max/Flash |
+| 模型 | 2026-11-27 按本机豆包客户端 2.37.16 工作模式菜单校准为 16 项：自动、豆包 2.1 Lite/Pro、DeepSeek V4.1 Flash/V4 Pro、Kimi K3/K3.1 Pro/K3.1 Pro 高速、GLM 5.4/5.3/5.3 Flash、Qwen 4 Max/Qwen 3.8 Max/Flash、MiMo V2.6 Pro/Flash |
 | 协议 | `POST https://www.doubao.com/chat/completion`，SSE；`model_item_key` 决定上游模型 |
 | 文本 | 支持，历史消息压平成一条用户文本 |
 | 工具 | 提示词工具桥（`DeepSeekToolBridge`）：把 tools schema 写进提示词，解析 `<tool_call>`；真正执行在客户端 |
@@ -75,24 +75,26 @@ Cookie 只保存在本机配置里，不写日志、不出现在错误响应；�
 
 ## 模型 key
 
-2026-11-27 从本机豆包客户端 2.37.16 的 `Preferences` 中 `_DesktopActionBarBriefListRequestCacheDataV1`（`modeSelectData.menuConfV2.mode_list` 工作模式）实抓，共 14 项：
+2026-11-27 从本机豆包客户端 2.37.16 的 `Preferences` 中 `_DesktopActionBarBriefListRequestCacheDataV1`（`modeSelectData.menuConfV2.mode_list` 工作模式）实抓，共 16 项：
 
 | 面板模型 | `model_item_key` | 客户端倍率 | 上下文/输出 | 默认推理档 |
 | --- | --- | --- | --- | --- |
 | `auto` | `9` | 小额免费 | 256k / 32k | 8 自动 |
 | `doubao-2.1-lite` | `seed-lite-7b` | 限时优惠 0.01x | 256k / 32k | 8 自动 |
 | `doubao-2.1-pro` | `5` | 0.65x | 256k / 32k | 5 高 |
-| `deepseek-v4-flash` | `person-deepseek-v4-1-flash-261017` | 限时优惠 0.01x | 300k / 64k | 5 高 |
-| `glm-5.4` | `person-glm-5-4` | 新上线 0.80x | 300k / 64k | 5 高 |
+| `deepseek-v4.1-flash` | `person-deepseek-v4-1-flash-261017` | 限时优惠 0.01x | 300k / 64k | 7 最高 |
+| `glm-5.4` | `person-glm-5-4` | 新上线 0.80x | 300k / 64k | 7 最高 |
 | `qwen4-max` | `person-qwen4-max` | 新上线 0.47x | 300k / 64k | 5 高 |
-| `kimi-k3.1-pro` | `person-kimi-k3-1-pro-261111` | 0.95x | 300k / 64k | 5 高 |
-| `kimi-k3.1-pro-fast` | `person-kimi-k3-1-pro-highspeed-261111` | 1.44x | 300k / 64k | 5 高 |
-| `kimi-k3` | `person-kimi-k3-261111` | 1.48x | 300k / 64k | 5 高 |
-| `glm-5.3` | `person-glm-5-3-261111` | 0.80x | 300k / 64k | 5 高 |
-| `glm-5.3-flash` | `person-glm-5-3-flash-261111` | 0.08x | 300k / 64k | 5 高 |
-| `deepseek-v4-pro` | `person-deepseek-v4-pro-ga-260813` | 0.46x | 300k / 64k | 5 高 |
+| `kimi-k3.1-pro` | `person-kimi-k3-1-pro-261111` | 0.95x | 300k / 64k | 7 最高 |
+| `kimi-k3.1-pro-fast` | `person-kimi-k3-1-pro-highspeed-261111` | 1.44x | 300k / 64k | 7 最高 |
+| `kimi-k3` | `person-kimi-k3-261111` | 1.48x | 300k / 64k | 7 最高 |
+| `glm-5.3` | `person-glm-5-3-261111` | 0.80x | 300k / 64k | 7 最高 |
+| `glm-5.3-flash` | `person-glm-5-3-flash-261111` | 0.08x | 300k / 64k | 7 最高 |
+| `deepseek-v4-pro` | `person-deepseek-v4-pro-ga-260813` | 0.46x | 300k / 64k | 7 最高 |
 | `qwen3.8-max` | `person-qwen3-8-max` | 0.74x | 300k / 64k | 5 高 |
 | `qwen3.8-flash` | `person-qwen3-8-flash` | 0.05x | 300k / 64k | 5 高 |
+| `mimo-v2.6-pro` | `person-mimo-v2-6-pro` | 0.07x | 300k / 64k | 5 高 |
+| `mimo-v2.6-flash` | `person-mimo-v2-6-flash` | 0.03x | 300k / 64k | 5 高 |
 
 倍率是客户端菜单标签，豆包会调整；以客户端模型选择页为准。`model_item_key` 失效时，模型会返回上游错误，不会悄悄换模型。GLM 5.3 两个模型在 doubao2api 的旧实测里返回“出了点问题”，本目录保留条目但在描述里标注，是否可用以账号实际返回为准。
 
@@ -148,31 +150,33 @@ Cookie 只保存在本机配置里，不写日志、不出现在错误响应；�
 - `GatewayServer`：`doubao` 与 `doubao-web` 两条协议路由、`/api/auth/{provider}/add`、`/api/auth/{provider}/sync-models`；
 - `LoginActivity`：WebView 登录后从 `CookieManager` 取整条 Cookie，两套供应商分别入池；
 - `dashboard.html`：两张豆包卡片、Cookie 导入、各自模型池；
-- `DoubaoWorkOfflineTest`：请求体/14 模型目录/倍率/推理档/SSE/工具桥/会话复用/401/429 的离线契约测试；
+- `DoubaoWorkOfflineTest`：请求体/16 模型目录/倍率/推理档/SSE/工具桥/会话复用/401/429 的离线契约测试；`DoubaoMenuParityOfflineTest` 与客户端 16 项菜单快照逐项比对；`DoubaoCatalogSyncHttpTest` 用真实环回 HTTP 验证同步接口和 `/v1/models` 展示名。
 - `DoubaoDualProviderOfflineTest`：旧网页版迁移、工作模式账号保留、两套并存不重复、默认目录不完整时不改动。
+
+**「同步模型列表」的真实语义**：它不会向豆包官方实时拉取在线模型目录。豆包公开的 `brief_list` 需要 PC 客户端安全 SDK 签名，纯 Cookie 请求实测返回 `710010202 common invalid param`，这条路没有打通。面板上的同步/恢复内置目录是把安装包内维护的目录写回配置，再配合 `doubaoCatalogVersion=4` 的升级迁移，把旧配置校准到 16 项；它能保证当前安装包与 2026-11-27 客户端菜单一致，但不能自动发现豆包未来新增的型号。
 
 ## 验收
 
 ```bash
 # 只跑豆包离线契约测试（main() 风格，非 JUnit）
-./gradlew :app:offlineTest_DoubaoWorkOfflineTest :app:offlineTest_DoubaoCheckinOfflineTest :app:offlineTest_DoubaoDualProviderOfflineTest
+./gradlew :app:offlineTest_DoubaoWorkOfflineTest :app:offlineTest_DoubaoCheckinOfflineTest :app:offlineTest_DoubaoDualProviderOfflineTest :app:offlineTest_DoubaoMenuParityOfflineTest :app:offlineTest_DoubaoCatalogSyncHttpTest
 # 跑全部离线套件（--continue 保证单个失败不会中断其余套件）
 ./gradlew :app:offlineTests --continue
 ```
 
-2026-11-27 在最新 `xune`（`1.2.158-test`）上跑全量离线：292 个套件执行，291 个通过，1 个环境失败。
+2026-11-27 在最新 `xune`（`1.2.158-test`）上跑全量离线：294 个套件执行，293 个通过，1 个环境失败。
 
 - 唯一失败是 `GatewayManagementCredentialOfflineTest`：测试调用 `Files.createSymbolicLink`，当前 Windows 账号没有 `SeCreateSymbolicLinkPrivilege` 且未开启开发者模式，抛 `客户端没有所需的特权`。该测试文件未被本次改动修改，属于环境权限限制，不是功能回归；在 Linux/macOS 或开启开发者模式的 Windows 上可正常执行。
-- 豆包专项 `DoubaoWorkOfflineTest`、`DoubaoCheckinOfflineTest`、`DoubaoDualProviderOfflineTest` 全部为 `OK`。
+- 豆包专项 `DoubaoWorkOfflineTest`、`DoubaoCheckinOfflineTest`、`DoubaoDualProviderOfflineTest`、`DoubaoMenuParityOfflineTest`、`DoubaoCatalogSyncHttpTest` 全部为 `OK`。
 - `BackupConfigSchema` 协议白名单已同时包含 `doubao` 与 `doubao-web`，`ConfigConsistencyOfflineTest`、备份恢复和发布加固套件通过。
 - 新增的 `doubao-web` 网页协议源码来自远端 `xune` 的 `DoubaoWeb.java` / `DoubaoWebChat.java`，本分支只做双供应商路由、账号池和面板接入。
 
 2026-11-27 已用真实账号做过一次上游实测（未把 Cookie 写入仓库或日志）：
 
-- 老版本升级后，启动时会自动把 `doubao` 的 `models/modelMeta/note` 对齐到安装包内置的 14 项目录，不会清空账号或 Key；旧网页版 `doubao` 会改名为 `doubao-web` 并保留账号/密钥；面板上的「恢复内置目录」仍可手动触发。
+- 老版本升级后，启动时会自动把 `doubao` 的 `models/modelMeta/note` 对齐到安装包内置的 16 项目录，不会清空账号或 Key；旧网页版 `doubao` 会改名为 `doubao-web` 并保留账号/密钥；面板上的「恢复内置目录」仍可手动触发。
 
 - `doubao-2.1-lite`：`POST /chat/completion` 返回 `200 text/event-stream`，长度约 11 KB，事件含 `SSE_ACK`、`STREAM_CHUNK`、`SSE_REPLY_END`；豆包会话页实际显示 assistant 回复「正常」；
-- `deepseek-v4-flash`：返回 `200 text/event-stream`，`STREAM_CHUNK` 5 条，`SSE_REPLY_END` 的 `brief=正常`；
+- `deepseek-v4.1-flash`（旧 id `deepseek-v4-flash` 仍兼容）：返回 `200 text/event-stream`，`STREAM_CHUNK` 5 条，`SSE_REPLY_END` 的 `brief=正常`；
 - 同一账号额度接口的 `used_percent` 从 12% 变为 16%，证明请求确实走了本人账号额度，而不是空转；
 - 连续快速请求后上游返回 `710022004 rate limited`，说明风控/频控生效；代码已把它映射成 429，不再误报 502。
 
@@ -180,7 +184,7 @@ Cookie 只保存在本机配置里，不写日志、不出现在错误响应；�
 
 1. 安装 debug 包，在「供应商 → 豆包工作模式」点「登录账号」；
 2. 完成扫码/手机号登录，点「完成入池」，确认卡片账号数变为 1；
-3. `GET /v1/models` 应出现 14 个 `doubao/*`，模型标签上的倍率应为 0.01x/0.65x/0.80x/0.47x 等，而不是旧的 2x/7x/12x；
+3. `GET /v1/models` 应出现 16 个 `doubao/*`，模型标签上的倍率应为 0.01x/0.65x/0.80x/0.47x 等，而不是旧的 2x/7x/12x；`deepseek-v4.1-flash` 和 `mimo-v2.6-*` 都应出现；
 4. 豆包网页版卡片单独登录同一账号后，应出现 `doubao-web/doubao`、`doubao-web/doubao-think`、`doubao-web/doubao-expert` 三个模型；两套账号池互不影响；
 5. 发一条普通对话，确认非流式与流式都能返回；
 6. 带 `tools` 发一条请求，确认模型输出 `<tool_call>` 被翻译成 OpenAI `tool_calls`；

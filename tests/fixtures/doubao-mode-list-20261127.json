@@ -1,0 +1,226 @@
+{
+  "source": "Doubao desktop 2.37.16 Preferences / _DesktopActionBarBriefListRequestCacheDataV1 / modeSelectData / menuConfV2.mode_list (工作任务)",
+  "captured": "2026-11-27",
+  "models": [
+    {
+      "name": "自动",
+      "key": "9",
+      "rate": "小额免费",
+      "memory_profile": "",
+      "total_window_size": "256000",
+      "default_effort": 8,
+      "efforts": [
+        8,
+        3,
+        4,
+        5
+      ]
+    },
+    {
+      "name": "豆包 2.1 Lite",
+      "key": "seed-lite-7b",
+      "rate": "限时优惠 0.01x",
+      "memory_profile": "256k",
+      "total_window_size": "256000",
+      "default_effort": 8,
+      "efforts": [
+        8,
+        3,
+        4,
+        5
+      ]
+    },
+    {
+      "name": "豆包 2.1 Pro",
+      "key": "5",
+      "rate": "0.65x",
+      "memory_profile": "",
+      "total_window_size": "256000",
+      "default_effort": 5,
+      "efforts": [
+        3,
+        4,
+        5
+      ]
+    },
+    {
+      "name": "DeepSeek V4.1 Flash",
+      "key": "person-deepseek-v4-1-flash-261017",
+      "rate": "限时优惠 0.01x",
+      "memory_profile": "300k_230",
+      "total_window_size": "300000",
+      "default_effort": 7,
+      "efforts": [
+        3,
+        4,
+        5,
+        6,
+        7
+      ]
+    },
+    {
+      "name": "GLM 5.4",
+      "key": "person-glm-5-4",
+      "rate": "新上线 0.80x",
+      "memory_profile": "300k_230",
+      "total_window_size": "300000",
+      "default_effort": 7,
+      "efforts": [
+        3,
+        5,
+        7
+      ]
+    },
+    {
+      "name": "Qwen 4 Max",
+      "key": "person-qwen4-max",
+      "rate": "新上线 0.47x",
+      "memory_profile": "300k_230",
+      "total_window_size": "300000",
+      "default_effort": 5,
+      "efforts": [
+        3,
+        5,
+        6
+      ]
+    },
+    {
+      "name": "Kimi K3.1 Pro",
+      "key": "person-kimi-k3-1-pro-261111",
+      "rate": "0.95x",
+      "memory_profile": "300k_230",
+      "total_window_size": "300000",
+      "default_effort": 7,
+      "efforts": [
+        3,
+        4,
+        5,
+        6,
+        7
+      ]
+    },
+    {
+      "name": "Kimi K3.1 Pro 高速",
+      "key": "person-kimi-k3-1-pro-highspeed-261111",
+      "rate": "1.44x",
+      "memory_profile": "300k_230",
+      "total_window_size": "300000",
+      "default_effort": 7,
+      "efforts": [
+        3,
+        4,
+        5,
+        6,
+        7
+      ]
+    },
+    {
+      "name": "Kimi K3",
+      "key": "person-kimi-k3-261111",
+      "rate": "1.48x",
+      "memory_profile": "300k_230",
+      "total_window_size": "300000",
+      "default_effort": 7,
+      "efforts": [
+        3,
+        4,
+        5,
+        6,
+        7
+      ]
+    },
+    {
+      "name": "GLM 5.3",
+      "key": "person-glm-5-3-261111",
+      "rate": "0.80x",
+      "memory_profile": "300k_230",
+      "total_window_size": "300000",
+      "default_effort": 7,
+      "efforts": [
+        3,
+        5,
+        7
+      ]
+    },
+    {
+      "name": "GLM 5.3 Flash",
+      "key": "person-glm-5-3-flash-261111",
+      "rate": "0.08x",
+      "memory_profile": "300k_230",
+      "total_window_size": "300000",
+      "default_effort": 7,
+      "efforts": [
+        3,
+        5,
+        7
+      ]
+    },
+    {
+      "name": "DeepSeek V4 Pro",
+      "key": "person-deepseek-v4-pro-ga-260813",
+      "rate": "0.46x",
+      "memory_profile": "300k_230",
+      "total_window_size": "300000",
+      "default_effort": 7,
+      "efforts": [
+        3,
+        4,
+        5,
+        6,
+        7
+      ]
+    },
+    {
+      "name": "Qwen 3.8 Max",
+      "key": "person-qwen3-8-max",
+      "rate": "0.74x",
+      "memory_profile": "300k_230",
+      "total_window_size": "300000",
+      "default_effort": 5,
+      "efforts": [
+        3,
+        5,
+        6
+      ]
+    },
+    {
+      "name": "Qwen 3.8 Flash",
+      "key": "person-qwen3-8-flash",
+      "rate": "0.05x",
+      "memory_profile": "300k_230",
+      "total_window_size": "300000",
+      "default_effort": 5,
+      "efforts": [
+        3,
+        5,
+        6
+      ]
+    },
+    {
+      "name": "MiMo V2.6 Pro",
+      "key": "person-mimo-v2-6-pro",
+      "rate": "0.07x",
+      "memory_profile": "300k_230",
+      "total_window_size": "300000",
+      "default_effort": 5,
+      "efforts": [
+        3,
+        4,
+        5
+      ]
+    },
+    {
+      "name": "MiMo V2.6 Flash",
+      "key": "person-mimo-v2-6-flash",
+      "rate": "0.03x",
+      "memory_profile": "300k_230",
+      "total_window_size": "300000",
+      "default_effort": 5,
+      "efforts": [
+        3,
+        4,
+        5
+      ]
+    }
+  ]
+}

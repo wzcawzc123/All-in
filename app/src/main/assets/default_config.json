@@ -300,12 +300,12 @@
       "baseUrl": "https://www.doubao.com",
       "loginUrl": "https://www.doubao.com/chat/",
       "protocol": "doubao",
-      "note": "豆包网页工作模式：Cookie 登录，用本人账号额度/积分调用豆包聚合的豆包 / DeepSeek / Kimi / GLM / Qwen；文本对话 + 提示词工具桥，不支持图片与文件；模型与倍率按本机豆包客户端 2.37.16 工作模式目录校准",
+      "note": "豆包网页工作模式：Cookie 登录，用本人账号额度/积分调用豆包聚合的豆包 / DeepSeek / Kimi / GLM / Qwen / MiMo；文本对话 + 提示词工具桥，不支持图片与文件；模型与倍率按本机豆包客户端 2.37.16 工作模式目录校准（16 项）",
       "models": [
         "auto",
         "doubao-2.1-lite",
         "doubao-2.1-pro",
-        "deepseek-v4-flash",
+        "deepseek-v4.1-flash",
         "glm-5.4",
         "qwen4-max",
         "kimi-k3.1-pro",
@@ -315,7 +315,9 @@
         "glm-5.3-flash",
         "deepseek-v4-pro",
         "qwen3.8-max",
-        "qwen3.8-flash"
+        "qwen3.8-flash",
+        "mimo-v2.6-pro",
+        "mimo-v2.6-flash"
       ],
       "keys": [],
       "accounts": [],
@@ -345,7 +347,7 @@
           "efforts": ["low", "medium", "high"],
           "desc": "豆包旗舰模型；客户端 0.65x"
         },
-        "deepseek-v4-flash": {
+        "deepseek-v4.1-flash": {
           "name": "DeepSeek V4.1 Flash",
           "contextWindow": 300000,
           "maxOutput": 65536,
@@ -432,6 +434,22 @@
           "multiplier": 0.05,
           "efforts": ["low", "high", "xhigh"],
           "desc": "豆包聚合的通义千问 Qwen 3.8 Flash；客户端 0.05x"
+        },
+        "mimo-v2.6-pro": {
+          "name": "MiMo V2.6 Pro",
+          "contextWindow": 300000,
+          "maxOutput": 65536,
+          "multiplier": 0.07,
+          "efforts": ["low", "medium", "high"],
+          "desc": "豆包聚合的小米 MiMo V2.6 Pro；客户端 0.07x"
+        },
+        "mimo-v2.6-flash": {
+          "name": "MiMo V2.6 Flash",
+          "contextWindow": 300000,
+          "maxOutput": 65536,
+          "multiplier": 0.03,
+          "efforts": ["low", "medium", "high"],
+          "desc": "豆包聚合的小米 MiMo V2.6 Flash；客户端 0.03x"
         }
       }
     },

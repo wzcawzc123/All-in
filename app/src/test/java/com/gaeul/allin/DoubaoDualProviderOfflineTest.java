@@ -21,6 +21,8 @@ public final class DoubaoDualProviderOfflineTest {
         incompleteDefaultsDoNothing();
         webDetection();
         shippedAssets();
+        legacyFlashIdMigrates();
+        v4AddsMimo();
         System.out.println("DoubaoDualProviderOfflineTest OK");
     }
 
@@ -43,7 +45,7 @@ public final class DoubaoDualProviderOfflineTest {
         require(web.optJSONArray("keys").length() == 1, "legacy web key preserved");
         require(web.optJSONArray("models").length() == 3, "web has three models");
         require(work.optString("protocol").equals("doubao"), "fresh work provider uses doubao");
-        require(work.optJSONArray("models").length() == 14, "fresh work provider has 14 models");
+        require(work.optJSONArray("models").length() == 16, "fresh work provider has 16 models");
         require(work.optJSONArray("accounts").length() == 0, "fresh work provider starts empty");
         require(ids(config).equals(java.util.Arrays.asList("doubao-web", "doubao")),
                 "no duplicate provider ids: " + ids(config));
@@ -62,7 +64,7 @@ public final class DoubaoDualProviderOfflineTest {
         require(savedWork.optJSONArray("accounts").length() == 1, "work account preserved");
         require(savedWork.optJSONArray("accounts").optJSONObject(0).optString("cookie").contains("sessionid=work"),
                 "work cookie content preserved");
-        require(savedWork.optJSONArray("models").length() == 14, "work models aligned to 14");
+        require(savedWork.optJSONArray("models").length() == 16, "work models aligned to 16");
         require(web != null && web.optJSONArray("models").length() == 3, "web added with three models");
         require(ids(config).equals(java.util.Arrays.asList("doubao", "doubao-web")),
                 "no duplicate provider ids: " + ids(config));
@@ -81,7 +83,7 @@ public final class DoubaoDualProviderOfflineTest {
         require(GatewayServer.migrateDoubaoCatalog(config, defaults), "already-dual migration should run");
         JSONObject savedWork = find(config, "doubao");
         JSONObject savedWeb = find(config, "doubao-web");
-        require(savedWork.optJSONArray("models").length() == 14, "work models aligned");
+        require(savedWork.optJSONArray("models").length() == 16, "work models aligned");
         require(savedWeb.optJSONArray("models").length() == 3, "web models aligned");
         require(savedWork.optJSONArray("accounts").length() == 1, "work account kept");
         require(savedWeb.optJSONArray("accounts").length() == 1, "web account kept");
@@ -186,10 +188,54 @@ public final class DoubaoDualProviderOfflineTest {
         JSONObject shipped = new JSONObject(new String(Files.readAllBytes(config.toPath()), StandardCharsets.UTF_8));
         JSONObject work = find(shipped, "doubao");
         JSONObject web = find(shipped, "doubao-web");
-        require(work != null && work.optJSONArray("models").length() == 14, "shipped work config has 14 models");
+        require(work != null && work.optJSONArray("models").length() == 16, "shipped work config has 16 models");
         require(web != null && web.optJSONArray("models").length() == 3, "shipped web config has three models");
         require(work.optString("protocol").equals("doubao"), "shipped work protocol");
         require(web.optString("protocol").equals("doubao-web"), "shipped web protocol");
+    }
+
+    private static void legacyFlashIdMigrates() {
+        JSONObject config = config();
+        JSONObject work = provider("doubao", "doubao", new String[]{"auto", "deepseek-v4-flash"});
+        work.put("accounts", new JSONArray().put(new JSONObject().put("cookie", "sessionid=keep")));
+        JSONObject meta = new JSONObject();
+        meta.put("deepseek-v4-flash", new JSONObject().put("name", "DeepSeek V4.1 Flash").put("multiplier", 0.01));
+        work.put("modelMeta", meta);
+        config.getJSONArray("providers").put(work);
+
+        require(GatewayServer.migrateDoubaoLegacyFlashId(config), "v3 legacy flash id should migrate");
+        JSONObject saved = find(config, "doubao");
+        require(saved.optJSONArray("accounts").length() == 1, "account kept during flash rename");
+        require(saved.optJSONArray("accounts").optJSONObject(0).optString("cookie").contains("sessionid=keep"),
+                "cookie kept during flash rename");
+        require(hasModel(saved, "deepseek-v4.1-flash"), "canonical flash id present");
+        require(!hasModel(saved, "deepseek-v4-flash"), "legacy flash id removed");
+        require(saved.optJSONObject("modelMeta").has("deepseek-v4.1-flash"), "modelMeta moved to canonical id");
+        require(!saved.optJSONObject("modelMeta").has("deepseek-v4-flash"), "legacy modelMeta removed");
+
+        JSONObject already = provider("doubao", "doubao", new String[]{"deepseek-v4.1-flash"});
+        JSONObject clean = config();
+        clean.getJSONArray("providers").put(already);
+        require(!GatewayServer.migrateDoubaoLegacyFlashId(clean), "canonical-only catalog is a no-op");
+    }
+
+    private static void v4AddsMimo() {
+        String[] oldIds = DoubaoProtocol.ids().subList(0, 14).toArray(new String[0]);
+        JSONObject work = provider("doubao", "doubao", oldIds);
+        JSONObject config = config();
+        config.getJSONArray("providers").put(work);
+        require(GatewayServer.migrateDoubaoV4(config, defaults()), "v4 catalog migration should run");
+        JSONObject saved = find(config, "doubao");
+        require(saved.optJSONArray("models").length() == 16, "v4 adds two MiMo models");
+        require(hasModel(saved, "mimo-v2.6-pro") && hasModel(saved, "mimo-v2.6-flash"), "MiMo models present");
+    }
+
+    private static boolean hasModel(JSONObject provider, String id) {
+        JSONArray models = provider.optJSONArray("models");
+        for (int i = 0; models != null && i < models.length(); i++) {
+            if (id.equals(models.optString(i, ""))) return true;
+        }
+        return false;
     }
 
     private static File firstExisting(String... paths) {

@@ -55,10 +55,11 @@ public final class DoubaoProtocol {
     private static final int[] EFFORT_300K = {3, 4, 5, 6, 7};
     private static final int[] EFFORT_GLM = {3, 5, 7};
     private static final int[] EFFORT_QWEN = {3, 5, 6};
+    private static final int[] EFFORT_MIMO = {3, 4, 5};
 
     private static final Map<String, Model> MODELS = new LinkedHashMap<>();
     static {
-        // 2026-11-27 本机豆包客户端 2.37.16 工作模式菜单实抓（14 项，含倍率/上下文/推理档位）。
+        // 2026-11-27 本机豆包客户端 2.37.16 工作模式菜单实抓（16 项，含倍率/上下文/推理档位）。
         add(new Model("auto", "自动", "9", "小额免费", 256000, 32768,
                 "", "256000", 8, EFFORT_256K,
                 "由豆包按任务自动选模型；小额免费，实际计费以客户端为准"));
@@ -68,32 +69,32 @@ public final class DoubaoProtocol {
         add(new Model("doubao-2.1-pro", "豆包 2.1 Pro", "5", "0.65x", 256000, 32768,
                 "", "256000", 5, new int[]{3, 4, 5},
                 "豆包旗舰模型，复杂推理与长任务"));
-        add(new Model("deepseek-v4-flash", "DeepSeek V4.1 Flash", "person-deepseek-v4-1-flash-261017", "限时优惠 0.01x", 300000, 65536,
-                "300k_230", "300000", 5, EFFORT_300K,
+        add(new Model("deepseek-v4.1-flash", "DeepSeek V4.1 Flash", "person-deepseek-v4-1-flash-261017", "限时优惠 0.01x", 300000, 65536,
+                "300k_230", "300000", 7, EFFORT_300K,
                 "豆包聚合的 DeepSeek 轻量旗舰；当前限时优惠"));
         add(new Model("glm-5.4", "GLM 5.4", "person-glm-5-4", "新上线 0.80x", 300000, 65536,
-                "300k_230", "300000", 5, EFFORT_GLM,
+                "300k_230", "300000", 7, EFFORT_GLM,
                 "豆包聚合的智谱 GLM 5.4；新上线模型"));
         add(new Model("qwen4-max", "Qwen 4 Max", "person-qwen4-max", "新上线 0.47x", 300000, 65536,
                 "300k_230", "300000", 5, EFFORT_QWEN,
                 "豆包聚合的通义千问 Qwen 4 Max；新上线模型"));
         add(new Model("kimi-k3.1-pro", "Kimi K3.1 Pro", "person-kimi-k3-1-pro-261111", "0.95x", 300000, 65536,
-                "300k_230", "300000", 5, EFFORT_300K,
+                "300k_230", "300000", 7, EFFORT_300K,
                 "豆包聚合的 Kimi K3.1 Pro"));
         add(new Model("kimi-k3.1-pro-fast", "Kimi K3.1 Pro 高速", "person-kimi-k3-1-pro-highspeed-261111", "1.44x", 300000, 65536,
-                "300k_230", "300000", 5, EFFORT_300K,
+                "300k_230", "300000", 7, EFFORT_300K,
                 "豆包聚合的 Kimi K3.1 Pro 高速通道"));
         add(new Model("kimi-k3", "Kimi K3", "person-kimi-k3-261111", "1.48x", 300000, 65536,
-                "300k_230", "300000", 5, EFFORT_300K,
+                "300k_230", "300000", 7, EFFORT_300K,
                 "豆包聚合的 Kimi K3"));
         add(new Model("glm-5.3", "GLM 5.3", "person-glm-5-3-261111", "0.80x", 300000, 65536,
-                "300k_230", "300000", 5, EFFORT_GLM,
+                "300k_230", "300000", 7, EFFORT_GLM,
                 "豆包聚合的智谱 GLM 5.3；上游曾报错，是否可用以账号实际返回为准"));
         add(new Model("glm-5.3-flash", "GLM 5.3 Flash", "person-glm-5-3-flash-261111", "0.08x", 300000, 65536,
-                "300k_230", "300000", 5, EFFORT_GLM,
+                "300k_230", "300000", 7, EFFORT_GLM,
                 "豆包聚合的智谱 GLM 5.3 Flash；上游曾报错，是否可用以账号实际返回为准"));
         add(new Model("deepseek-v4-pro", "DeepSeek V4 Pro", "person-deepseek-v4-pro-ga-260813", "0.46x", 300000, 65536,
-                "300k_230", "300000", 5, EFFORT_300K,
+                "300k_230", "300000", 7, EFFORT_300K,
                 "豆包聚合的 DeepSeek V4 Pro"));
         add(new Model("qwen3.8-max", "Qwen 3.8 Max", "person-qwen3-8-max", "0.74x", 300000, 65536,
                 "300k_230", "300000", 5, EFFORT_QWEN,
@@ -101,6 +102,12 @@ public final class DoubaoProtocol {
         add(new Model("qwen3.8-flash", "Qwen 3.8 Flash", "person-qwen3-8-flash", "0.05x", 300000, 65536,
                 "300k_230", "300000", 5, EFFORT_QWEN,
                 "豆包聚合的通义千问 Qwen 3.8 Flash"));
+        add(new Model("mimo-v2.6-pro", "MiMo V2.6 Pro", "person-mimo-v2-6-pro", "0.07x", 300000, 65536,
+                "300k_230", "300000", 5, EFFORT_MIMO,
+                "豆包聚合的小米 MiMo V2.6 Pro"));
+        add(new Model("mimo-v2.6-flash", "MiMo V2.6 Flash", "person-mimo-v2-6-flash", "0.03x", 300000, 65536,
+                "300k_230", "300000", 5, EFFORT_MIMO,
+                "豆包聚合的小米 MiMo V2.6 Flash"));
     }
 
     private static void add(Model model) { MODELS.put(model.id, model); }
@@ -111,6 +118,8 @@ public final class DoubaoProtocol {
         if (direct != null) return direct;
         if ("doubao-seed-2.1-lite".equals(id)) return MODELS.get("doubao-2.1-lite");
         if ("doubao-seed-2.1-pro".equals(id)) return MODELS.get("doubao-2.1-pro");
+        // 兼容 v3 目录里的旧 id：客户端和旧配置可能还发 deepseek-v4-flash。
+        if ("deepseek-v4-flash".equals(id)) return MODELS.get("deepseek-v4.1-flash");
         if ("qwen-4-max".equals(id)) return MODELS.get("qwen4-max");
         if ("qwen-3.8-max".equals(id)) return MODELS.get("qwen3.8-max");
         if ("qwen-3.8-flash".equals(id)) return MODELS.get("qwen3.8-flash");
