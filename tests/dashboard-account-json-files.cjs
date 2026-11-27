@@ -12,14 +12,20 @@ Object.defineProperty(navigator,'clipboard',{value:{writeText(){copies++;throw E
 window.AllInNative={openAccountTransfer(action,id){calls.push({action,id});return true}};
 ${code}
 (async()=>{
- for(const id of ACCOUNT_FILE_PROVIDERS){
+ for(const id of [...ACCOUNT_FILE_PROVIDERS].filter(id=>id!=='doubao'&&id!=='doubao-web')){
   const card=document.createElement('div');document.querySelector('#cards').appendChild(card);
   ensureAccountFileButtons(card,id);ensureAccountFileButtons(card,id);
   const buttons=card.querySelectorAll('button');check(buttons.length===2,'exactly one pair for '+id);
   buttons[0].click();buttons[1].click();check(calls[calls.length-2].action==='import'&&calls[calls.length-1].action==='export','native actions '+id);
   check(calls[calls.length-1].id===id,'correct provider '+id);
  }
- check(calls.length===42,'twenty-one implemented suppliers have both actions');
+ check(calls.length===40,'twenty generic implemented suppliers have both actions');
+ for(const id of ['doubao','doubao-web']){
+  const card=document.createElement('div');card.innerHTML='<button data-account-file-action="import">导入账号</button><button data-account-file-action="export">导出账号</button>';
+  ensureAccountFileButtons(card,id);
+  const buttons=card.querySelectorAll('button');check(buttons.length===2,'dedicated exactly one pair for '+id);
+  check(buttons[0].textContent==='导入账号'&&buttons[1].textContent==='导出账号','dedicated labels '+id);
+ }
  const card=document.createElement('div');ensureAccountFileButtons(card,'agentmore');check(card.children.length===0,'placeholder not pretending support');
  ensureAccountFileButtons(document.querySelector('#legacy'),'antigravity');
  const legacy=document.querySelectorAll('#legacy button');check(legacy.length===3,'missing import added without duplicate export');

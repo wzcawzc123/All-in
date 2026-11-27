@@ -17837,7 +17837,7 @@ async function removeCustomProvider(id) {
     }
     document.querySelectorAll('[data-provider-logo]').forEach(el => {
       const id = el.getAttribute('data-provider-logo');
-      const card = el.closest('.card'); if (card) card.dataset.providerId = id;
+      const card = el.closest('.card'); if (card && !card.dataset.providerId) card.dataset.providerId = id;
       el.outerHTML = providerLogo(id, id, false);
     });
 

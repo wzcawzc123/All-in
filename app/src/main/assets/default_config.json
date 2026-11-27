@@ -704,7 +704,7 @@
         },
         "Kimi-k2.6": {
           "name": "Kimi k2.6 (x6.5)",
-          "contextWindow": 26214444,
+          "contextWindow": 262144,
           "maxOutput": 65536
         },
         "qwen-3.8-max": {

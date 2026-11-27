@@ -64,7 +64,7 @@ function runDom(html, budgetMs, screenshotPath) {
 const CARD_IDS = [
   'workbuddy', 'raccoon', 'workbuddy-ai', 'loomy', 'catpaw',
   'github-copilot', 'minimax-code', 'deepseek_web', 'zcode',
-  'qoder_cn', 'cline', 'codex', 'antigravity', 'trae-cn', 'doubao'
+  'qoder_cn', 'cline', 'codex', 'antigravity', 'trae-cn', 'doubao', 'doubao-web'
 ];
 
 const dashboardHtml = fs.readFileSync(
@@ -353,7 +353,7 @@ const driverScript = `<pre id="test-result" hidden>WAIT</pre>
     check(appConfig && Array.isArray(appConfig.providers) && appConfig.providers.length >= 14,
       'appConfig loaded failed; fetches=' + window.__TEST_STATE.fetches.map((f) => f.url).join(',') + ' typeofLoad=' + (typeof loadConfig));
 
-    // Switch to providers tab and show all 14 cards simultaneously for layout + click audit
+    // Switch to providers tab and show all 16 cards simultaneously for layout + click audit
     if (typeof switchTab === 'function') switchTab('providers');
     else {
       document.querySelectorAll('.tab-pane').forEach((n) => n.classList.remove('active'));
@@ -380,7 +380,7 @@ const driverScript = `<pre id="test-result" hidden>WAIT</pre>
       'light mode horizontal overflow: scrollWidth=' + document.documentElement.scrollWidth + ' innerWidth=' + window.innerWidth);
 
     const cards = Array.from(document.querySelectorAll('#all-providers-cards-container > .card[data-provider-id]'));
-    check(cards.length === 15, 'expected 15 static provider cards, got ' + cards.length);
+    check(cards.length === 16, 'expected 16 static provider cards, got ' + cards.length);
     const containerEl = document.getElementById('all-providers-cards-container');
     containerEl.style.maxWidth = '358px';
     await sleep(10);
@@ -410,7 +410,7 @@ const driverScript = `<pre id="test-result" hidden>WAIT</pre>
     document.documentElement.removeAttribute('data-theme');
     await sleep(20);
 
-    // 3. Verify EVERY button across ALL 14 cards triggers cleanly
+    // 3. Verify EVERY button across ALL 16 cards triggers cleanly
     const state = window.__TEST_STATE;
     state.loginCalls = [];
     const origTriggerPlatformLogin = window.triggerPlatformLogin;
@@ -516,7 +516,7 @@ const driverScript = `<pre id="test-result" hidden>WAIT</pre>
       closeAccountModal();
       await sleep(20);
     }
-    check(clickedButtonCount === 83, 'expected 83 static card buttons across 15 cards, checked ' + clickedButtonCount);
+    check(clickedButtonCount === 88, 'expected 88 static card buttons across 16 cards, checked ' + clickedButtonCount);
 
     // 4. Strictly test per-account enable/disable glass-switch in inline card pool + modal + 409 rollback + ⋯ menu
     // 4a. Inline toggle disable on catpaw acc-1 via real user click()
