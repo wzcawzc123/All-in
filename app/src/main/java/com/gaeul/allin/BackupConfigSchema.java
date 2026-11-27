@@ -5,7 +5,7 @@ import com.gaeul.allin.json.*;
 
 /** Validates consumed configuration fields while preserving unrelated legacy fields. */
 final class BackupConfigSchema {
-    private static final Set<String> PROTOCOLS = new HashSet<>(Arrays.asList("openai","anthropic","responses","gemini","antigravity","qoder","codex","copilot","minimax","deepseek-web","cline","catpaw","trae"));
+    private static final Set<String> PROTOCOLS = new HashSet<>(Arrays.asList("openai","anthropic","responses","gemini","antigravity","qoder","codex","copilot","minimax","deepseek-web","cline","catpaw","trae","doubao"));
     static void validate(JSONObject root) throws Exception {
         JSONObject server = object(root, "server", true);
         optionalString(server, "authKey"); optionalString(server, "host");
