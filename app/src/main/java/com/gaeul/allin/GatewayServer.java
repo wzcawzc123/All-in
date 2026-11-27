@@ -779,6 +779,8 @@ public class GatewayServer extends NanoHTTPD {
     }
     private DeepSeekWeb.Transport deepSeekTransport = new DeepSeekWeb.HttpTransport();
     void setDeepSeekTransportForTests(DeepSeekWeb.Transport transport) { deepSeekTransport=transport; }
+    private DoubaoAuth.Transport doubaoTransport = new DoubaoHttp.HttpTransport();
+    void setDoubaoTransportForTests(DoubaoAuth.Transport transport) { doubaoTransport=transport; }
     private final File configFile;
     private volatile boolean backupRetired;
     private volatile ProviderQuirks.Snapshot quirksSnapshot;
@@ -2160,10 +2162,6 @@ public class GatewayServer extends NanoHTTPD {
         synchronized(this){checkinNetwork=NetworkPolicy.parse(networkFromConfig(configJson));}
         try(NetworkPolicy.Scope scope=NetworkPolicy.use(checkinNetwork)) {
             String id=account.optString("id");
-            if("doubao".equals(provider)) {
-                // 豆包每日签到：POST /alice/ug/campaign/landing/checkin，接口幂等
-                return DoubaoWeb.checkin(doubaoTransport(), account.optString("token",""));
-            }
             if("workbuddy".equals(provider)) {
                 JSONObject fresh=ensureStoredToken(provider,account,null);
                 return WorkBuddyCheckin.checkin(provider,fresh,this::openVendorConnection);
@@ -2197,7 +2195,18 @@ public class GatewayServer extends NanoHTTPD {
                 if(raw.optJSONArray("done")!=null&&raw.optJSONArray("done").length()>0)return new JSONObject().put("outcome","done").put("verified",true);
                 return new JSONObject().put("outcome","inactive").put("message","当前没有可领取的赠送套餐");
             }
+            if("doubao".equals(provider)||"doubao-web".equals(provider))return doubaoPageCheckin(account,true);
             throw new IllegalArgumentException("unsupported checkin provider");
+        }
+    }
+    private JSONObject doubaoPageCheckin(JSONObject account,boolean claim) {
+        if(context==null)return new JSONObject().put("outcome","failed").put("verified",false)
+                .put("safeToRetry",false).put("claimPossible",false)
+                .put("message","豆包签到需要通过 App 内 WebView 打开官方活动页；当前运行环境没有 Android WebView");
+        try(DoubaoCheckinPage page=new DoubaoCheckinPage(context)) {
+            return claim?DoubaoCheckin.checkin(account,page):DoubaoCheckin.status(account,page);
+        } catch(Exception failure) {
+            return CheckinEvidence.failure(failure);
         }
     }
     private static JSONObject loomyAvailability(Double quota) {
@@ -2219,6 +2228,7 @@ public class GatewayServer extends NanoHTTPD {
             }
             if("minimax-code".equals(provider)){MiniMaxLifecycle.Lease lease=miniLease(account,false,null);return MiniMaxAuth.checkin(lease.credentials.access,account.optString("uid"),false);}
             if("loomy".equals(provider)){LoomyAuth.Wallets w=loomyApi().usage(account.optString("token"));return loomyAvailability(w.dailyRemaining!=null?w.dailyRemaining:w.daily);}
+            if("doubao".equals(provider)||"doubao-web".equals(provider))return doubaoPageCheckin(account,false);
             return new JSONObject().put("outcome","unknown").put("message","赠送领取请使用单独的手动入口");
         }
     }
@@ -3221,8 +3231,9 @@ public class GatewayServer extends NanoHTTPD {
         String token = account.optString("token", "");
         switch (provider) {
         case "doubao":
+        case "doubao-web":
             // 豆包网页额度：POST /alice/commerce/sale/subscription/quota/summary/
-            return DoubaoWeb.fetchQuota(doubaoTransport(), token);
+            return DoubaoWeb.fetchQuota(doubaoWebTransport(), token);
         case "codex": {
             CodexAuth.SignInInfo info = new CodexAuth.SignInInfo();
             info.accessToken=account.optString("access", token); info.refreshToken=account.optString("refresh", "");
@@ -3535,7 +3546,7 @@ public class GatewayServer extends NanoHTTPD {
             models.put(model,clean);
         }
         JSONArray results=new JSONArray(), accounts=provider.optJSONArray("accounts");
-        boolean supported=java.util.Arrays.asList("codex","qoder_cn","cline","github-copilot","catpaw","raccoon","trae-cn","minimax-code","loomy","workbuddy","workbuddy-ai","doubao").contains(id);
+        boolean supported=java.util.Arrays.asList("codex","qoder_cn","cline","github-copilot","catpaw","raccoon","trae-cn","minimax-code","loomy","workbuddy","workbuddy-ai","doubao","doubao-web").contains(id);
         for(int i=0;accounts!=null && i<accounts.length();i++) {
             if(Thread.currentThread().isInterrupted()) throw new java.io.InterruptedIOException("interrupted");
             JSONObject a=accounts.optJSONObject(i); if(!qoderEnabled(a)) continue;
@@ -4329,9 +4340,9 @@ public class GatewayServer extends NanoHTTPD {
             }
             publishConfig(loaded);
             try { mergeDefaultProviders(); } catch (Throwable ignored) { }
+            try { migrateDoubaoCatalog(); } catch (Throwable ignored) { }
             try { migrateProviders(); } catch (Throwable ignored) { }
             try { migrateDeepSeekWeb(); } catch (Throwable ignored) { }
-            try { migrateDoubao(); } catch (Throwable ignored) { }
             return;
         }
         // No configuration file yet: the shipped asset is a template, not user data.
@@ -4786,6 +4797,101 @@ public class GatewayServer extends NanoHTTPD {
         }
     }
 
+    /**
+     * 豆包模型目录以安装包内置表为准：老版本升级后，配置里可能还留着旧的 10 个模型和错误倍率。
+     * 只对齐 models/modelMeta/note，保留账号、Key、enabled 等用户数据。
+     */
+    private synchronized void migrateDoubaoCatalog() {
+        JSONObject staged = new JSONObject(configJson.toString());
+        // 只迁移一次：之后用户手动删改目录不再被启动流程覆盖。
+        if (staged.optInt("doubaoCatalogVersion", 0) >= 3) return;
+        try {
+            byte[] bytes = readFileBytes(context.getAssets().open("default_config.json"));
+            JSONObject defaults = new JSONObject(new String(bytes, "UTF-8"));
+            if (!migrateDoubaoCatalog(staged, defaults)) return;
+            staged.put("doubaoCatalogVersion", 3);
+            saveConfig(staged);
+        } catch (Exception e) {
+            logException("migrateDoubaoCatalog", e);
+        }
+    }
+
+    /**
+     * 纯数据迁移：把旧配置里的单个 doubao 拆成 doubao 工作模式 + doubao-web 网页版。
+     * 返回 false 表示默认目录不完整，未做任何修改。
+     */
+    static boolean migrateDoubaoCatalog(JSONObject staged, JSONObject defaults) {
+        JSONObject defWork = findProviderById(defaults.optJSONArray("providers"), "doubao");
+        JSONObject defWeb = findProviderById(defaults.optJSONArray("providers"), "doubao-web");
+        JSONArray currentProvs = staged.optJSONArray("providers");
+        if (defWork == null || defWeb == null || currentProvs == null) return false;
+
+        JSONObject currentWork = findProviderById(currentProvs, "doubao");
+        JSONObject currentWeb = findProviderById(currentProvs, "doubao-web");
+
+        // 老配置可能把网页版放在 doubao 这个 id 下；先把它迁到 doubao-web，
+        // 再补一个空的 doubao 工作模式条目，账号和密钥不丢。
+        if (currentWork != null && isDoubaoWebProvider(currentWork)) {
+            if (currentWeb == null) {
+                currentWork.put("id", "doubao-web");
+                currentWork.put("name", defWeb.optString("name", "豆包网页版"));
+                currentWork.put("protocol", "doubao-web");
+                currentWeb = currentWork;
+                currentWork = null;
+            } else {
+                copyArrayIfEmpty(currentWeb, currentWork, "accounts");
+                copyArrayIfEmpty(currentWeb, currentWork, "keys");
+                for (int i = currentProvs.length() - 1; i >= 0; i--) {
+                    JSONObject p = currentProvs.optJSONObject(i);
+                    if (p != null && "doubao".equals(p.optString("id"))) { currentProvs.remove(i); break; }
+                }
+                currentWork = null;
+            }
+        }
+        if (currentWork == null) {
+            currentWork = new JSONObject(defWork.toString());
+            currentProvs.put(currentWork);
+        }
+        alignDoubaoProvider(currentWork, defWork);
+        if (currentWeb == null) {
+            currentWeb = new JSONObject(defWeb.toString());
+            currentProvs.put(currentWeb);
+        }
+        alignDoubaoProvider(currentWeb, defWeb);
+        return true;
+    }
+
+    private static boolean isDoubaoWebProvider(JSONObject provider) {
+        if ("doubao-web".equals(provider.optString("protocol"))) return true;
+        JSONArray models = provider.optJSONArray("models");
+        if (models != null) {
+            for (int i = 0; i < models.length(); i++) {
+                String model = models.optString(i, "");
+                if ("doubao-think".equals(model) || "doubao-expert".equals(model)) return true;
+            }
+        }
+        return provider.optString("note", "").contains("llm_model_type=38");
+    }
+
+    private static void copyArrayIfEmpty(JSONObject target, JSONObject source, String field) {
+        JSONArray existing = target.optJSONArray(field);
+        if (existing != null && existing.length() > 0) return;
+        JSONArray sourceArray = source.optJSONArray(field);
+        if (sourceArray != null) target.put(field, new JSONArray(sourceArray.toString()));
+    }
+
+    private static void alignDoubaoProvider(JSONObject target, JSONObject def) {
+        JSONArray models = def.optJSONArray("models");
+        if (models != null) target.put("models", new JSONArray(models.toString()));
+        JSONObject meta = def.optJSONObject("modelMeta");
+        if (meta != null) target.put("modelMeta", new JSONObject(meta.toString()));
+        else target.remove("modelMeta");
+        for (String field : new String[]{"name", "protocol", "status", "note", "loginUrl", "baseUrl"}) {
+            String want = def.optString(field, "");
+            if (!want.isEmpty() && !want.equals(target.optString(field, ""))) target.put(field, want);
+        }
+    }
+
     // 启动时自动合并内置默认供应商：补齐老版本配置中缺失的全部 Provider（绝不清空用户已有账号与密钥）
     private synchronized void mergeDefaultProviders() {
         JSONObject staged = new JSONObject(configJson.toString());
@@ -4830,43 +4936,6 @@ public class GatewayServer extends NanoHTTPD {
             }
         } catch (Exception e) {
             logException("mergeDefaultProviders",e);
-        }
-    }
-
-    /**
-     * 豆包：默认表换档（对话档 → 工作档）后，老配置里的 models/name/note 要对齐。
-     * mergeDefaultProviders 只在「provider 不存在」时补齐，不会更新已存在的条目，
-     * 所以这里单独做一次幂等对齐，否则老用户还会看到已经调不通的对话档模型名。
-     */
-    private synchronized void migrateDoubao() {
-        try {
-            if (getProviderById("doubao") == null) return;
-            JSONObject staged = new JSONObject(configJson.toString());
-            JSONObject target = findProviderById(staged.optJSONArray("providers"), "doubao");
-            if (target == null) return;
-            byte[] bytes = readFileBytes(context.getAssets().open("default_config.json"));
-            JSONObject defaults = new JSONObject(new String(bytes, "UTF-8"));
-            JSONObject def = findProviderById(defaults.optJSONArray("providers"), "doubao");
-            if (def == null) return;
-
-            boolean changed = false;
-            String curModels = String.valueOf(target.optJSONArray("models"));
-            String defModels = String.valueOf(def.optJSONArray("models"));
-            if (!curModels.equals(defModels)) {
-                target.put("models", new JSONArray(def.optJSONArray("models").toString()));
-                changed = true;
-            }
-            for (String field : new String[]{"name", "protocol", "status", "note", "loginUrl", "baseUrl"}) {
-                String want = def.optString(field, "");
-                if (!want.isEmpty() && !want.equals(target.optString(field, ""))) {
-                    target.put(field, want);
-                    changed = true;
-                }
-            }
-            // 只在 provider 本身需要变更时才写盘，账号与密钥一律不动
-            if (changed) saveConfig(staged);
-        } catch (Exception e) {
-            logException("migrateDoubao", e);
         }
     }
 
@@ -8704,6 +8773,44 @@ public class GatewayServer extends NanoHTTPD {
                     catch (DeepSeekConfigFailure e) { return errorResponse(500,"网页账号保存失败"); }
                     catch (IOException e) { return errorResponse(502,"网页凭据验证失败，请检查网络"); }
                 }
+                if ("doubao".equals(customProv) || "doubao".equals(targetProv)
+                        || "doubao-web".equals(customProv) || "doubao-web".equals(targetProv)) {
+                    String doubaoProvider = ("doubao-web".equals(customProv) || "doubao-web".equals(targetProv))
+                            ? "doubao-web" : "doubao";
+                    try {
+                        String cookie = DoubaoAuth.normalizeCookie(req.optString("cookie", req.optString("token", "")));
+                        DoubaoAuth.Credential credential = DoubaoAuth.Credential.fromAccount(
+                                new JSONObject().put("cookie", cookie), cookie);
+                        JSONObject who = DoubaoAuth.validate(doubaoTransport, credential);
+                        String official = who.optString("user_name", who.optString("name", "")).trim();
+                        if (!official.isEmpty() && ("豆包账号".equals(name) || name.isEmpty() || "免Key账号".equals(name)))
+                            name = official;
+                        if (name.isEmpty() || name.length() > 80) name = "豆包账号";
+                        boolean force = req.optBoolean("force", false);
+                        if (!force) {
+                            JSONObject existProv = getProviderById(doubaoProvider);
+                            JSONObject dup = findDuplicateAccount(existProv, name, cookie);
+                            if (dup != null) return duplicateAccountResponse(
+                                    "doubao-web".equals(doubaoProvider) ? "豆包网页版" : "豆包工作模式", dup);
+                        }
+                        String accId = addDoubaoAccount(doubaoProvider, name, cookie, force);
+                        if (!accountAddSucceeded(accId)) {
+                            JSONObject failed = new JSONObject();
+                            failed.put("ok", false);
+                            failed.put("error", "配置写入失败，账号未加入网关池，请重试");
+                            return jsonResponse(failed);
+                        }
+                        JSONObject res = new JSONObject();
+                        res.put("ok", true); res.put("id", accId); res.put("name", name);
+                        res.put("provider", doubaoProvider);
+                        res.put("message", "doubao-web".equals(doubaoProvider) ? "豆包网页版账号已加入网关池" : "豆包工作模式账号已加入网关池");
+                        return jsonResponse(res);
+                    } catch (DoubaoAuth.Failure failure) {
+                        return errorResponse(failure.status, failure.getMessage());
+                    } catch (IOException failure) {
+                        return errorResponse(502, "豆包登录态校验失败，请检查网络后再试");
+                    }
+                }
                 if (token.isEmpty()) {
                     return errorResponse(400, "Token 凭据不能为空");
                 }
@@ -8894,6 +9001,49 @@ public class GatewayServer extends NanoHTTPD {
                 if(!prov.optBoolean("enabled",true))return errorResponse(403,"供应商已禁用");
                 if(CustomProvider.isCustom(prov)) return syncCustomProvider(new JSONObject(prov.toString()));
                 if ("codex".equals(provId)) return syncCodexProviderCatalog(prov);
+                if ("doubao".equals(provId)) {
+                    if (!providerHasCredential(prov)) return errorResponse(401,"请先登录豆包账号");
+                    JSONArray list = new JSONArray();
+                    for (String id : DoubaoProtocol.ids()) list.put(id);
+                    JSONObject meta = new JSONObject();
+                    for (DoubaoProtocol.Model model : DoubaoProtocol.models()) {
+                        JSONArray efforts = new JSONArray();
+                        for (int effort : model.efforts) efforts.put(DoubaoProtocol.effortName(effort));
+                        meta.put(model.id, new JSONObject().put("name", model.name)
+                                .put("contextWindow", model.contextWindow)
+                                .put("maxOutput", model.maxOutput)
+                                .put("multiplier", DoubaoProtocol.multiplier(model))
+                                .put("rate", model.rate)
+                                .put("efforts", efforts)
+                                .put("desc", model.desc + "；积分倍率 " + model.rate));
+                    }
+                    synchronized (this) {
+                        JSONObject staged = new JSONObject(configJson.toString());
+                        JSONObject current = findProviderById(staged.optJSONArray("providers"), provId);
+                        if (current == null || !current.optBoolean("enabled", true)) return errorResponse(409,"供应商已变化，请重新读取");
+                        current.put("models", list);
+                        current.put("modelMeta", meta);
+                        if (!saveConfig(staged)) return errorResponse(500,"豆包模型目录保存失败，未生效");
+                    }
+                    return jsonResponse(new JSONObject().put("ok",true).put("provider",provId)
+                            .put("count",list.length()).put("models",list)
+                            .put("message","已恢复内置豆包工作模式模型目录；不访问上游，倍率以客户端为准"));
+                }
+                if ("doubao-web".equals(provId)) {
+                    if (!providerHasCredential(prov)) return errorResponse(401,"请先登录豆包网页版账号");
+                    JSONArray list = new JSONArray();
+                    for (String id : DoubaoWeb.MODELS) list.put(id);
+                    synchronized (this) {
+                        JSONObject staged = new JSONObject(configJson.toString());
+                        JSONObject current = findProviderById(staged.optJSONArray("providers"), provId);
+                        if (current == null || !current.optBoolean("enabled", true)) return errorResponse(409,"供应商已变化，请重新读取");
+                        current.put("models", list);
+                        if (!saveConfig(staged)) return errorResponse(500,"豆包网页版模型目录保存失败，未生效");
+                    }
+                    return jsonResponse(new JSONObject().put("ok",true).put("provider",provId)
+                            .put("count",list.length()).put("models",list)
+                            .put("message","已恢复内置豆包网页版模型目录（三档思考）"));
+                }
                 if ("deepseek-web".equals(prov.optString("protocol"))) {
                     if (!providerHasCredential(prov)) return errorResponse(401,"请先添加网页账号");
                     JSONArray modes=new JSONArray(); for(String m:DeepSeekWeb.MODELS) modes.put(m);
@@ -9084,9 +9234,12 @@ public class GatewayServer extends NanoHTTPD {
                 } else if ("workbuddy".equals(provId)) {
                     fetched = fetchOfficialModels(token, modelMeta);
                 } else if ("doubao".equals(provId)) {
-                    // 豆包的模型清单是客户端缓存（mode_list），公开接口 brief_list 需要签名，
-                    // 实测无 Cookie 与有 Cookie 都返回 710010202。这里用随包维护的实测表同步，
-                    // 保证面板模型集与代码里的 MODELS_MAP 永远一致；官方新增模型时改这一处即可。
+                    // 豆包工作模式的模型清单是客户端缓存（mode_list），公开接口 brief_list 需要签名，
+                    // 实测无 Cookie 与有 Cookie 都返回 710010202。这里用随包维护的实测表同步。
+                    fetched = new ArrayList<String>();
+                    for (String m : DoubaoProtocol.ids()) fetched.add(m);
+                } else if ("doubao-web".equals(provId)) {
+                    // 网页版只有三档思考，模型名由 use_deep_think / use_auto_cot 区分。
                     fetched = new ArrayList<String>();
                     for (String m : DoubaoWeb.MODELS) fetched.add(m);
                 } else if (isStandardProvider(provId)) {
@@ -12831,6 +12984,21 @@ public class GatewayServer extends NanoHTTPD {
         } catch(Exception e) { throw new IOException("Could not remove account",e); }
     }
 
+    private Attempt forwardDeepSeekWebAttempt(RouteTarget target, JSONObject payload, boolean stream, String requested,
+                                              PrivacyMasker.Session mask, ContextGuard.Result guard, ContextGuard.Config guardCfg) {
+        Attempt out=new Attempt(); out.providerId=target.providerId; out.modelRef=target.providerId+"/"+target.upstreamModel;
+        if (guardCfg.enabled && guardCfg.maxOutputTokens>0) {
+            out.status=400; out.body="DeepSeek web cannot enforce guard maxOutputTokens";
+            out.response=errorResponse(400,out.body); return out;
+        }
+        JSONObject original=NATIVE_REQUEST.get(), baseline=NATIVE_BASELINE.get();
+        JSONObject mw=configJson.optJSONObject("middleware");
+        if (original!=null && !original.has("max_tokens") && baseline!=null
+                && payload.has("max_tokens") && payload.optInt("max_tokens",-1)==baseline.optInt("max_tokens",-2)
+                && !middlewareCanSetLimit(mw,target.providerId)) payload.remove("max_tokens");
+        return forwardDeepSeekWeb(target,payload,stream,requested,mask,guard);
+    }
+
     private Attempt forwardDeepSeekWeb(RouteTarget target, JSONObject payload, boolean stream, String requested,
                                        PrivacyMasker.Session mask, ContextGuard.Result guard) {
         Attempt out=new Attempt(); out.providerId=target.providerId; out.modelRef=target.providerId+"/"+target.upstreamModel;
@@ -12874,33 +13042,33 @@ public class GatewayServer extends NanoHTTPD {
         } catch(Exception e) { out.status=502; out.body="DeepSeek web request failed"; out.response=errorResponse(502,out.body); return out; }
     }
 
-    // ── 豆包 ──────────────────────────────────────────────────────────────────
-    private static volatile DoubaoWeb.Transport doubaoTransport;
+    // ── 豆包网页版（三档思考） ───────────────────────────────────────────────
+    private static volatile DoubaoWeb.Transport doubaoWebTransport;
 
-    private static DoubaoWeb.Transport doubaoTransport() {
-        DoubaoWeb.Transport t = doubaoTransport;
+    private static DoubaoWeb.Transport doubaoWebTransport() {
+        DoubaoWeb.Transport t = doubaoWebTransport;
         if (t == null) {
             synchronized (GatewayServer.class) {
-                if (doubaoTransport == null) doubaoTransport = new DoubaoWebChat.HttpTransport();
-                t = doubaoTransport;
+                if (doubaoWebTransport == null) doubaoWebTransport = new DoubaoWebChat.HttpTransport();
+                t = doubaoWebTransport;
             }
         }
         return t;
     }
 
     /**
-     * 豆包网页反代：请求面由 DoubaoWeb 组装（设备 query 五段式信封），
+     * 豆包网页版反代：请求面由 DoubaoWeb 组装（设备 query 五段式信封），
      * 响应面吐 OpenAI chunk，直接交给既有的 streamForwardResponse 转发。
      * 凭据是入池时存下的整串 Cookie，不是 Bearer。
      */
-    private Attempt forwardDoubao(RouteTarget target, JSONObject payload, boolean stream, String requested,
-                                  PrivacyMasker.Session mask, ContextGuard.Result guard) {
+    private Attempt forwardDoubaoWeb(RouteTarget target, JSONObject payload, boolean stream, String requested,
+                                     PrivacyMasker.Session mask, ContextGuard.Result guard) {
         Attempt out = new Attempt();
         out.providerId = target.providerId;
         out.modelRef = target.providerId + "/" + target.upstreamModel;
         DoubaoWebChat web;
         try {
-            web = new DoubaoWebChat(target.apiKey, doubaoTransport());
+            web = new DoubaoWebChat(target.apiKey, doubaoWebTransport());
         } catch (IOException e) {
             out.status = 401;
             out.body = "Doubao account has no valid cookie, please sign in again";
@@ -12988,10 +13156,87 @@ public class GatewayServer extends NanoHTTPD {
         }
     }
 
+    /**
+     * 豆包工作模式：账号 Cookie 换 chat/completion，模型由 model_item_key 指定。
+     * 第三方模型（DeepSeek / Kimi / GLM）由豆包侧按该账号的额度路由，网关只做协议翻译。
+     */
+    private Attempt forwardDoubao(RouteTarget target, JSONObject payload, boolean stream, String requested,
+                                  PrivacyMasker.Session mask, ContextGuard.Result guard, ContextGuard.Config guardCfg) {
+        Attempt out = new Attempt();
+        out.providerId = target.providerId;
+        out.modelRef = target.providerId + "/" + target.upstreamModel;
+        if (guardCfg.enabled && guardCfg.maxOutputTokens > 0) {
+            out.status = 400; out.body = "Doubao work mode cannot enforce guard maxOutputTokens";
+            out.response = errorResponse(400, out.body);
+            return out;
+        }
+        DoubaoChat chat;
+        try {
+            DoubaoAuth.Credential credential = DoubaoAuth.Credential.fromAccount(target.account, target.apiKey);
+            chat = new DoubaoChat(credential, doubaoTransport);
+            chat.validate(payload);
+        } catch (IOException invalid) {
+            out.status = 400; out.body = invalid.getMessage() == null ? "Invalid Doubao request" : invalid.getMessage();
+            out.response = errorResponse(400, out.body);
+            return out;
+        }
+        try {
+            if (stream) {
+                final UsageLedger.Row row = U_ROW.get();
+                final Long start = U_START.get();
+                InputStream input = chat.stream(payload, requested, (success, status, error) -> {
+                    if (row != null) {
+                        row.status = success ? 200 : status; row.err = error;
+                        row.ms = System.currentTimeMillis() - (start == null ? System.currentTimeMillis() : start.longValue());
+                        try { recordUsageRow(row); } catch (Throwable ignored) {}
+                    }
+                });
+                U_ROW.remove();
+                try {
+                    out.response = wantsAnthropicOut()
+                            ? streamForwardAnthropicResponse(input, requested, mask, guard, null)
+                            : streamForwardResponse(input, mask, guard, null, out.modelRef);
+                } finally {
+                    if (row != null) U_ROW.set(row);
+                }
+                out.response.addHeader("X-AllIn-Output-Limit", "unsupported");
+                out.response.addHeader("Access-Control-Expose-Headers", "X-AllIn-Output-Limit");
+                out.ok = true; out.status = 200;
+                return out;
+            }
+            DoubaoChat.Result result = chat.run(payload, null);
+            JSONObject message = new JSONObject().put("role", "assistant").put("content", result.text);
+            if (!result.reasoning.isEmpty()) message.put("reasoning_content", result.reasoning);
+            if (result.toolCalls.length() > 0) message.put("tool_calls", result.toolCalls);
+            JSONObject body = new JSONObject().put("object", "chat.completion").put("model", requested)
+                    .put("choices", new JSONArray().put(new JSONObject().put("index", 0)
+                            .put("message", message)
+                            .put("finish_reason", result.toolCalls.length() > 0 ? "tool_calls" : "stop")));
+            String response = toAnthropicBodyIfNeeded(PrivacyMasker.unmaskText(body.toString(), mask), requested);
+            out.response = newFixedLengthResponse(Status.OK, "application/json; charset=UTF-8", response);
+            addCorsHeaders(out.response); applyGuardHeaders(out.response, guard);
+            out.response.addHeader("X-AllIn-Output-Limit", "unsupported");
+            out.response.addHeader("Access-Control-Expose-Headers", "X-AllIn-Output-Limit");
+            out.textOut = result.text; out.reasoningOut = result.reasoning;
+            out.ok = true; out.status = 200;
+            return out;
+        } catch (ProtocolResponseException invalid) {
+            return failedProtocolAttempt(out);
+        } catch (DoubaoChat.UpstreamException e) {
+            out.status = DoubaoChat.safeStatus(e);
+            out.body = DoubaoChat.safeErrorMessage(out.status);
+            out.response = errorResponse(out.status, out.body);
+            return out;
+        } catch (Exception e) {
+            out.status = 502; out.body = "豆包工作模式请求失败，请稍后重试";
+            out.response = errorResponse(502, out.body);
+            return out;
+        }
+    }
+
     private Response deepSeekWebError(DeepSeekWebChat web, DeepSeekWeb.UpstreamException failure) {
         return errorResponseWithDetail(failure.gatewayStatus, web.errorDetail(failure.gatewayStatus, failure));
     }
-
     private static String recentRef(RouteTarget target) { return target.providerId + "/" + target.upstreamModel; }
 
     private boolean isManualGroup(String model) {
@@ -13790,7 +14035,7 @@ public class GatewayServer extends NanoHTTPD {
         if (!java.util.Arrays.asList("openai", "anthropic", "responses").contains(protocol)) return false;
         if (java.util.Arrays.asList("workbuddy", "workbuddy-ai", "raccoon", "loomy", "zcode", "cline",
                 "codex", "github-copilot", "minimax-code", "antigravity", "qoder_cn", "catpaw",
-                "deepseek-web").contains(id)) return false;
+                "deepseek-web", "doubao", "doubao-web").contains(id)) return false;
         String kind = provider.optString("type", "").toLowerCase(java.util.Locale.ROOT);
         return !kind.contains("subscription") && !kind.contains("gift");
     }
@@ -14258,6 +14503,15 @@ public class GatewayServer extends NanoHTTPD {
         if ("deepseek-web".equals(p.optString("protocol"))) {
             for (int i=0;accs!=null && i<accs.length();i++) {
                 JSONObject a=accs.optJSONObject(i); if (a!=null && a.optBoolean("enabled",true) && !deepAccountToken(a).isEmpty()) return true;
+            }
+            return false;
+        }
+        if ("doubao".equals(p.optString("protocol")) || "doubao".equals(p.optString("id"))
+                || "doubao-web".equals(p.optString("protocol")) || "doubao-web".equals(p.optString("id"))) {
+            for (int i=0;accs!=null && i<accs.length();i++) {
+                JSONObject a=accs.optJSONObject(i);
+                if (a!=null && a.optBoolean("enabled",true) && !a.optBoolean("off",false)
+                        && !DoubaoAuth.cookieOf(a).trim().isEmpty()) return true;
             }
             return false;
         }
@@ -16161,26 +16415,20 @@ public class GatewayServer extends NanoHTTPD {
                 return adopt(out,result);
             }
             if ("deepseek-web".equals(target.protocol)) {
-                // A configured output cap cannot be enforced by the website, even if
-                // middleware happened to remove the corresponding request field.
-                if (guardCfg.enabled && guardCfg.maxOutputTokens>0) {
-                    out.status=400; out.body="DeepSeek web cannot enforce guard maxOutputTokens";
-                    out.response=errorResponse(400,out.body); return out;
-                }
-                JSONObject original=NATIVE_REQUEST.get(), baseline=NATIVE_BASELINE.get();
-                JSONObject mw=configJson.optJSONObject("middleware");
-                if (original!=null && !original.has("max_tokens") && baseline!=null
-                        && payload.has("max_tokens") && payload.optInt("max_tokens",-1)==baseline.optInt("max_tokens",-2)
-                        && !middlewareCanSetLimit(mw,target.providerId)) payload.remove("max_tokens");
-                Attempt web=forwardDeepSeekWeb(target,payload,clientWantsStream,requestedModel,maskSession,guardResult);
+                Attempt web=forwardDeepSeekWebAttempt(target,payload,clientWantsStream,requestedModel,maskSession,guardResult,guardCfg);
                 if (web.ok && clientWantsStream) handedOff=true;
                 return adopt(out,web);
             }
 
-            // ===== Qoder：不是 OpenAI 兼容接口，要过 COSY 签名 + 自定义响应解码 =====
-            // ===== 豆包：网页版 POST /chat/completion，自定义五段式信封 + 自定义 SSE =====
             if ("doubao".equals(target.protocol)) {
-                Attempt db = forwardDoubao(target, payload, clientWantsStream, requestedModel, maskSession, guardResult);
+                Attempt work = forwardDoubao(target, payload, clientWantsStream, requestedModel, maskSession, guardResult, guardCfg);
+                if (work.ok && clientWantsStream) handedOff = true;
+                return adopt(out, work);
+            }
+
+            // ===== 豆包网页版：POST /chat/completion，自定义五段式信封 + 自定义 SSE =====
+            if ("doubao-web".equals(target.protocol)) {
+                Attempt db = forwardDoubaoWeb(target, payload, clientWantsStream, requestedModel, maskSession, guardResult);
                 if (db.ok && clientWantsStream) handedOff = true;
                 return adopt(out, db);
             }
@@ -19170,7 +19418,9 @@ public class GatewayServer extends NanoHTTPD {
         }
         JSONObject pooledAccount=null;
         if(accountPoolOwns && !java.util.Arrays.asList("raccoon","loomy","trae-cn","qoder_cn","cline","catpaw","antigravity","github-copilot","minimax-code").contains(chosenId)
-                && !"deepseek-web".equals(chosenProvider.optString("protocol"))) {
+                && !"deepseek-web".equals(chosenProvider.optString("protocol"))
+                && !"doubao".equals(chosenProvider.optString("protocol"))
+                && !"doubao-web".equals(chosenProvider.optString("protocol"))) {
             ArrayList<JSONObject> eligible=new ArrayList<>(AccountPoolPolicy.routingAccounts(chosenProvider));
             if("workbuddy".equals(chosenId) || "workbuddy-ai".equals(chosenId)) {
                 final String wanted=mName;
@@ -19256,6 +19506,34 @@ public class GatewayServer extends NanoHTTPD {
             if (valid.isEmpty()) return null;
             route.account=valid.get(routingAccountIndex(route.providerId,valid,mName));
             route.apiKey=deepAccountToken(route.account); return route;
+        }
+        if ("doubao".equals(route.protocol)) {
+            if (DoubaoProtocol.resolve(mName) == null) return null;
+            JSONArray accounts=chosenProvider.optJSONArray("accounts"); ArrayList<JSONObject> valid=new ArrayList<JSONObject>();
+            for (int i=0;accounts!=null && i<accounts.length();i++) {
+                JSONObject a=accounts.optJSONObject(i);
+                if (a!=null && a.optBoolean("enabled",true) && !a.optBoolean("off",false)
+                        && !DoubaoAuth.cookieOf(a).trim().isEmpty()) valid.add(a);
+            }
+            if (valid.isEmpty()) return null;
+            route.account=valid.get(routingAccountIndex(route.providerId,valid,mName));
+            try { route.apiKey=DoubaoAuth.normalizeCookie(DoubaoAuth.cookieOf(route.account)); }
+            catch (IOException invalid) { return null; }
+            return route;
+        }
+        if ("doubao-web".equals(route.protocol)) {
+            if (!java.util.Arrays.asList(DoubaoWeb.MODELS).contains(mName)) return null;
+            JSONArray accounts=chosenProvider.optJSONArray("accounts"); ArrayList<JSONObject> valid=new ArrayList<JSONObject>();
+            for (int i=0;accounts!=null && i<accounts.length();i++) {
+                JSONObject a=accounts.optJSONObject(i);
+                if (a!=null && a.optBoolean("enabled",true) && !a.optBoolean("off",false)
+                        && !DoubaoAuth.cookieOf(a).trim().isEmpty()) valid.add(a);
+            }
+            if (valid.isEmpty()) return null;
+            route.account=valid.get(routingAccountIndex(route.providerId,valid,mName));
+            try { route.apiKey=DoubaoAuth.normalizeCookie(DoubaoAuth.cookieOf(route.account)); }
+            catch (IOException invalid) { return null; }
+            return route;
         }
         if ("cline".equals(route.providerId) || "cline".equals(route.protocol)) {
             JSONArray accs = chosenProvider.optJSONArray("accounts");
@@ -20235,6 +20513,68 @@ public class GatewayServer extends NanoHTTPD {
             return accId;
         } catch (Exception e) {
             logException("account ingestion",e);
+            return "err";
+        }
+    }
+
+    /**
+     * 豆包账号入池。Cookie 就是登录态，没有 refresh；过期只能重新扫码。
+     * deviceId 由 Cookie 稳定派生，换设备不会改变会话身份。
+     * doubao 工作模式与 doubao-web 网页版共用同一套 Cookie，但各自维护账号列表。
+     */
+    private synchronized String addDoubaoAccount(String providerId, String name, String cookie, boolean force) {
+        try {
+            boolean web = "doubao-web".equals(providerId);
+            String providerName = web ? "豆包网页版 (三档思考)" : "豆包工作模式 (积分/额度池)";
+            String protocol = web ? "doubao-web" : "doubao";
+            JSONArray accountModels = new JSONArray();
+            if (web) {
+                for (String id : DoubaoWeb.MODELS) accountModels.put(id);
+            } else {
+                for (String id : DoubaoProtocol.ids()) accountModels.put(id);
+            }
+            JSONObject staged = new JSONObject(configJson.toString());
+            JSONArray providers = staged.optJSONArray("providers");
+            if (providers == null) { providers = new JSONArray(); staged.put("providers", providers); }
+            JSONObject targetProv = null;
+            for (int i = 0; i < providers.length(); i++) {
+                JSONObject p = providers.optJSONObject(i);
+                if (p != null && providerId.equals(p.optString("id"))) { targetProv = p; break; }
+            }
+            if (targetProv == null) {
+                targetProv = new JSONObject();
+                targetProv.put("id", providerId);
+                targetProv.put("name", providerName);
+                targetProv.put("baseUrl", DoubaoAuth.ORIGIN);
+                targetProv.put("loginUrl", DoubaoAuth.ORIGIN + (web ? "/chat" : "/chat/"));
+                targetProv.put("protocol", protocol);
+                targetProv.put("status", "ported");
+                targetProv.put("enabled", true);
+                targetProv.put("models", new JSONArray(accountModels.toString()));
+                providers.put(targetProv);
+            }
+            JSONArray accounts = targetProv.optJSONArray("accounts");
+            if (accounts == null) { accounts = new JSONArray(); targetProv.put("accounts", accounts); }
+
+            String accId = AccountPoolPolicy.newId("acc_");
+            JSONObject acc = new JSONObject();
+            acc.put("id", accId);
+            acc.put("name", name == null || name.trim().isEmpty() ? "豆包账号" : name.trim());
+            acc.put("type", "web");
+            acc.put("token", cookie);
+            acc.put("cookie", cookie);
+            acc.put("deviceId", DoubaoAuth.deriveDeviceId(cookie));
+            acc.put("webId", DoubaoAuth.deriveDeviceId(cookie));
+            acc.put("localAppId", DoubaoAuth.LOCAL_APP_ID);
+            acc.put("addedAt", System.currentTimeMillis());
+            acc.put("models", new JSONArray(accountModels.toString()));
+            acc = AccountPoolPolicy.upsert(targetProv, acc, providerId);
+            accId = acc.optString("id");
+
+            if (!saveConfig(staged)) throw new IOException("配置保存失败，账号未加入账号池");
+            return accId;
+        } catch (Exception failure) {
+            logException("Doubao account ingestion", failure);
             return "err";
         }
     }

@@ -149,6 +149,26 @@ final class GatewayAccessCatalog {
             return false;
         }
         if ("deepseek-web".equals(protocol) && !java.util.Arrays.asList(DeepSeekWeb.MODELS).contains(model)) return false;
+        if ("doubao".equals(protocol)) {
+            if (DoubaoProtocol.resolve(model) == null) return false;
+            boolean scoped=p.optBoolean("accessAccountCatalogScoped",false) || hasAccountCatalog(accounts);
+            for (int i=0; accounts!=null && i<accounts.length(); i++) {
+                JSONObject a=accounts.optJSONObject(i);
+                if (qoderEnabled(a) && DoubaoAuth.cookieOf(a).trim().length()>0
+                        && supportsAccountModel(a,model,scoped)) return true;
+            }
+            return false;
+        }
+        if ("doubao-web".equals(protocol)) {
+            if (!java.util.Arrays.asList(DoubaoWeb.MODELS).contains(model)) return false;
+            boolean scoped=p.optBoolean("accessAccountCatalogScoped",false) || hasAccountCatalog(accounts);
+            for (int i=0; accounts!=null && i<accounts.length(); i++) {
+                JSONObject a=accounts.optJSONObject(i);
+                if (qoderEnabled(a) && DoubaoAuth.cookieOf(a).trim().length()>0
+                        && supportsAccountModel(a,model,scoped)) return true;
+            }
+            return false;
+        }
         if ("deepseek-web".equals(protocol) || "qoder".equals(protocol) || "catpaw".equals(protocol) || "antigravity".equals(protocol) || "copilot".equals(protocol) || "minimax".equals(protocol) || "cline".equals(protocol)) {
             for (int i=0; accounts!=null && i<accounts.length(); i++) {
                 JSONObject a=accounts.optJSONObject(i); if (!enabled(a) || !supportsAccountModel(a,model,p.optBoolean("accessAccountCatalogScoped", false) || hasAccountCatalog(accounts))) continue;

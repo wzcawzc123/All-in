@@ -12,7 +12,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Daily per-account check-ins. Durable intent precedes a claim; unknown claims are never replayed that day. */
 final class CheckinCenter implements AutoCloseable {
-    static final List<String> SUPPORTED = Collections.unmodifiableList(Arrays.asList("workbuddy", "minimax-code", "raccoon", "loomy", "trae-cn", "zcode", "doubao", QoderCheckin.PROVIDER));
+    static final List<String> SUPPORTED = Collections.unmodifiableList(Arrays.asList("workbuddy", "minimax-code", "raccoon", "loomy", "trae-cn", "zcode", "doubao", "doubao-web", QoderCheckin.PROVIDER));
     interface Host { Object lock(); JSONObject config(); boolean save(JSONObject next); boolean retired(); default long accountEpoch(String provider,String id){return 0;} }
     interface Transport { JSONObject checkin(String provider, JSONObject account) throws Exception; default JSONObject claimQoder(JSONObject account,String campaign)throws Exception{throw new IOException("Qoder claim unavailable");} default JSONObject status(String provider,JSONObject account)throws Exception{return new JSONObject().put("outcome","unknown").put("message","此供应商没有独立签到状态接口，请在官方客户端核对");} }
     interface Clock { long now(); }
@@ -77,6 +77,7 @@ final class CheckinCenter implements AutoCloseable {
         if("workbuddy".equals(provider))return WorkBuddyAllowance.eligible(a) && !a.optString("access",a.optString("token","")).isEmpty();
         if("minimax-code".equals(provider))return !a.optString("access",a.optString("token","")).isEmpty();
         if("zcode".equals(provider))return !a.optString("jwt",a.optString("giftJwt","")).isEmpty();
+        if("doubao".equals(provider)||"doubao-web".equals(provider))return !DoubaoAuth.cookieOf(a).trim().isEmpty();
         return !a.optString("token",a.optString("access","")).isEmpty();
     }
     private static void putRecord(JSONObject config,String k,JSONObject result) {

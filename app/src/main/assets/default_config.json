@@ -23,13 +23,13 @@
   },
   "providers": [
     {
-      "id": "doubao",
-      "name": "豆包工作 (字节 网页模式)",
+      "id": "doubao-web",
+      "name": "豆包网页版 (三档思考)",
       "status": "ported",
       "baseUrl": "https:\/\/www.doubao.com",
       "loginUrl": "https:\/\/www.doubao.com\/chat",
-      "protocol": "doubao",
-      "note": "网页对话接口底层只有一个 Seed 模型（llm_model_type=38），快速\/思考\/专家 靠 use_deep_think 与 use_auto_cot 区分。实测 model_item_key 被服务端忽略，DeepSeek\/GLM\/Qwen\/Kimi 那批是工作任务模式的聚合能力，不属于本接口参数。支持额度查询与每日签到。",
+      "protocol": "doubao-web",
+      "note": "独立网页对话通道：底层只有一个 Seed 模型（llm_model_type=38），快速\/思考\/专家 靠 use_deep_think 与 use_auto_cot 区分。实测 model_item_key 被服务端忽略，DeepSeek\/GLM\/Qwen\/Kimi 那批是“豆包”工作模式供应商的聚合能力，不属于本接口参数。支持额度查询与每日签到。",
       "models": [
         "doubao",
         "doubao-think",
@@ -293,6 +293,149 @@
       }
     },
     {
+      "id": "doubao",
+      "name": "豆包工作模式 (积分/额度池)",
+      "status": "ported",
+      "plugin": "community/doubao-work",
+      "baseUrl": "https://www.doubao.com",
+      "loginUrl": "https://www.doubao.com/chat/",
+      "protocol": "doubao",
+      "note": "豆包网页工作模式：Cookie 登录，用本人账号额度/积分调用豆包聚合的豆包 / DeepSeek / Kimi / GLM / Qwen；文本对话 + 提示词工具桥，不支持图片与文件；模型与倍率按本机豆包客户端 2.37.16 工作模式目录校准",
+      "models": [
+        "auto",
+        "doubao-2.1-lite",
+        "doubao-2.1-pro",
+        "deepseek-v4-flash",
+        "glm-5.4",
+        "qwen4-max",
+        "kimi-k3.1-pro",
+        "kimi-k3.1-pro-fast",
+        "kimi-k3",
+        "glm-5.3",
+        "glm-5.3-flash",
+        "deepseek-v4-pro",
+        "qwen3.8-max",
+        "qwen3.8-flash"
+      ],
+      "keys": [],
+      "accounts": [],
+      "enabled": true,
+      "modelMeta": {
+        "auto": {
+          "name": "自动",
+          "contextWindow": 256000,
+          "maxOutput": 32768,
+          "multiplier": 0,
+          "efforts": ["auto", "low", "medium", "high"],
+          "desc": "由豆包按任务自动选模型；客户端标注“小额免费”，实际计费以客户端为准"
+        },
+        "doubao-2.1-lite": {
+          "name": "豆包 2.1 Lite",
+          "contextWindow": 256000,
+          "maxOutput": 32768,
+          "multiplier": 0.01,
+          "efforts": ["auto", "low", "medium", "high"],
+          "desc": "轻量豆包模型；客户端限时优惠 0.01x"
+        },
+        "doubao-2.1-pro": {
+          "name": "豆包 2.1 Pro",
+          "contextWindow": 256000,
+          "maxOutput": 32768,
+          "multiplier": 0.65,
+          "efforts": ["low", "medium", "high"],
+          "desc": "豆包旗舰模型；客户端 0.65x"
+        },
+        "deepseek-v4-flash": {
+          "name": "DeepSeek V4.1 Flash",
+          "contextWindow": 300000,
+          "maxOutput": 65536,
+          "multiplier": 0.01,
+          "efforts": ["low", "medium", "high", "xhigh", "max"],
+          "desc": "豆包聚合的 DeepSeek 轻量旗舰；客户端限时优惠 0.01x"
+        },
+        "glm-5.4": {
+          "name": "GLM 5.4",
+          "contextWindow": 300000,
+          "maxOutput": 65536,
+          "multiplier": 0.8,
+          "efforts": ["low", "high", "max"],
+          "desc": "豆包聚合的智谱 GLM 5.4；客户端新上线 0.80x"
+        },
+        "qwen4-max": {
+          "name": "Qwen 4 Max",
+          "contextWindow": 300000,
+          "maxOutput": 65536,
+          "multiplier": 0.47,
+          "efforts": ["low", "high", "xhigh"],
+          "desc": "豆包聚合的通义千问 Qwen 4 Max；客户端新上线 0.47x"
+        },
+        "kimi-k3.1-pro": {
+          "name": "Kimi K3.1 Pro",
+          "contextWindow": 300000,
+          "maxOutput": 65536,
+          "multiplier": 0.95,
+          "efforts": ["low", "medium", "high", "xhigh", "max"],
+          "desc": "豆包聚合的 Kimi K3.1 Pro；客户端 0.95x"
+        },
+        "kimi-k3.1-pro-fast": {
+          "name": "Kimi K3.1 Pro 高速",
+          "contextWindow": 300000,
+          "maxOutput": 65536,
+          "multiplier": 1.44,
+          "efforts": ["low", "medium", "high", "xhigh", "max"],
+          "desc": "豆包聚合的 Kimi K3.1 Pro 高速通道；客户端 1.44x"
+        },
+        "kimi-k3": {
+          "name": "Kimi K3",
+          "contextWindow": 300000,
+          "maxOutput": 65536,
+          "multiplier": 1.48,
+          "efforts": ["low", "medium", "high", "xhigh", "max"],
+          "desc": "豆包聚合的 Kimi K3；客户端 1.48x"
+        },
+        "glm-5.3": {
+          "name": "GLM 5.3",
+          "contextWindow": 300000,
+          "maxOutput": 65536,
+          "multiplier": 0.8,
+          "efforts": ["low", "high", "max"],
+          "desc": "豆包聚合的智谱 GLM 5.3；客户端 0.80x，上游曾报错，是否可用以账号实际返回为准"
+        },
+        "glm-5.3-flash": {
+          "name": "GLM 5.3 Flash",
+          "contextWindow": 300000,
+          "maxOutput": 65536,
+          "multiplier": 0.08,
+          "efforts": ["low", "high", "max"],
+          "desc": "豆包聚合的智谱 GLM 5.3 Flash；客户端 0.08x，上游曾报错，是否可用以账号实际返回为准"
+        },
+        "deepseek-v4-pro": {
+          "name": "DeepSeek V4 Pro",
+          "contextWindow": 300000,
+          "maxOutput": 65536,
+          "multiplier": 0.46,
+          "efforts": ["low", "medium", "high", "xhigh", "max"],
+          "desc": "豆包聚合的 DeepSeek V4 Pro；客户端 0.46x"
+        },
+        "qwen3.8-max": {
+          "name": "Qwen 3.8 Max",
+          "contextWindow": 300000,
+          "maxOutput": 65536,
+          "multiplier": 0.74,
+          "efforts": ["low", "high", "xhigh"],
+          "desc": "豆包聚合的通义千问 Qwen 3.8 Max；客户端 0.74x"
+        },
+        "qwen3.8-flash": {
+          "name": "Qwen 3.8 Flash",
+          "contextWindow": 300000,
+          "maxOutput": 65536,
+          "multiplier": 0.05,
+          "efforts": ["low", "high", "xhigh"],
+          "desc": "豆包聚合的通义千问 Qwen 3.8 Flash；客户端 0.05x"
+        }
+      }
+    },
+    {
       "id": "trae-cn",
       "name": "Trae CN (字节 AI IDE)",
       "status": "ported",
@@ -543,7 +686,7 @@
         },
         "Kimi-k2.6": {
           "name": "Kimi k2.6 (x6.5)",
-          "contextWindow": 262144,
+          "contextWindow": 26214444,
           "maxOutput": 65536
         },
         "qwen-3.8-max": {

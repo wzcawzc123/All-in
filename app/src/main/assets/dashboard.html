@@ -5021,14 +5021,14 @@ html[data-theme="dark"] .priv-ico.tone-violet { background: rgba(167, 139, 250, 
           </div>
         </div>
 
-        <!-- 豆包 -->
+        <!-- 豆包工作模式 -->
         <div class="card" data-provider-id="doubao">
           <div class="pv-head">
             <div class="pv-brand">
               <span data-provider-logo="doubao"></span>
               <div>
-                <b class="pv-name">豆包</b>
-                <span class="pv-sub">官网网页登录入池 · 文本反代 POST /chat/completion</span>
+                <b class="pv-name">豆包工作模式</b>
+                <span class="pv-sub">网页 Cookie 登录 · 用账号额度调用豆包 / DeepSeek / Kimi / GLM</span>
               </div>
             </div>
             <div class="pv-head-right">
@@ -5038,21 +5038,58 @@ html[data-theme="dark"] .priv-ico.tone-violet { background: rgba(167, 139, 250, 
           <div class="pv-dock">
             <div class="pv-primary-row">
               <button type="button" class="btn pv-btn-cta" onclick="triggerPlatformLogin('doubao')"><span class="pv-btn-ico" aria-hidden="true"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></span><span>登录账号</span></button>
-              <button type="button" class="btn pv-btn-glass" data-account-file-action="import" onclick="promptImportAccount('doubao')"><span class="pv-btn-ico" aria-hidden="true"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/></svg></span><span class="pv-btn-label">导入账号</span></button>
+              <button type="button" class="btn pv-btn-glass" onclick="promptImportDoubaoAccount('doubao')"><span class="pv-btn-ico" aria-hidden="true"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/></svg></span><span class="pv-btn-label">导入 Cookie</span></button>
             </div>
             <div class="pv-util-dock">
-              <button type="button" class="btn pv-util-btn" onclick="syncUniversalModels('doubao')"><span class="pv-btn-ico" aria-hidden="true"><svg width="12.5" height="12.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg></span><span>同步官方模型</span></button>
-              <button type="button" class="btn pv-util-btn" data-account-file-action="export" onclick="exportAccount('doubao')"><span class="pv-btn-ico" aria-hidden="true"><svg width="12.5" height="12.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3"/><path d="m7 8 5-5 5 5"/><path d="M5 20h14"/></svg></span><span class="pv-btn-label">导出账号</span></button>
+              <button type="button" class="btn pv-util-btn" onclick="syncUniversalModels('doubao')"><span class="pv-btn-ico" aria-hidden="true"><svg width="12.5" height="12.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg></span><span>恢复内置目录</span></button>
+              <button type="button" class="btn pv-util-btn" onclick="exportAccount('doubao')"><span class="pv-btn-ico" aria-hidden="true"><svg width="12.5" height="12.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3"/><path d="m7 8 5-5 5 5"/><path d="M5 20h14"/></svg></span><span class="pv-btn-label">导出账号</span></button>
               <button type="button" class="btn pv-util-btn" onclick="removeAccountAction('doubao')"><span class="pv-btn-ico" aria-hidden="true"><svg width="12.5" height="12.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></span><span class="pv-btn-label">移除账号</span></button>
             </div>
           </div>
-          <div id="endpoint-probe-status-doubao" class="pv-telemetry" role="status" aria-live="polite">登录走豆包官网（手机号验证码即可，不必扫码）；入池整串 Cookie，8 个必需名凑齐才算登录成功；网页模式仅文本。</div>
+          <div id="endpoint-probe-status-doubao" class="pv-telemetry" role="status" aria-live="polite">消耗登录账号自己的豆包额度/积分；工作模式为文本对话（含提示词工具桥），不支持图片与文件。</div>
           <div id="acc-pool-doubao" class="pv-pool" hidden></div>
           <div class="pv-models-box">
             <div class="pv-models-head">
-              <span id="model-pool-summary-doubao" class="pv-sub" style="margin:0;">官方云端模型池:</span>
+              <span id="model-pool-summary-doubao" class="pv-sub" style="margin:0;">豆包聚合模型池（14 档）:</span>
             </div>
             <div id="models-tags-doubao" class="pv-models-tags">
+              <span style="font-size: 0.72rem; color: var(--text-muted);">⚡ 正在加载模型池...</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 豆包网页版 -->
+        <div class="card" data-provider-id="doubao-web">
+          <div class="pv-head">
+            <div class="pv-brand">
+              <span data-provider-logo="doubao"></span>
+              <div>
+                <b class="pv-name">豆包网页版</b>
+                <span class="pv-sub">官网网页登录入池 · 三档思考 · 文本反代 POST /chat/completion</span>
+              </div>
+            </div>
+            <div class="pv-head-right">
+              <span id="badge-count-doubao-web" class="badge" onclick="manageProviderAccounts('doubao-web')">账号 0</span>
+            </div>
+          </div>
+          <div class="pv-dock">
+            <div class="pv-primary-row">
+              <button type="button" class="btn pv-btn-cta" onclick="triggerPlatformLogin('doubao-web')"><span class="pv-btn-ico" aria-hidden="true"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></span><span>登录账号</span></button>
+              <button type="button" class="btn pv-btn-glass" onclick="promptImportDoubaoAccount('doubao-web')"><span class="pv-btn-ico" aria-hidden="true"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/></svg></span><span class="pv-btn-label">导入 Cookie</span></button>
+            </div>
+            <div class="pv-util-dock">
+              <button type="button" class="btn pv-util-btn" onclick="syncUniversalModels('doubao-web')"><span class="pv-btn-ico" aria-hidden="true"><svg width="12.5" height="12.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg></span><span>同步官方模型</span></button>
+              <button type="button" class="btn pv-util-btn" onclick="exportAccount('doubao-web')"><span class="pv-btn-ico" aria-hidden="true"><svg width="12.5" height="12.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3"/><path d="m7 8 5-5 5 5"/><path d="M5 20h14"/></svg></span><span class="pv-btn-label">导出账号</span></button>
+              <button type="button" class="btn pv-util-btn" onclick="removeAccountAction('doubao-web')"><span class="pv-btn-ico" aria-hidden="true"><svg width="12.5" height="12.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></span><span class="pv-btn-label">移除账号</span></button>
+            </div>
+          </div>
+          <div id="endpoint-probe-status-doubao-web" class="pv-telemetry" role="status" aria-live="polite">登录走豆包官网；网页对话通道只有快速 / 思考 / 专家三档，模型名由 use_deep_think 与 use_auto_cot 区分。</div>
+          <div id="acc-pool-doubao-web" class="pv-pool" hidden></div>
+          <div class="pv-models-box">
+            <div class="pv-models-head">
+              <span id="model-pool-summary-doubao-web" class="pv-sub" style="margin:0;">官方云端模型池（3 档）:</span>
+            </div>
+            <div id="models-tags-doubao-web" class="pv-models-tags">
               <span style="font-size: 0.72rem; color: var(--text-muted);">⚡ 正在加载模型池...</span>
             </div>
           </div>
@@ -7459,7 +7496,7 @@ html[data-theme="dark"] .priv-ico.tone-violet { background: rgba(167, 139, 250, 
 
     /** 供应商卡片的统一清单：两处 render 循环共用，避免新增供应商时漏改一处 */
     const PROVIDER_CARD_IDS = ['workbuddy', 'workbuddy-ai', 'raccoon', 'loomy', 'catpaw', 'deepseek_web',
-      'doubao',
+      'doubao', 'doubao-web',
       'zcode', 'qoder_cn', 'cline', 'codex', 'antigravity', 'trae-cn',
       'github-copilot', 'minimax-code'];
 
@@ -13013,7 +13050,7 @@ async function removeCustomProvider(id) {
 }
 
     function providerCounts(p) {
-      const accountRequired = ['antigravity','qoder_cn','catpaw','github-copilot','minimax-code','trae-cn','deepseek_web','loomy'].includes(p.id);
+      const accountRequired = ['antigravity','qoder_cn','catpaw','github-copilot','minimax-code','trae-cn','deepseek_web','doubao','doubao-web','loomy'].includes(p.id);
       const keys = new Set((Array.isArray(p.keys) ? p.keys : []).map(k => typeof k === 'string' ? k.trim() : (k && typeof k === 'object' && typeof k.key === 'string' ? k.key.trim() : '')).filter(Boolean));
       const accounts = (Array.isArray(p.accounts) ? p.accounts : []).filter(a => a && typeof a === 'object' && !Array.isArray(a) && ['token','access','accessToken','refresh','refreshToken','jwt','apiKey'].some(k => typeof a[k] === 'string' && a[k].trim()));
       // Saved disabled accounts remain manageable; expired login mirrors alone are not accounts.
@@ -17767,6 +17804,7 @@ async function removeCustomProvider(id) {
     // 文件名按供应商 ID 命名；暂缺的资源加载失败时显示首字。
     const PROVIDER_ICON_FILES = Object.freeze({
       'doubao': 'doubao.svg',
+      'doubao-web': 'doubao.svg',
       'anthropic': 'anthropic.svg', 'antigravity': 'antigravity.svg',
       'cline': 'cline.svg', 'codex': 'codex.svg', 'dangbei': 'dangbei.png',
       'deepseek': 'deepseek.svg', 'deepseek_web': 'deepseek_web.svg',
@@ -18206,6 +18244,8 @@ async function removeCustomProvider(id) {
         raccoon: '商汤小浣熊',
         catpaw: '妙手 CatPaw',
         deepseek_web: 'DeepSeek',
+        doubao: '豆包工作模式',
+        'doubao-web': '豆包网页版',
         trae: '字节 Trae',
         wenxin_web: '百度文心',
         dangbei: '当贝 AI',
@@ -18234,6 +18274,35 @@ async function removeCustomProvider(id) {
           refreshProviderBadges();
         } else if (data.duplicate) {
           showDupAccountModal(providerId, data, () => addProviderAccount(providerId, name, token, true));
+        } else {
+          alert('入池失败: ' + errText(data.error));
+        }
+      } catch (e) {
+        alert('网络请求失败: ' + e.message);
+      }
+    }
+
+    async function promptImportDoubaoAccount(providerId) {
+      const target = providerId === 'doubao-web' ? 'doubao-web' : 'doubao';
+      const cookie = prompt('粘贴 www.doubao.com 的完整 Cookie（必须包含 sessionid=；可在浏览器开发者工具 Network → 任意请求 → Request Headers → Cookie 复制）。');
+      if (cookie == null || !cookie.trim()) return;
+      await addDoubaoAccountFromDashboard(target, cookie.trim(), false);
+    }
+
+    async function addDoubaoAccountFromDashboard(providerId, cookie, force) {
+      try {
+        const res = await fetch(API_BASE + '/api/auth/' + providerId + '/add', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: '豆包账号', cookie, provider: providerId, force: !!force })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          showToast('🎉 ' + getProviderName(providerId) + ' 账号已成功加入网关池！');
+          await loadConfig();
+          refreshProviderBadges();
+        } else if (data.duplicate) {
+          showDupAccountModal(providerId, data, () => addDoubaoAccountFromDashboard(providerId, cookie, true));
         } else {
           alert('入池失败: ' + errText(data.error));
         }
@@ -18340,7 +18409,7 @@ async function removeCustomProvider(id) {
       if (typeof retry === 'function') retry();
     }
 
-    const ACCOUNT_FILE_PROVIDERS = new Set(['zcode','doubao','workbuddy','workbuddy-ai','trae-cn','catpaw','deepseek_web','raccoon','loomy','deepseek','siliconflow','openai','anthropic','openrouter','tencent','qoder_cn','cline','codex','antigravity','github-copilot','minimax-code']);
+    const ACCOUNT_FILE_PROVIDERS = new Set(['zcode','doubao','doubao-web','workbuddy','workbuddy-ai','trae-cn','catpaw','deepseek_web','raccoon','loomy','deepseek','siliconflow','openai','anthropic','openrouter','tencent','qoder_cn','cline','codex','antigravity','github-copilot','minimax-code']);
     function openAccountFileTransfer(providerId, action) {
       if (!ACCOUNT_FILE_PROVIDERS.has(providerId) || !['import','export'].includes(action)) {
         showToast('此供应商尚不支持账号文件迁移'); return false;
@@ -18362,6 +18431,8 @@ async function removeCustomProvider(id) {
     };
     function ensureAccountFileButtons(container, id) {
       if (!container || !ACCOUNT_FILE_PROVIDERS.has(id)) return;
+      // 豆包两个供应商都用整条 Cookie 入池；卡片上已有专用导入按钮，避免被通用导入覆盖。
+      if (id === 'doubao' || id === 'doubao-web') return;
       let imported = false, exported = false;
       Array.from(container.querySelectorAll('button')).forEach(button => {
         const inline = button.getAttribute('onclick') || '';

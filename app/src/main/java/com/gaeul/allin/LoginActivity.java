@@ -365,14 +365,19 @@ public class LoginActivity extends Activity {
         });
     }
 
+    private boolean isDoubaoProvider() {
+        return "doubao".equals(currentProvider) || "doubao-web".equals(currentProvider);
+    }
+
     private String getProviderDisplayName(String id) {
         if ("workbuddy".equals(id)) return "WorkBuddy";
         if ("trae".equals(id)) return "字节 Trae";
         if ("catpaw".equals(id)) return "妙手 CatPaw (美团)";
         if ("workbuddy-ai".equals(id)) return "WorkBuddy AI (国际版)";
         if ("trae-cn".equals(id)) return "Trae CN";
-        if ("doubao".equals(id)) return "豆包";
+        if ("doubao-web".equals(id)) return "豆包网页版";
         if ("deepseek_web".equals(id)) return "DeepSeek";
+        if ("doubao".equals(id)) return "豆包工作模式";
         if ("zhipu_web".equals(id)) return "智谱清言";
         if ("agentmore".equals(id)) return "AgentMore";
         if ("wenxin_web".equals(id)) return "百度文心";
@@ -409,8 +414,8 @@ public class LoginActivity extends Activity {
             initDeviceFlowAuth("minimax-code", "MiniMax Code", 10 * 60 * 1000L);
         } else if ("workbuddy".equals(currentProvider)) {
             initWorkBuddyAuth();
-        } else if ("doubao".equals(currentProvider)) {
-            subtitleView.setText("请在豆包官网完成登录（手机号验证码），登录成功后自动入池，也可点右上角「完成入池」");
+        } else if (isDoubaoProvider()) {
+            subtitleView.setText("请在豆包官网完成登录（扫码或手机号验证码），登录成功后自动入池，也可点右上角「完成入池」");
             webView.loadUrl("https://www.doubao.com/chat");
         } else if ("deepseek_web".equals(currentProvider)) {
             subtitleView.setText("请在官方页面登录，登录后自动入池，也可点击完成入池");
@@ -1562,6 +1567,7 @@ public class LoginActivity extends Activity {
 
     private void extractTokenFromPage(final boolean isManualClick) {
         if ("deepseek_web".equals(currentProvider)) { extractDeepSeek(isManualClick); return; }
+        if (isDoubaoProvider()) { extractDoubao(isManualClick); return; }
         if ("zhipu_web".equals(currentProvider)) return;
         // 1. 原生 CookieManager 扫描（直接从底层的 Cookie 数据库提取，包含 HttpOnly 与跨子域名 Cookie）
         String tokenFound = "";
@@ -1591,7 +1597,7 @@ public class LoginActivity extends Activity {
                     String c = cm.getCookie("https://ai.catpaw.meituan.com");
                     if (c != null) sb.append(c).append("; ");
 
-                } else if ("doubao".equals(currentProvider)) {
+                } else if (isDoubaoProvider()) {
                     // 豆包鉴权是多 Cookie 协作（sessionid/sid_guard/uid_tt…），必须整串带
                     String dc = cm.getCookie("https://www.doubao.com");
                     if (dc != null) sb.append(dc).append("; ");
@@ -1600,7 +1606,7 @@ public class LoginActivity extends Activity {
 
                 if (!allCookies.isEmpty()) {
                     // A0. 豆包：整串 Cookie 即凭证，8 个必需名凑齐才算登录成功
-                    if ("doubao".equals(currentProvider)) {
+                    if (isDoubaoProvider()) {
                         String[] need = {"sessionid=", "sessionid_ss=", "sid_tt=", "sid_guard=",
                                 "uid_tt=", "uid_tt_ss=", "ttwid=", "passport_csrf_token="};
                         boolean complete = true;
@@ -1624,7 +1630,7 @@ public class LoginActivity extends Activity {
                     }
 
                     // B. 通用 JWT 扫描（匹配任何 Cookie 中的标准 JWT 格式）
-                    if (tokenFound.isEmpty() && !"doubao".equals(currentProvider)) {
+                    if (tokenFound.isEmpty() && !isDoubaoProvider()) {
                         Matcher mJwt = Pattern.compile("eyJ[a-zA-Z0-9_\\-]{20,}\\.[a-zA-Z0-9_\\-]{20,}\\.[a-zA-Z0-9_\\-]{20,}").matcher(allCookies);
                         if (mJwt.find()) {
                             tokenFound = mJwt.group(0).trim();
@@ -1632,7 +1638,7 @@ public class LoginActivity extends Activity {
                     }
 
                     // C. 常见 token 命名扫描
-                    if (tokenFound.isEmpty() && !"doubao".equals(currentProvider)) {
+                    if (tokenFound.isEmpty() && !isDoubaoProvider()) {
                         Matcher mKeys = Pattern.compile("(?:^|;\\s*)(?:xhx_token|access_token|accessToken|user_token|auth_token|token|session_token)=([^;]+)", Pattern.CASE_INSENSITIVE).matcher(allCookies);
                         if (mKeys.find()) {
                             String val = mKeys.group(1).trim();
@@ -1708,6 +1714,78 @@ public class LoginActivity extends Activity {
                 }
             }
         }
+    }
+
+    /**
+     * 豆包要的是整条 Cookie（sessionid 是身份，ttwid 等参与风控），不是某个 JWT。
+     * 从 WebView 的 CookieManager 取域名 Cookie，交给网关做只读校验后入池。
+     */
+    private void extractDoubao(final boolean manual) {
+        if (isFinishing() || isDestroyed()) return;
+        String cookie = "";
+        try {
+            CookieManager cm = CookieManager.getInstance();
+            try { CookieManager.class.getMethod("flush").invoke(cm); } catch (Exception ignored) {}
+            String a = cm.getCookie("https://www.doubao.com");
+            String b = cm.getCookie("https://doubao.com");
+            StringBuilder sb = new StringBuilder();
+            if (a != null && !a.trim().isEmpty()) sb.append(a.trim());
+            if (b != null && !b.trim().isEmpty()) {
+                for (String part : b.split(";")) {
+                    String key = part.trim();
+                    if (key.isEmpty() || sb.indexOf(key) >= 0) continue;
+                    if (sb.length() > 0) sb.append("; ");
+                    sb.append(key);
+                }
+            }
+            cookie = sb.toString();
+        } catch (Exception ignored) {}
+        if (cookie.indexOf("sessionid=") < 0) {
+            if (manual) new AlertDialog.Builder(LoginActivity.this)
+                    .setTitle("还没有登录豆包")
+                    .setMessage("请先在下方页面完成扫码或手机号登录，登录成功后再点击右上角【完成入池】。")
+                    .setPositiveButton("我知道了", null).show();
+            return;
+        }
+        saveDoubaoAccount(cookie, currentProvider);
+    }
+
+    private void saveDoubaoAccount(final String cookie, final String provider) {
+        if (isFinishing() || isDestroyed() || accountSaveInFlight) return;
+        accountSaveInFlight = true;
+        final int generation = ++accountSaveGeneration;
+        startLoginTask(new Runnable() {
+            @Override public void run() {
+                try {
+                    JSONObject body = new JSONObject();
+                    body.put("name", "豆包账号");
+                    body.put("cookie", cookie);
+                    body.put("provider", provider);
+                    final LocalBridge.Result response = loginRequest("POST", "/api/auth/" + provider + "/add", body.toString(), 20000);
+                    mainHandler.post(new Runnable() {
+                        @Override public void run() {
+                            if (isFinishing() || isDestroyed() || generation != accountSaveGeneration) return;
+                            accountSaveInFlight = false;
+                            if (response.accountSaved()) {
+                                Toast.makeText(LoginActivity.this, "🎉 豆包账号已成功加入网关池！", Toast.LENGTH_LONG).show();
+                                finish();
+                            } else {
+                                subtitleView.setText(response.accountFailureMessage());
+                                Toast.makeText(LoginActivity.this, response.accountFailureMessage(), Toast.LENGTH_LONG).show();
+                            }
+                        }
+                    });
+                } catch (final Exception e) {
+                    mainHandler.post(new Runnable() {
+                        @Override public void run() {
+                            if (isFinishing() || isDestroyed() || generation != accountSaveGeneration) return;
+                            accountSaveInFlight = false;
+                            Toast.makeText(LoginActivity.this, "保存豆包账号失败，请检查网关后重试", Toast.LENGTH_SHORT).show();
+                        }
+                    });
+                }
+            }
+        });
     }
 
     private boolean isDeepSeekOrigin(String url) {
