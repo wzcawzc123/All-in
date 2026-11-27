@@ -118,6 +118,19 @@ const rafNative = window.requestAnimationFrame;
 window.performance.now = () => vNow;
 window.requestAnimationFrame = cb => { rafQueue.push(cb); return rafQueue.length; };
 window.cancelAnimationFrame = () => {};
+// XunE: 测试环境确定化——宿主系统的 prefers-reduced-motion/transparency 不得影响断言。
+// Windows CI runner 报告 reduce 时，mountSegSlider 会把 lift.target 钉在 0，
+// data-lens-lifted 永远不会出现；这类宿主媒体查询必须由测试固定为 no-preference。
+const mediaNative = window.matchMedia ? window.matchMedia.bind(window) : null;
+window.matchMedia = query => {
+  const q = String(query);
+  if (/prefers-reduced-(motion|transparency)/.test(q)) {
+    return { matches: false, media: q, onchange: null,
+      addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} };
+  }
+  return mediaNative ? mediaNative(q)
+    : { matches: false, media: q, onchange: null, addEventListener() {}, removeEventListener() {} };
+};
 function stepFrames(count) {
   for (let i = 0; i < count; i++) {
     vNow += 16;
@@ -232,7 +245,10 @@ ${routeUiAndGroupsSlice}
       bubbles: true, pointerId: 1, pointerType: 'touch', clientX: centerX(btns[0]), clientY: y
     }));
     stepFrames(12);
-    assertTrue(segBefore.hasAttribute('data-lens-lifted'), 'pointerdown should lift lens');
+    const segRect = segBefore.getBoundingClientRect();
+      assertTrue(segBefore.hasAttribute('data-lens-lifted'),
+        'pointerdown should lift lens; diag w=' + segRect.width + ' h=' + segRect.height +
+        ' btns=' + btns.length + ' rm=' + matchMedia('(prefers-reduced-motion: reduce)').matches);
     btns[0].dispatchEvent(new PointerEvent('pointermove', {
       bubbles: true, pointerId: 1, pointerType: 'touch', clientX: centerX(btns[2]), clientY: y
     }));
