@@ -23,6 +23,23 @@
   },
   "providers": [
     {
+      "id": "doubao",
+      "name": "豆包工作 (字节 网页模式)",
+      "status": "ported",
+      "baseUrl": "https:\/\/www.doubao.com",
+      "loginUrl": "https:\/\/www.doubao.com\/chat",
+      "protocol": "doubao",
+      "note": "网页对话接口底层只有一个 Seed 模型（llm_model_type=38），快速\/思考\/专家 靠 use_deep_think 与 use_auto_cot 区分。实测 model_item_key 被服务端忽略，DeepSeek\/GLM\/Qwen\/Kimi 那批是工作任务模式的聚合能力，不属于本接口参数。支持额度查询与每日签到。",
+      "models": [
+        "doubao",
+        "doubao-think",
+        "doubao-expert"
+      ],
+      "enabled": true,
+      "accounts": [],
+      "keys": []
+    },
+    {
       "id": "zcode",
       "name": "ZCode (智谱 GLM Coding)",
       "status": "ported",

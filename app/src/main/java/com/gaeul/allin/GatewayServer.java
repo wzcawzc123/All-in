@@ -2096,6 +2096,10 @@ public class GatewayServer extends NanoHTTPD {
         synchronized(this){checkinNetwork=NetworkPolicy.parse(networkFromConfig(configJson));}
         try(NetworkPolicy.Scope scope=NetworkPolicy.use(checkinNetwork)) {
             String id=account.optString("id");
+            if("doubao".equals(provider)) {
+                // 豆包每日签到：POST /alice/ug/campaign/landing/checkin，接口幂等
+                return DoubaoWeb.checkin(doubaoTransport(), account.optString("token",""));
+            }
             if("workbuddy".equals(provider)) {
                 JSONObject fresh=ensureStoredToken(provider,account,null);
                 return WorkBuddyCheckin.checkin(provider,fresh,this::openVendorConnection);
@@ -2711,6 +2715,9 @@ public class GatewayServer extends NanoHTTPD {
         if (fixture != null) return fixture.allowance(provider, account);
         String token = account.optString("token", "");
         switch (provider) {
+        case "doubao":
+            // 豆包网页额度：POST /alice/commerce/sale/subscription/quota/summary/
+            return DoubaoWeb.fetchQuota(doubaoTransport(), token);
         case "codex": {
             CodexAuth.SignInInfo info = new CodexAuth.SignInInfo();
             info.accessToken=account.optString("access", token); info.refreshToken=account.optString("refresh", "");
@@ -3008,7 +3015,7 @@ public class GatewayServer extends NanoHTTPD {
             models.put(model,clean);
         }
         JSONArray results=new JSONArray(), accounts=provider.optJSONArray("accounts");
-        boolean supported=java.util.Arrays.asList("codex","qoder_cn","cline","github-copilot","catpaw","raccoon","trae-cn","minimax-code","loomy","workbuddy","workbuddy-ai").contains(id);
+        boolean supported=java.util.Arrays.asList("codex","qoder_cn","cline","github-copilot","catpaw","raccoon","trae-cn","minimax-code","loomy","workbuddy","workbuddy-ai","doubao").contains(id);
         for(int i=0;accounts!=null && i<accounts.length();i++) {
             if(Thread.currentThread().isInterrupted()) throw new java.io.InterruptedIOException("interrupted");
             JSONObject a=accounts.optJSONObject(i); if(!qoderEnabled(a)) continue;
@@ -3599,6 +3606,7 @@ public class GatewayServer extends NanoHTTPD {
             try { mergeDefaultProviders(); } catch (Throwable ignored) { }
             try { migrateProviders(); } catch (Throwable ignored) { }
             try { migrateDeepSeekWeb(); } catch (Throwable ignored) { }
+            try { migrateDoubao(); } catch (Throwable ignored) { }
             return;
         }
         // No configuration file yet: the shipped asset is a template, not user data.
@@ -4097,6 +4105,43 @@ public class GatewayServer extends NanoHTTPD {
             }
         } catch (Exception e) {
             logException("mergeDefaultProviders",e);
+        }
+    }
+
+    /**
+     * 豆包：默认表换档（对话档 → 工作档）后，老配置里的 models/name/note 要对齐。
+     * mergeDefaultProviders 只在「provider 不存在」时补齐，不会更新已存在的条目，
+     * 所以这里单独做一次幂等对齐，否则老用户还会看到已经调不通的对话档模型名。
+     */
+    private synchronized void migrateDoubao() {
+        try {
+            if (getProviderById("doubao") == null) return;
+            JSONObject staged = new JSONObject(configJson.toString());
+            JSONObject target = findProviderById(staged.optJSONArray("providers"), "doubao");
+            if (target == null) return;
+            byte[] bytes = readFileBytes(context.getAssets().open("default_config.json"));
+            JSONObject defaults = new JSONObject(new String(bytes, "UTF-8"));
+            JSONObject def = findProviderById(defaults.optJSONArray("providers"), "doubao");
+            if (def == null) return;
+
+            boolean changed = false;
+            String curModels = String.valueOf(target.optJSONArray("models"));
+            String defModels = String.valueOf(def.optJSONArray("models"));
+            if (!curModels.equals(defModels)) {
+                target.put("models", new JSONArray(def.optJSONArray("models").toString()));
+                changed = true;
+            }
+            for (String field : new String[]{"name", "protocol", "status", "note", "loginUrl", "baseUrl"}) {
+                String want = def.optString(field, "");
+                if (!want.isEmpty() && !want.equals(target.optString(field, ""))) {
+                    target.put(field, want);
+                    changed = true;
+                }
+            }
+            // 只在 provider 本身需要变更时才写盘，账号与密钥一律不动
+            if (changed) saveConfig(staged);
+        } catch (Exception e) {
+            logException("migrateDoubao", e);
         }
     }
 
@@ -8185,6 +8230,12 @@ public class GatewayServer extends NanoHTTPD {
                     }
                 } else if ("workbuddy".equals(provId)) {
                     fetched = fetchOfficialModels(token, modelMeta);
+                } else if ("doubao".equals(provId)) {
+                    // 豆包的模型清单是客户端缓存（mode_list），公开接口 brief_list 需要签名，
+                    // 实测无 Cookie 与有 Cookie 都返回 710010202。这里用随包维护的实测表同步，
+                    // 保证面板模型集与代码里的 MODELS_MAP 永远一致；官方新增模型时改这一处即可。
+                    fetched = new ArrayList<String>();
+                    for (String m : DoubaoWeb.MODELS) fetched.add(m);
                 } else if (isStandardProvider(provId)) {
                     fetched = fetchStandardModels(provId, prov.optString("baseUrl", ""), token, modelMeta);
                 } else {
@@ -11032,6 +11083,120 @@ public class GatewayServer extends NanoHTTPD {
             out.response = deepSeekWebError(web, e);
             return out;
         } catch(Exception e) { out.status=502; out.body="DeepSeek web request failed"; out.response=errorResponse(502,out.body); return out; }
+    }
+
+    // ── 豆包 ──────────────────────────────────────────────────────────────────
+    private static volatile DoubaoWeb.Transport doubaoTransport;
+
+    private static DoubaoWeb.Transport doubaoTransport() {
+        DoubaoWeb.Transport t = doubaoTransport;
+        if (t == null) {
+            synchronized (GatewayServer.class) {
+                if (doubaoTransport == null) doubaoTransport = new DoubaoWebChat.HttpTransport();
+                t = doubaoTransport;
+            }
+        }
+        return t;
+    }
+
+    /**
+     * 豆包网页反代：请求面由 DoubaoWeb 组装（设备 query 五段式信封），
+     * 响应面吐 OpenAI chunk，直接交给既有的 streamForwardResponse 转发。
+     * 凭据是入池时存下的整串 Cookie，不是 Bearer。
+     */
+    private Attempt forwardDoubao(RouteTarget target, JSONObject payload, boolean stream, String requested,
+                                  PrivacyMasker.Session mask, ContextGuard.Result guard) {
+        Attempt out = new Attempt();
+        out.providerId = target.providerId;
+        out.modelRef = target.providerId + "/" + target.upstreamModel;
+        DoubaoWebChat web;
+        try {
+            web = new DoubaoWebChat(target.apiKey, doubaoTransport());
+        } catch (IOException e) {
+            out.status = 401;
+            out.body = "Doubao account has no valid cookie, please sign in again";
+            out.response = errorResponse(401, out.body);
+            ROUTE_SIGN_IN_HINT.set("豆包登录态失效，请在供应商卡片点「登录账号」重新登录");
+            return out;
+        }
+        try {
+            web.validate(payload);
+        } catch (IOException e) {
+            out.status = 400;
+            out.body = e.getMessage();
+            out.response = errorResponse(400, out.body);
+            return out;
+        }
+        try {
+            if (stream) {
+                final UsageLedger.Row row = U_ROW.get();
+                final Long start = U_START.get();
+                InputStream input = web.stream(payload, requested, (success, status, error) -> {
+                    if (row != null) {
+                        row.status = success ? 200 : status;
+                        row.err = error;
+                        row.ms = System.currentTimeMillis() - (start == null ? System.currentTimeMillis() : start.longValue());
+                        try { recordUsageRow(row); } catch (Throwable ignored) { }
+                    }
+                });
+                // 流 worker 接管了账本行，两种输出格式都一样
+                U_ROW.remove();
+                try {
+                    out.response = wantsAnthropicOut()
+                            ? streamForwardAnthropicResponse(input, requested, mask, guard, null)
+                            : streamForwardResponse(input, mask, guard, null, out.modelRef);
+                } finally {
+                    if (row != null) U_ROW.set(row);
+                }
+                out.response.addHeader("X-AllIn-Output-Limit", "unsupported");
+                out.response.addHeader("Access-Control-Expose-Headers", "X-AllIn-Output-Limit");
+                out.ok = true;
+                out.status = 200;
+                return out;
+            }
+            final StringBuilder text = new StringBuilder();
+            DoubaoWebChat.Result result = web.run(payload, new DoubaoWeb.Listener() {
+                @Override public void onText(String delta) { text.append(delta); }
+                @Override public void onReasoning(String delta) { }
+            });
+            JSONObject message = new JSONObject().put("role", "assistant").put("content", result.text);
+            JSONObject body = new JSONObject()
+                    .put("object", "chat.completion")
+                    .put("model", requested)
+                    .put("choices", new JSONArray().put(new JSONObject()
+                            .put("index", 0)
+                            .put("message", message)
+                            .put("finish_reason", "stop")));
+            unmaskJson(body, mask);
+            String response = toAnthropicBodyIfNeeded(body.toString(), requested);
+            out.response = newFixedLengthResponse(Status.OK, "application/json; charset=UTF-8", response);
+            addCorsHeaders(out.response);
+            applyGuardHeaders(out.response, guard);
+            out.response.addHeader("X-AllIn-Output-Limit", "unsupported");
+            out.response.addHeader("Access-Control-Expose-Headers", "X-AllIn-Output-Limit");
+            out.textOut = result.text;
+            out.reasoningOut = result.reasoning;
+            out.ok = true;
+            out.status = 200;
+            return out;
+        } catch (DoubaoWeb.UpstreamException failure) {
+            out.status = failure.gatewayStatus;
+            out.body = DoubaoWebChat.safeErrorMessage(out.status);
+            out.stopFallback = true;
+            out.response = errorResponseWithDetail(out.status, new JSONObject()
+                    .put("type", out.status == 401 ? "authentication_error"
+                            : out.status == 403 ? "permission_error"
+                            : out.status == 429 ? "rate_limit_error" : "upstream_error")
+                    .put("code", out.status)
+                    .put("message", out.body)
+                    .put("detail", failure.getMessage() == null ? "" : failure.getMessage()));
+            return out;
+        } catch (Exception e) {
+            out.status = 502;
+            out.body = "Doubao web request failed";
+            out.response = errorResponse(502, out.body);
+            return out;
+        }
     }
 
     private Response deepSeekWebError(DeepSeekWebChat web, DeepSeekWeb.UpstreamException failure) {
@@ -14028,6 +14193,13 @@ public class GatewayServer extends NanoHTTPD {
             }
 
             // ===== Qoder：不是 OpenAI 兼容接口，要过 COSY 签名 + 自定义响应解码 =====
+            // ===== 豆包：网页版 POST /chat/completion，自定义五段式信封 + 自定义 SSE =====
+            if ("doubao".equals(target.protocol)) {
+                Attempt db = forwardDoubao(target, payload, clientWantsStream, requestedModel, maskSession, guardResult);
+                if (db.ok && clientWantsStream) handedOff = true;
+                return adopt(out, db);
+            }
+
             if ("qoder".equals(target.protocol)) {
                 Attempt result=forwardQoder(target,payload,clientWantsStream,requestedModel,maskSession,guardResult);
                 if(result.ok && clientWantsStream) handedOff=true;

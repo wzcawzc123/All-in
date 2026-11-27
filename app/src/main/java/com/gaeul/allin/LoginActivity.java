@@ -371,6 +371,7 @@ public class LoginActivity extends Activity {
         if ("catpaw".equals(id)) return "妙手 CatPaw (美团)";
         if ("workbuddy-ai".equals(id)) return "WorkBuddy AI (国际版)";
         if ("trae-cn".equals(id)) return "Trae CN";
+        if ("doubao".equals(id)) return "豆包";
         if ("deepseek_web".equals(id)) return "DeepSeek";
         if ("zhipu_web".equals(id)) return "智谱清言";
         if ("agentmore".equals(id)) return "AgentMore";
@@ -408,6 +409,9 @@ public class LoginActivity extends Activity {
             initDeviceFlowAuth("minimax-code", "MiniMax Code", 10 * 60 * 1000L);
         } else if ("workbuddy".equals(currentProvider)) {
             initWorkBuddyAuth();
+        } else if ("doubao".equals(currentProvider)) {
+            subtitleView.setText("请在豆包官网完成登录（手机号验证码），登录成功后自动入池，也可点右上角「完成入池」");
+            webView.loadUrl("https://www.doubao.com/chat");
         } else if ("deepseek_web".equals(currentProvider)) {
             subtitleView.setText("请在官方页面登录，登录后自动入池，也可点击完成入池");
             webView.loadUrl("https://chat.deepseek.com/sign_in");
@@ -1587,10 +1591,22 @@ public class LoginActivity extends Activity {
                     String c = cm.getCookie("https://ai.catpaw.meituan.com");
                     if (c != null) sb.append(c).append("; ");
 
+                } else if ("doubao".equals(currentProvider)) {
+                    // 豆包鉴权是多 Cookie 协作（sessionid/sid_guard/uid_tt…），必须整串带
+                    String dc = cm.getCookie("https://www.doubao.com");
+                    if (dc != null) sb.append(dc).append("; ");
                 }
                 String allCookies = sb.toString();
 
                 if (!allCookies.isEmpty()) {
+                    // A0. 豆包：整串 Cookie 即凭证，8 个必需名凑齐才算登录成功
+                    if ("doubao".equals(currentProvider)) {
+                        String[] need = {"sessionid=", "sessionid_ss=", "sid_tt=", "sid_guard=",
+                                "uid_tt=", "uid_tt_ss=", "ttwid=", "passport_csrf_token="};
+                        boolean complete = true;
+                        for (String n : need) { if (allCookies.indexOf(n) < 0) { complete = false; break; } }
+                        if (complete) tokenFound = allCookies.trim();
+                    }
                     // A. 专门针对小浣熊 xhx_token 和 user_name
                     if ("raccoon".equals(currentProvider)) {
                         Matcher mToken = Pattern.compile("(?:^|;\\s*)xhx_token=([^;]+)").matcher(allCookies);
@@ -1608,7 +1624,7 @@ public class LoginActivity extends Activity {
                     }
 
                     // B. 通用 JWT 扫描（匹配任何 Cookie 中的标准 JWT 格式）
-                    if (tokenFound.isEmpty()) {
+                    if (tokenFound.isEmpty() && !"doubao".equals(currentProvider)) {
                         Matcher mJwt = Pattern.compile("eyJ[a-zA-Z0-9_\\-]{20,}\\.[a-zA-Z0-9_\\-]{20,}\\.[a-zA-Z0-9_\\-]{20,}").matcher(allCookies);
                         if (mJwt.find()) {
                             tokenFound = mJwt.group(0).trim();
@@ -1616,7 +1632,7 @@ public class LoginActivity extends Activity {
                     }
 
                     // C. 常见 token 命名扫描
-                    if (tokenFound.isEmpty()) {
+                    if (tokenFound.isEmpty() && !"doubao".equals(currentProvider)) {
                         Matcher mKeys = Pattern.compile("(?:^|;\\s*)(?:xhx_token|access_token|accessToken|user_token|auth_token|token|session_token)=([^;]+)", Pattern.CASE_INSENSITIVE).matcher(allCookies);
                         if (mKeys.find()) {
                             String val = mKeys.group(1).trim();
